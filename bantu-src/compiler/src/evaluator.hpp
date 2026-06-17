@@ -106,7 +106,7 @@ inline std::string bantuJsonStringify(const Value& v) {
             std::ostringstream oss;
             oss << "{";
             bool first = true;
-            for (const auto& [k, val] : v.objectVal) {
+            for (const auto& [k, val] : *v.objectVal) {
                 if (!first) oss << ",";
                 first = false;
                 // key as quoted string
@@ -622,7 +622,7 @@ private:
 
                 if (obj.isObject()) {
                     std::string key = idx.toString();
-                    obj.objectVal[key] = val;
+                    (*obj.objectVal)[key] = val;
                     return val;
                 }
             }
@@ -650,7 +650,7 @@ private:
 
         if (obj.isObject()) {
             std::string key = idx.toString();
-            obj.objectVal[key] = val;
+            (*obj.objectVal)[key] = val;
             if (auto varNode = dynamic_cast<VariableNode*>(n->object.get())) {
                 env_->set(varNode->name, obj);
             }
@@ -672,7 +672,7 @@ private:
         }
 
         if (obj.isObject()) {
-            obj.objectVal[n->key] = val;
+            (*obj.objectVal)[n->key] = val;
             if (auto varNode = dynamic_cast<VariableNode*>(n->object.get())) {
                 env_->set(varNode->name, obj);
             }
@@ -1390,8 +1390,8 @@ private:
 
         // Object (dict)
         if (obj.isObject()) {
-            auto it = obj.objectVal.find(n->property);
-            if (it != obj.objectVal.end()) return it->second;
+            auto it = obj.objectVal->find(n->property);
+            if (it != obj.objectVal->end()) return it->second;
             // For leniency with $req.body.X access patterns, return null
             // instead of throwing when a key is missing on a plain object.
             // (Class instances still throw — they use the class-instance branch above.)
@@ -1527,8 +1527,8 @@ private:
         }
 
         if (obj.isObject() && idx.isString()) {
-            auto it = obj.objectVal.find(idx.stringVal);
-            if (it != obj.objectVal.end()) return it->second;
+            auto it = obj.objectVal->find(idx.stringVal);
+            if (it != obj.objectVal->end()) return it->second;
             return Value();
         }
 
@@ -2661,8 +2661,8 @@ private:
 
             std::vector<Value> tableNames;
             for (auto& row : rows) {
-                if (row.isObject() && row.objectVal.count("name")) {
-                    tableNames.push_back(row.objectVal["name"]);
+                if (row.isObject() && row.objectVal && row.objectVal->count("name")) {
+                    tableNames.push_back((*row.objectVal)["name"]);
                 }
             }
 

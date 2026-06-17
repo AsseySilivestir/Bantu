@@ -25,6 +25,24 @@ class ClassDefinition;
 
 class Value;
 
+// ObjectMap is the canonical map type used to back Value's "object" form.
+// It is also used as a local-variable type throughout the codebase
+// (where Value is already complete, so the instantiation is legal).
+//
+// IMPORTANT (Ubuntu 22.04 / GCC 11 compatibility):
+//   `std::unordered_map<std::string, Value>` CANNOT be a non-static data
+//   member of `Value` itself, because Value is incomplete inside its own
+//   class body and unordered_map requires its value type to be complete
+//   (it instantiates `std::pair<const std::string, Value>` which stores
+//   Value by value). GCC 14 (libstdc++ 14) tolerates this; GCC 11
+//   (libstdc++ 11, Ubuntu 22.04) does not — it fails with
+//       error: 'std::pair<_T1, _T2>::second' has incomplete type
+//   See https://gcc.gnu.org/bugzilla/show_bug.cgi?id=90893 for background.
+//
+//   Fix: store the map behind a `std::shared_ptr<ObjectMap>`. shared_ptr<T>
+//   is specifically designed to allow incomplete T (used in pimpl patterns),
+//   so the member declaration compiles even while Value is incomplete.
+//   The map is only instantiated lazily, by which time Value is complete.
 using ObjectMap = std::unordered_map<std::string, Value>;
 using NativeFn = std::function<Value(std::vector<Value>)>;
 
@@ -41,7 +59,10 @@ public:
     std::shared_ptr<BantuFunction> functionPtr;
     ClassInstance* classInstanceVal = nullptr;
     ClassDefinition* classDefVal = nullptr;
-    ObjectMap objectVal;
+    // Object form — shared_ptr so the unordered_map instantiation is
+    // deferred until Value is complete. Left null for non-OBJECT values;
+    // all access sites already gate on `isObject()` before dereferencing.
+    std::shared_ptr<ObjectMap> objectVal;
     std::vector<Value> listVal;
     std::function<Value(std::vector<Value>)> nativeFn;
 
@@ -54,7 +75,14 @@ public:
     explicit Value(std::shared_ptr<BantuFunction> fn) : type(FUNCTION), functionVal(fn.get()), functionPtr(std::move(fn)) {}
     explicit Value(ClassInstance* ci) : type(CLASS_INSTANCE), classInstanceVal(ci) {}
     explicit Value(ClassDefinition* cd) : type(CLASS_DEF), classDefVal(cd) {}
-    explicit Value(ObjectMap obj) : type(OBJECT), objectVal(std::move(obj)) {}
+    // ObjectMap is taken by const-ref (NOT by value) to avoid requiring
+    // `ObjectMap` to be complete at the parameter declaration site —
+    // parameter declarations are NOT complete-class contexts per
+    // [class.mem]/6, so a by-value ObjectMap parameter would fail to
+    // compile on GCC 11 (libstdc++ 11) for the same reason as the data
+    // member above. A const reference only requires ObjectMap to be
+    // declared, not complete.
+    explicit Value(const ObjectMap& obj) : type(OBJECT), objectVal(std::make_shared<ObjectMap>(obj)) {}
     explicit Value(std::vector<Value> lst) : type(LIST), listVal(std::move(lst)) {}
     explicit Value(NativeFn fn) : type(NATIVE_FN), nativeFn(std::move(fn)) {}
 
@@ -77,7 +105,7 @@ public:
             case NULL_VAL: return false;
             case FUNCTION: case NATIVE_FN: return true;
             case CLASS_INSTANCE: case CLASS_DEF: return true;
-            case OBJECT: return !objectVal.empty();
+            case OBJECT: return objectVal && !objectVal->empty();
             case LIST: return !listVal.empty();
         }
         return false;
@@ -104,10 +132,12 @@ public:
                 std::ostringstream oss;
                 oss << "{";
                 bool first = true;
-                for (const auto& [k, v] : objectVal) {
-                    if (!first) oss << ", ";
-                    first = false;
-                    oss << k << ": " << v.toString();
+                if (objectVal) {
+                    for (const auto& [k, v] : *objectVal) {
+                        if (!first) oss << ", ";
+                        first = false;
+                        oss << k << ": " << v.toString();
+                    }
                 }
                 oss << "}";
                 return oss.str();
