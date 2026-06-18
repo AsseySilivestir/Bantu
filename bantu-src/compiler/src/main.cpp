@@ -24,6 +24,7 @@
 #include "evaluator.hpp"
 #include "environment.hpp"
 #include "server.hpp"
+#include "init_templates.hpp"
 
 #include <iostream>
 #include <fstream>
@@ -119,8 +120,9 @@ void printHelp() {
     std::cout << "    bantu run              Run main.b in current dir\n";
     std::cout << "    bantu build <file.b>   Compile to executable\n";
     std::cout << "    bantu build            Build main.b in current dir\n";
-    std::cout << "    bantu init <name>      Create a new Bantu project\n";
-    std::cout << "    bantu new <name>       Create a new Bantu project\n";
+    std::cout << "    bantu init <name>      Create a new Bantu project (CLI)\n";
+    std::cout << "    bantu init --web <n>   Create a Sua web app (Spring Initializer-style)\n";
+    std::cout << "    bantu new <name>       Alias of init\n";
     std::cout << "    bantu relay [port]    Start STUN/TURN relay server\n";
     std::cout << "    bantu --help           Show this help\n";
     std::cout << "    bantu --version        Show version\n";
@@ -129,7 +131,8 @@ void printHelp() {
     std::cout << "    bantu run hello.b      Run hello.b\n";
     std::cout << "    bantu run              Run main.b\n";
     std::cout << "    bantu build app.b      Build app.b -> ./app\n";
-    std::cout << "    bantu init myproject   Create new project\n";
+    std::cout << "    bantu init myproject   Create new CLI project\n";
+    std::cout << "    bantu init --web shop  Create new Sua web app 'shop'\n";
     std::cout << "\n";
     std::cout << "  KEYWORDS:\n";
     std::cout << "    def, if, else, while, for, each..in,\n";
@@ -469,6 +472,81 @@ int cmdInit(const std::string& projectName) {
     return 0;
 }
 
+// ─── bantu init --web / bantu new --web ──────────────────────────────
+// Scaffolds a Sua web app: server.b + frontend + launchers + Dockerfile
+// + render.yaml + README. Like Spring Initializer for web apps.
+
+int cmdInitWeb(const std::string& projectName) {
+    if (projectName.empty()) {
+        std::cerr << "  [ERROR] Project name required.\n";
+        std::cerr << "  Usage: bantu init --web <project-name>\n";
+        return 1;
+    }
+
+    // Reject names that would make bad directory names or bad SQL identifiers.
+    if (projectName.find_first_of("/\\:*?\"<>|") != std::string::npos
+        || projectName.find(' ') != std::string::npos) {
+        std::cerr << "  [ERROR] Invalid project name: '" << projectName << "'\n";
+        std::cerr << "  Names cannot contain spaces or any of: / \\ : * ? \" < > |\n";
+        return 1;
+    }
+
+    if (fileExists(projectName)) {
+        std::cerr << "  [ERROR] Directory already exists: " << projectName << "\n";
+        return 1;
+    }
+
+    std::cout << "  Creating Sua web app: " << projectName << "\n";
+
+#ifdef _WIN32
+    #define BANTU_MKDIR_WEB(p) mkdir(p)
+#else
+    #define BANTU_MKDIR_WEB(p) mkdir(p, 0755)
+#endif
+    BANTU_MKDIR_WEB(projectName.c_str());
+    BANTU_MKDIR_WEB((projectName + "/public").c_str());
+    BANTU_MKDIR_WEB((projectName + "/public/css").c_str());
+    BANTU_MKDIR_WEB((projectName + "/public/js").c_str());
+#undef BANTU_MKDIR_WEB
+
+    // ─── Write all files ────────────────────────────────────────────
+    writeFile(projectName + "/main.b",              bantu_templates::main_b(projectName));
+    writeFile(projectName + "/public/index.html",   bantu_templates::index_html(projectName));
+    writeFile(projectName + "/public/css/style.css",bantu_templates::style_css());
+    writeFile(projectName + "/public/js/app.js",    bantu_templates::app_js());
+    writeFile(projectName + "/start.sh",            bantu_templates::start_sh());
+    writeFile(projectName + "/start.bat",           bantu_templates::start_bat());
+    writeFile(projectName + "/Dockerfile",          bantu_templates::dockerfile());
+    writeFile(projectName + "/render.yaml",         bantu_templates::render_yaml(projectName));
+    writeFile(projectName + "/.gitignore",          bantu_templates::gitignore());
+    writeFile(projectName + "/README.md",           bantu_templates::readme_md(projectName));
+    writeFile(projectName + "/bantu.json",          bantu_templates::bantu_json(projectName, BANTU_VERSION));
+
+    // Make start.sh executable on POSIX
+#ifndef _WIN32
+    chmod((projectName + "/start.sh").c_str(), 0755);
+#endif
+
+    std::cout << "  ────────────────────────────\n";
+    std::cout << "  Project created: " << projectName << "/\n";
+    std::cout << "    " << projectName << "/main.b                ← backend (Sua + SQLite)\n";
+    std::cout << "    " << projectName << "/public/                ← frontend (HTML/CSS/JS)\n";
+    std::cout << "    " << projectName << "/start.sh / start.bat   ← launchers\n";
+    std::cout << "    " << projectName << "/Dockerfile             ← Render-ready\n";
+    std::cout << "    " << projectName << "/render.yaml            ← Render blueprint\n";
+    std::cout << "    " << projectName << "/README.md              ← docs\n";
+    std::cout << "\n";
+    std::cout << "  Next steps:\n";
+    std::cout << "    cd " << projectName << "\n";
+    std::cout << "    ./start.sh          # Linux/Mac\n";
+    std::cout << "    start.bat           # Windows\n";
+    std::cout << "    bantu run main.b    # anywhere with bantu on PATH\n";
+    std::cout << "\n";
+    std::cout << "  Then open http://localhost:8080\n";
+
+    return 0;
+}
+
 // ─── bantu relay ────────────────────────────────────────────────────
 
 int cmdRelay(int port) {
@@ -555,8 +633,33 @@ int main(int argc, char* argv[]) {
     }
 
     // ─── bantu init / bantu new ───
+    // Supports:
+    //   bantu init <name>            ← CLI "Hello World" (default)
+    //   bantu init --web <name>      ← Sua web app (Spring Initializer-style)
+    //   bantu new <name>             ← alias of init
+    //   bantu new --web <name>       ← alias of init --web
     if (command == "init" || command == "new") {
-        std::string name = (argc >= 3) ? argv[2] : "";
+        // Parse args. The --web flag can come before or after the name.
+        bool web = false;
+        std::string name = "";
+        for (int i = 2; i < argc; ++i) {
+            std::string a = argv[i];
+            if (a == "--web" || a == "-w" || a == "web") {
+                web = true;
+            } else if (a == "--cli" || a == "-c") {
+                web = false;
+            } else if (a == "--help" || a == "-h") {
+                std::cout << "  Usage:\n";
+                std::cout << "    bantu init <name>           CLI project (default)\n";
+                std::cout << "    bantu init --web <name>     Sua web app starter\n";
+                return 0;
+            } else if (!a.empty() && a[0] != '-') {
+                name = a;
+            }
+        }
+        if (web) {
+            return cmdInitWeb(name);
+        }
         return cmdInit(name);
     }
 
