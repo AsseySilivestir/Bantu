@@ -35,6 +35,7 @@
 #include <chrono>
 #include <csignal>
 #include <cstdlib>
+#include <cctype>
 #include <bitset>
 #include <cmath>
 
@@ -151,6 +152,17 @@ void printHelp() {
     std::cout << "      --version <x.y.z>  Application version (default: 1.0.0)\n";
     std::cout << "    bantu bench              Run built-in micro-benchmark suite\n";
     std::cout << "\n";
+    std::cout << "  DESKTOP APP INSTALLER (cross-platform, offline-ready):\n";
+    std::cout << "    bantu installer                       Auto-detect host platform\n";
+    std::cout << "    bantu installer [entry.b] --platform linux    Generate .deb + .desktop\n";
+    std::cout << "    bantu installer [entry.b] --platform windows  Generate NSIS .exe installer\n";
+    std::cout << "    bantu installer [entry.b] --platform macos    Generate .app bundle\n";
+    std::cout << "      --name <Name>      Application name (default: from bantu.json or folder)\n";
+    std::cout << "      --version <x.y.z>  Application version (default: 1.0.0)\n";
+    std::cout << "      --icon <path>      Path to icon (.png/.ico/.icns) for shortcuts\n";
+    std::cout << "      --bundle-bantu     Embed the bantu interpreter inside the installer\n";
+    std::cout << "                          (default: on, so apps run on machines without Bantu)\n";
+    std::cout << "\n";
     std::cout << "  GLOBAL FLAGS:\n";
     std::cout << "    bantu --help             Show this help\n";
     std::cout << "    bantu --version          Show version\n";
@@ -164,6 +176,7 @@ void printHelp() {
     std::cout << "    cd myproject && bantu run\n";
     std::cout << "    bantu add math-utils     # install math-utils package\n";
     std::cout << "    bantu install            # reinstall all deps from bantu.json\n";
+    std::cout << "    bantu installer app.b --platform linux   # build .deb installer\n";
     std::cout << "\n";
     std::cout << "  KEYWORDS:\n";
     std::cout << "    def, if, else, while, for, each..in,\n";
@@ -947,6 +960,566 @@ int cmdBuildWindows(int argc, char* argv[]) {
     return 0;
 }
 
+// ─── bantu installer ─────────────────────────────────────────────────
+// Cross-platform desktop installer generator.
+//
+//   bantu installer                        # auto-detect host platform
+//   bantu installer app.b --platform linux
+//   bantu installer app.b --platform windows
+//   bantu installer app.b --platform macos
+//
+// Output goes to ./dist/. Each platform produces a runnable, offline-
+// ready installer that bundles the bantu interpreter (so end users
+// don't need Bantu installed) plus the project's .b source files and
+// a launcher.
+//
+// Linux:   dist/<name>_<version>_amd64.deb  (dpkg-deb)
+//          Also writes a .desktop file so the app appears in the
+//          launcher menu.
+//
+// Windows: dist/<name>-Setup-<version>.exe  (NSIS .nsi)
+//          If makensis is on PATH the .exe is built; otherwise the
+//          .nsi is left for the user to compile.
+//
+// macOS:   dist/<Name>.app bundle
+//          Contents/{MacOS,Resources} layout with Info.plist and a
+//          launcher script. The .app can be opened with `open` or
+//          double-clicked in Finder.
+
+// Trim leading/trailing whitespace
+static std::string trimStr(const std::string& s) {
+    size_t a = s.find_first_not_of(" \t\r\n");
+    if (a == std::string::npos) return "";
+    size_t b = s.find_last_not_of(" \t\r\n");
+    return s.substr(a, b - a + 1);
+}
+
+// Find a JSON string field by key. Very small JSON parser — enough
+// for bantu.json which the scaffolder writes itself.
+static std::string jsonField(const std::string& json, const std::string& key) {
+    std::string needle = "\"" + key + "\"";
+    size_t k = json.find(needle);
+    if (k == std::string::npos) return "";
+    size_t colon = json.find(':', k + needle.size());
+    if (colon == std::string::npos) return "";
+    size_t q1 = json.find('"', colon + 1);
+    if (q1 == std::string::npos) return "";
+    size_t q2 = json.find('"', q1 + 1);
+    if (q2 == std::string::npos) return "";
+    return json.substr(q1 + 1, q2 - q1 - 1);
+}
+
+// Locate the bantu interpreter to embed in the installer.
+// Search order: $BANTU_BIN env, alongside current argv[0], PATH.
+static std::string findSelfBinary() {
+    const char* envBin = std::getenv("BANTU_BIN");
+    if (envBin && *envBin && fileExists(envBin)) {
+        return std::string(envBin);
+    }
+    // Try /proc/self/exe on Linux
+    if (fileExists("/proc/self/exe")) {
+        char buf[4096];
+        ssize_t n = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
+        if (n > 0) { buf[n] = 0; return std::string(buf); }
+    }
+    // Fall back to PATH lookup
+    int rc = system("command -v bantu > /tmp/.bantu_bin_path 2>/dev/null");
+    (void)rc;
+    std::ifstream f("/tmp/.bantu_bin_path");
+    if (f.is_open()) {
+        std::string line;
+        std::getline(f, line);
+        if (!line.empty() && fileExists(line)) return line;
+    }
+    return "";
+}
+
+// ── Linux: build a .deb package ──
+static int buildLinuxInstaller(
+    const std::string& entryFile,
+    const std::string& appName,
+    const std::string& appVersion,
+    const std::string& iconPath,
+    bool bundleBantu)
+{
+    std::string distDir = "dist";
+    if (system(("mkdir -p " + distDir).c_str()) != 0) {
+        std::cerr << "  [ERROR] Cannot create dist/\n";
+        return 1;
+    }
+
+    // Sanitize appName for package name (lowercase, no spaces).
+    std::string pkgName = appName;
+    for (auto& c : pkgName) {
+        if (std::isalnum((unsigned char)c)) c = (char)std::tolower((unsigned char)c);
+        else c = '_';
+    }
+    std::string pkgVer = appVersion;
+    std::string stagingDir = "dist/" + pkgName + "_" + pkgVer + "_amd64_staging";
+    std::string cleanCmd = "rm -rf '" + stagingDir + "'";
+    system(cleanCmd.c_str());
+
+    // Standard .deb layout
+    std::string debRoot = stagingDir + "/usr";
+    std::string binDir       = debRoot + "/bin";
+    std::string libDir       = debRoot + "/lib/" + pkgName;
+    std::string shareDir     = debRoot + "/share/" + pkgName;
+    std::string appsDir      = debRoot + "/share/applications";
+    std::string iconsDir     = debRoot + "/share/icons/hicolor/256x256/apps";
+
+    system(("mkdir -p '" + binDir   + "'").c_str());
+    system(("mkdir -p '" + libDir   + "'").c_str());
+    system(("mkdir -p '" + shareDir + "'").c_str());
+    system(("mkdir -p '" + appsDir  + "'").c_str());
+    system(("mkdir -p '" + iconsDir + "'").c_str());
+
+    // ── lib/<pkg>/: copy all .b files (entry first), bantu.json, public/
+    system(("cp *.b '" + libDir + "/' 2>/dev/null").c_str());
+    system(("cp bantu.json '" + libDir + "/' 2>/dev/null").c_str());
+    system(("cp -r public '" + libDir + "/' 2>/dev/null").c_str());
+
+    // ── Optional: bundle the bantu interpreter
+    std::string bantuBinPath;
+    if (bundleBantu) {
+        bantuBinPath = findSelfBinary();
+        if (!bantuBinPath.empty()) {
+            system(("cp '" + bantuBinPath + "' '" + libDir + "/bantu' 2>/dev/null").c_str());
+            system(("chmod +x '" + libDir + "/bantu'").c_str());
+            std::cout << "  [INSTALLER] Bundled interpreter: " << bantuBinPath << "\n";
+        } else {
+            std::cerr << "  [WARN] Could not locate bantu binary to bundle.\n";
+            std::cerr << "         Set $BANTU_BIN to point at it, or rerun without --bundle-bantu.\n";
+        }
+    }
+
+    // ── bin/<pkg>: launcher script (this is what users run from terminal)
+    std::string launcherPath = binDir + "/" + pkgName;
+    std::ofstream launcher(launcherPath);
+    if (!launcher.is_open()) {
+        std::cerr << "  [ERROR] Cannot write launcher: " << launcherPath << "\n";
+        return 1;
+    }
+    launcher << "#!/bin/bash\n";
+    launcher << "# Generated by bantu installer v" << BANTU_VERSION << "\n";
+    launcher << "# App: " << appName << " v" << appVersion << "\n";
+    launcher << "set -e\n";
+    launcher << "APP_LIB=\"/usr/lib/" << pkgName << "\"\n";
+    launcher << "if [ ! -d \"$APP_LIB\" ]; then\n";
+    launcher << "    APP_LIB=\"$HOME/.local/lib/" << pkgName << "\"\n";
+    launcher << "fi\n";
+    launcher << "if [ -x \"$APP_LIB/bantu\" ]; then\n";
+    launcher << "    BANTU_BIN=\"$APP_LIB/bantu\"\n";
+    launcher << "elif command -v bantu >/dev/null 2>&1; then\n";
+    launcher << "    BANTU_BIN=\"bantu\"\n";
+    launcher << "else\n";
+    launcher << "    echo \"[ERROR] Bantu interpreter not found. Install Bantu or use --bundle-bantu.\" >&2\n";
+    launcher << "    exit 1\n";
+    launcher << "fi\n";
+    launcher << "cd \"$APP_LIB\"\n";
+    launcher << "exec \"$BANTU_BIN\" run " << entryFile << " \"$@\"\n";
+    launcher.close();
+    system(("chmod +x '" + launcherPath + "'").c_str());
+
+    // ── share/applications/<pkg>.desktop — launcher menu entry
+    std::string desktopPath = appsDir + "/" + pkgName + ".desktop";
+    std::ofstream desktop(desktopPath);
+    if (desktop.is_open()) {
+        desktop << "[Desktop Entry]\n";
+        desktop << "Version=" << appVersion << "\n";
+        desktop << "Type=Application\n";
+        desktop << "Name=" << appName << "\n";
+        desktop << "Comment=" << appName << " (Bantu app)\n";
+        desktop << "Exec=" << pkgName << "\n";
+        if (!iconPath.empty() && fileExists(iconPath)) {
+            // Copy the icon into the icons dir
+            system(("cp '" + iconPath + "' '" + iconsDir + "/" + pkgName + ".png' 2>/dev/null").c_str());
+            desktop << "Icon=" << pkgName << "\n";
+        } else {
+            desktop << "Icon=utilities-terminal\n";
+        }
+        desktop << "Terminal=true\n";
+        desktop << "Categories=Development;Utility;\n";
+        desktop.close();
+    }
+
+    // ── DEBIAN/control
+    std::string debianDir = stagingDir + "/DEBIAN";
+    system(("mkdir -p '" + debianDir + "'").c_str());
+    std::ofstream ctrl(debianDir + "/control");
+    if (!ctrl.is_open()) {
+        std::cerr << "  [ERROR] Cannot write DEBIAN/control\n";
+        return 1;
+    }
+    ctrl << "Package: " << pkgName << "\n";
+    ctrl << "Version: " << appVersion << "\n";
+    ctrl << "Architecture: amd64\n";
+    ctrl << "Maintainer: Assey Silivestir <assey@bantu-lang.dev>\n";
+    ctrl << "Section: utils\n";
+    ctrl << "Priority: optional\n";
+    ctrl << "Description: " << appName << " — Bantu desktop application\n";
+    ctrl << " Bundled Bantu interpreter + .b source files. Runs offline.\n";
+    ctrl << " Built with bantu installer v" << BANTU_VERSION << ".\n";
+    ctrl.close();
+
+    // ── DEBIAN/postinst — fix permissions after unpack
+    std::ofstream postinst(debianDir + "/postinst");
+    if (postinst.is_open()) {
+        postinst << "#!/bin/bash\n";
+        postinst << "set -e\n";
+        postinst << "chmod +x /usr/bin/" << pkgName << "\n";
+        postinst << "chmod -R +r /usr/lib/" << pkgName << " 2>/dev/null || true\n";
+        postinst << "if [ -x /usr/lib/" << pkgName << "/bantu ]; then\n";
+        postinst << "    chmod +x /usr/lib/" << pkgName << "/bantu\n";
+        postinst << "fi\n";
+        postinst << "exit 0\n";
+        postinst.close();
+        system(("chmod +x '" + debianDir + "/postinst'").c_str());
+    }
+
+    // ── DEBIAN/prerm — pre-remove (no-op, just placeholder)
+    std::ofstream prerm(debianDir + "/prerm");
+    if (prerm.is_open()) {
+        prerm << "#!/bin/bash\nset -e\nexit 0\n";
+        prerm.close();
+        system(("chmod +x '" + debianDir + "/prerm'").c_str());
+    }
+
+    // ── Build the .deb
+    std::string debName = pkgName + "_" + pkgVer + "_amd64.deb";
+    std::string buildCmd = "dpkg-deb --build '" + stagingDir + "' 'dist/" + debName + "'";
+    std::cout << "  [INSTALLER] Building .deb: " << debName << "\n";
+    int rc = system(buildCmd.c_str());
+    if (rc != 0) {
+        std::cerr << "\n  [ERROR] dpkg-deb failed (rc=" << rc << ").\n";
+        std::cerr << "  Staging dir left at: " << stagingDir << "\n";
+        std::cerr << "  On non-Debian Linux, install 'dpkg-deb' or use the staging dir directly.\n";
+        return 1;
+    }
+
+    std::cout << "\n  [INSTALLER] Linux installer ready:\n";
+    std::cout << "    dist/" << debName << "\n";
+    std::cout << "\n  Install on any Debian/Ubuntu machine:\n";
+    std::cout << "    sudo dpkg -i dist/" << debName << "\n";
+    std::cout << "    " << pkgName << "              # run from terminal\n";
+    std::cout << "    # Or find '" << appName << "' in your application launcher.\n";
+    std::cout << "\n  Uninstall:\n";
+    std::cout << "    sudo dpkg -r " << pkgName << "\n";
+    return 0;
+}
+
+// ── Windows: build an NSIS .exe installer ──
+static int buildWindowsInstaller(
+    const std::string& entryFile,
+    const std::string& appName,
+    const std::string& appVersion,
+    const std::string& iconPath,
+    bool bundleBantu)
+{
+    std::string distDir = "dist";
+    if (system(("mkdir -p " + distDir).c_str()) != 0) {
+        std::cerr << "  [ERROR] Cannot create dist/\n";
+        return 1;
+    }
+
+    std::string nsiPath = distDir + "/installer-" + appName + ".nsi";
+    std::ofstream nsi(nsiPath);
+    if (!nsi.is_open()) {
+        std::cerr << "  [ERROR] Cannot write " << nsiPath << "\n";
+        return 1;
+    }
+
+    nsi << "; Generated by bantu installer v" << BANTU_VERSION << "\n";
+    nsi << "!define APPNAME \"" << appName << "\"\n";
+    nsi << "!define APPVERSION \"" << appVersion << "\"\n";
+    nsi << "!define APPPUBLISHER \"Bantu\"\n";
+    nsi << "\n";
+    nsi << "Name \"${APPNAME} ${APPVERSION}\"\n";
+    nsi << "OutFile \"${APPNAME}-Setup-${APPVERSION}.exe\"\n";
+    nsi << "InstallDir \"$LOCALAPPDATA\\${APPNAME}\"\n";
+    nsi << "RequestExecutionLevel user\n";
+    nsi << "\n";
+    nsi << "Page directory\n";
+    nsi << "Page instfiles\n";
+    nsi << "\n";
+    nsi << "Section \"${APPNAME}\"\n";
+    nsi << "  SetOutPath \"$INSTDIR\"\n";
+    if (bundleBantu) {
+        nsi << "  ; Bundle the Bantu interpreter so the app runs on machines without Bantu installed.\n";
+        nsi << "  File /nonfatal \"bantu.exe\"\n";
+        nsi << "  File /nonfatal \"bantu\"\n";
+    }
+    nsi << "  ; Project source files\n";
+    nsi << "  File \"*.b\"\n";
+    nsi << "  File /nonfatal \"bantu.json\"\n";
+    nsi << "  File /nonfatal \"*.bat\"\n";
+    if (!iconPath.empty()) {
+        nsi << "  File /nonfatal \"" << iconPath << "\"\n";
+    }
+    nsi << "\n";
+    nsi << "  ; Launcher batch file\n";
+    nsi << "  FileOpen $0 \"$INSTDIR\\run-${APPNAME}.bat\" w\n";
+    nsi << "  FileWrite $0 '@echo off$\r$\n'\n";
+    nsi << "  FileWrite $0 'cd /d \"%~dp0\"$\r$\n'\n";
+    nsi << "  FileWrite $0 'if exist bantu.exe (bantu.exe run " << entryFile << ") else (bantu run " << entryFile << ")$\r$\n'\n";
+    nsi << "  FileWrite $0 'pause$\r$\n'\n";
+    nsi << "  FileClose $0\n";
+    nsi << "\n";
+    nsi << "  ; Start Menu shortcut\n";
+    nsi << "  CreateDirectory \"$SMPROGRAMS\\${APPNAME}\"\n";
+    nsi << "  CreateShortcut \"$SMPROGRAMS\\${APPNAME}\\${APPNAME}.lnk\" \\\n";
+    nsi << "    \"$INSTDIR\\run-${APPNAME}.bat\" \"\" \"$INSTDIR\\bantu.exe\"\n";
+    nsi << "\n";
+    nsi << "  ; Uninstaller\n";
+    nsi << "  WriteUninstaller \"$INSTDIR\\uninstall-${APPNAME}.exe\"\n";
+    nsi << "  CreateShortcut \"$SMPROGRAMS\\${APPNAME}\\Uninstall.lnk\" \\\n";
+    nsi << "    \"$INSTDIR\\uninstall-${APPNAME}.exe\"\n";
+    nsi << "SectionEnd\n";
+    nsi << "\n";
+    nsi << "Section \"Uninstall\"\n";
+    nsi << "  Delete \"$INSTDIR\\*.*\"\n";
+    nsi << "  RMDir \"$INSTDIR\"\n";
+    nsi << "  Delete \"$SMPROGRAMS\\${APPNAME}\\*.*\"\n";
+    nsi << "  RMDir \"$SMPROGRAMS\\${APPNAME}\"\n";
+    nsi << "SectionEnd\n";
+    nsi.close();
+
+    std::cout << "  [INSTALLER] NSIS script written: " << nsiPath << "\n";
+    std::cout << "  [INSTALLER] App: " << appName << " v" << appVersion << "\n";
+    std::cout << "  [INSTALLER] Entry: " << entryFile << "\n";
+    if (bundleBantu) {
+        std::cout << "  [INSTALLER] Bundling: bantu.exe will be embedded if present in cwd.\n";
+    }
+
+    // Try to invoke makensis
+    int rc = system("makensis dist/installer.nsi 2>/dev/null || makensis dist/installer-*.nsi");
+    if (rc != 0) {
+        std::cerr << "\n  [WARN] makensis not found or failed (rc=" << rc << ").\n";
+        std::cerr << "  Install NSIS to generate the .exe:\n";
+        std::cerr << "    Linux:  sudo apt install nsis\n";
+        std::cerr << "    macOS:  brew install nsis\n";
+        std::cerr << "    Windows: https://nsis.sourceforge.io/Download\n";
+        std::cerr << "\n  Then run:\n";
+        std::cerr << "    makensis " << nsiPath << "\n";
+        std::cerr << "\n  Output: dist/" << appName << "-Setup-" << appVersion << ".exe\n";
+        return 0;  // not fatal — script is still valid
+    }
+
+    std::cout << "\n  [INSTALLER] Windows installer ready:\n";
+    std::cout << "    dist/" << appName << "-Setup-" << appVersion << ".exe\n";
+    return 0;
+}
+
+// ── macOS: build a .app bundle ──
+static int buildMacOSInstaller(
+    const std::string& entryFile,
+    const std::string& appName,
+    const std::string& appVersion,
+    const std::string& iconPath,
+    bool bundleBantu)
+{
+    std::string distDir = "dist";
+    if (system(("mkdir -p " + distDir).c_str()) != 0) {
+        std::cerr << "  [ERROR] Cannot create dist/\n";
+        return 1;
+    }
+
+    // .app bundle layout
+    std::string appDir   = distDir + "/" + appName + ".app";
+    std::string contents = appDir + "/Contents";
+    std::string macosDir = contents + "/MacOS";
+    std::string resDir   = contents + "/Resources";
+    system(("rm -rf '" + appDir + "'").c_str());
+    system(("mkdir -p '" + macosDir + "'").c_str());
+    system(("mkdir -p '" + resDir + "'").c_str());
+
+    // Copy source files into Resources/
+    system(("cp *.b '" + resDir + "/' 2>/dev/null").c_str());
+    system(("cp bantu.json '" + resDir + "/' 2>/dev/null").c_str());
+    system(("cp -r public '" + resDir + "/' 2>/dev/null").c_str());
+    if (!iconPath.empty() && fileExists(iconPath)) {
+        system(("cp '" + iconPath + "' '" + resDir + "/app.icns' 2>/dev/null").c_str());
+    }
+    if (bundleBantu) {
+        std::string bantuBinPath = findSelfBinary();
+        if (!bantuBinPath.empty()) {
+            system(("cp '" + bantuBinPath + "' '" + macosDir + "/bantu' 2>/dev/null").c_str());
+            system(("chmod +x '" + macosDir + "/bantu'").c_str());
+            std::cout << "  [INSTALLER] Bundled interpreter: " << bantuBinPath << "\n";
+        } else {
+            std::cerr << "  [WARN] Could not locate bantu binary to bundle.\n";
+        }
+    }
+
+    // Info.plist
+    std::ofstream plist(contents + "/Info.plist");
+    if (plist.is_open()) {
+        plist << "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n";
+        plist << "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n";
+        plist << "<plist version=\"1.0\">\n<dict>\n";
+        plist << "  <key>CFBundleName</key><string>" << appName << "</string>\n";
+        plist << "  <key>CFBundleDisplayName</key><string>" << appName << "</string>\n";
+        plist << "  <key>CFBundleIdentifier</key><string>dev.bantu-lang." << appName << "</string>\n";
+        plist << "  <key>CFBundleVersion</key><string>" << appVersion << "</string>\n";
+        plist << "  <key>CFBundleShortVersionString</key><string>" << appVersion << "</string>\n";
+        plist << "  <key>CFBundlePackageType</key><string>APPL</string>\n";
+        plist << "  <key>CFBundleExecutable</key><string>" << appName << "</string>\n";
+        plist << "  <key>CFBundleIconFile</key><string>app.icns</string>\n";
+        plist << "  <key>NSHighResolutionCapable</key><true/>\n";
+        plist << "  <key>LSMinimumSystemVersion</key><string>10.13</string>\n";
+        plist << "</dict>\n</plist>\n";
+        plist.close();
+    }
+
+    // Launcher script (the CFBundleExecutable)
+    std::string launcherPath = macosDir + "/" + appName;
+    std::ofstream launcher(launcherPath);
+    if (!launcher.is_open()) {
+        std::cerr << "  [ERROR] Cannot write launcher: " << launcherPath << "\n";
+        return 1;
+    }
+    launcher << "#!/bin/bash\n";
+    launcher << "# Generated by bantu installer v" << BANTU_VERSION << "\n";
+    launcher << "set -e\n";
+    launcher << "APP_DIR=\"$(dirname \"$(dirname \"$0\")\")/Resources\"\n";
+    launcher << "if [ -x \"$(dirname \"$0\")/bantu\" ]; then\n";
+    launcher << "    BANTU_BIN=\"$(dirname \"$0\")/bantu\"\n";
+    launcher << "elif command -v bantu >/dev/null 2>&1; then\n";
+    launcher << "    BANTU_BIN=\"bantu\"\n";
+    launcher << "else\n";
+    launcher << "    echo \"[ERROR] Bantu interpreter not found.\" >&2\n";
+    launcher << "    exit 1\n";
+    launcher << "fi\n";
+    launcher << "cd \"$APP_DIR\"\n";
+    launcher << "exec \"$BANTU_BIN\" run " << entryFile << " \"$@\"\n";
+    launcher.close();
+    system(("chmod +x '" + launcherPath + "'").c_str());
+
+    // PkgInfo
+    std::ofstream pkgInfo(contents + "/PkgInfo");
+    if (pkgInfo.is_open()) {
+        pkgInfo.write("APPL????", 8);
+        pkgInfo.close();
+    }
+
+    std::cout << "\n  [INSTALLER] macOS .app bundle ready:\n";
+    std::cout << "    " << appDir << "\n";
+    std::cout << "\n  Run on this machine:\n";
+    std::cout << "    open " << appDir << "\n";
+    std::cout << "\n  Distribute as a .dmg (requires hdiutil on macOS):\n";
+    std::cout << "    hdiutil create -volname '" << appName << "' -srcfolder " << appDir
+              << " -ov -format UDZO dist/" << appName << "-" << appVersion << ".dmg\n";
+    return 0;
+}
+
+int cmdInstaller(int argc, char* argv[]) {
+    std::string entryFile;
+    std::string appName;
+    std::string appVersion;
+    std::string iconPath;
+    std::string platform;
+    bool bundleBantu = true;
+
+    for (int i = 2; i < argc; ++i) {
+        std::string a = argv[i];
+        if (a == "--name" && i + 1 < argc) {
+            appName = argv[++i];
+        } else if (a == "--version" && i + 1 < argc) {
+            appVersion = argv[++i];
+        } else if (a == "--icon" && i + 1 < argc) {
+            iconPath = argv[++i];
+        } else if (a == "--platform" && i + 1 < argc) {
+            platform = argv[++i];
+        } else if (a == "--no-bundle-bantu") {
+            bundleBantu = false;
+        } else if (a == "--bundle-bantu") {
+            bundleBantu = true;
+        } else if (a == "--help" || a == "-h") {
+            std::cout << "  Usage: bantu installer [entry.b] [options]\n";
+            std::cout << "  Options:\n";
+            std::cout << "    --name <Name>          Application name (default: from bantu.json or folder)\n";
+            std::cout << "    --version <x.y.z>      Application version (default: 1.0.0)\n";
+            std::cout << "    --icon <path>          Icon file (.png/.ico/.icns)\n";
+            std::cout << "    --platform <p>         linux | windows | macos (default: auto-detect)\n";
+            std::cout << "    --bundle-bantu         Embed bantu interpreter (default: on)\n";
+            std::cout << "    --no-bundle-bantu      Don't embed bantu (smaller installer, requires Bantu on target)\n";
+            std::cout << "\n  Output: ./dist/<name>_<version>_*.{deb,exe,app}\n";
+            return 0;
+        } else if (!a.empty() && a[0] != '-') {
+            entryFile = a;
+        }
+    }
+
+    // Resolve entry file
+    if (entryFile.empty()) {
+        if (fileExists("main.b")) entryFile = "main.b";
+        else if (fileExists("app.b")) entryFile = "app.b";
+        else if (fileExists("index.b")) entryFile = "index.b";
+        else if (fileExists("server.b")) entryFile = "server.b";
+        else {
+            std::cerr << "  [ERROR] No entry file found (looked for main.b, app.b, index.b, server.b)\n";
+            return 1;
+        }
+    }
+    if (!fileExists(entryFile)) {
+        std::cerr << "  [ERROR] Entry file not found: " << entryFile << "\n";
+        return 1;
+    }
+
+    // Read bantu.json to fill in defaults
+    if (appName.empty() || appVersion.empty()) {
+        if (fileExists("bantu.json")) {
+            std::string json = readFile("bantu.json");
+            if (appName.empty())    appName    = jsonField(json, "name");
+            if (appVersion.empty()) appVersion = jsonField(json, "version");
+        }
+    }
+    // Fall back to folder name + 1.0.0
+    if (appName.empty()) {
+        std::string cwd = getCurrentDir();
+        size_t slash = cwd.find_last_of("/\\");
+        appName = (slash == std::string::npos) ? cwd : cwd.substr(slash + 1);
+        if (appName.empty()) appName = "BantuApp";
+    }
+    if (appVersion.empty()) appVersion = "1.0.0";
+
+    // Auto-detect platform if not specified
+    if (platform.empty()) {
+#ifdef _WIN32
+        platform = "windows";
+#elif defined(__APPLE__)
+        platform = "macos";
+#else
+        platform = "linux";
+#endif
+    }
+
+    // Normalize
+    if (platform == "win" || platform == "win32") platform = "windows";
+    if (platform == "mac" || platform == "osx")   platform = "macos";
+
+    std::cout << "\n  ╔══════════════════════════════════════════════╗\n";
+    std::cout << "  ║   bantu installer — desktop installer builder ║\n";
+    std::cout << "  ╚══════════════════════════════════════════════╝\n\n";
+    std::cout << "  App:      " << appName << " v" << appVersion << "\n";
+    std::cout << "  Entry:    " << entryFile << "\n";
+    std::cout << "  Platform: " << platform << "\n";
+    std::cout << "  Bundle:   " << (bundleBantu ? "yes (embed bantu)" : "no (use system bantu)") << "\n";
+    if (!iconPath.empty()) std::cout << "  Icon:     " << iconPath << "\n";
+    std::cout << "\n";
+
+    if (platform == "linux") {
+        return buildLinuxInstaller(entryFile, appName, appVersion, iconPath, bundleBantu);
+    } else if (platform == "windows") {
+        return buildWindowsInstaller(entryFile, appName, appVersion, iconPath, bundleBantu);
+    } else if (platform == "macos") {
+        return buildMacOSInstaller(entryFile, appName, appVersion, iconPath, bundleBantu);
+    }
+
+    std::cerr << "  [ERROR] Unknown platform: " << platform << "\n";
+    std::cerr << "  Valid: linux, windows, macos\n";
+    return 1;
+}
+
 // ─── bantu bench ──────────────────────────────────────────────────────
 // v1.2.1: Run built-in micro-benchmarks and print results to stdout.
 // Used by the Bantu benchmark suite (see /benchmarks).
@@ -1116,6 +1689,9 @@ int main(int argc, char* argv[]) {
     // ─── bantu build-windows / bench (v1.2.1) ───
     if (command == "build-windows" || command == "build-win") return cmdBuildWindows(argc, argv);
     if (command == "bench")        return cmdBench();
+
+    // ─── bantu installer (cross-platform desktop installer generator) ───
+    if (command == "installer" || command == "installer") return cmdInstaller(argc, argv);
 
     // ─── bantu <file.b> (legacy shorthand for run) ───
     if (command.size() > 2 && command.substr(command.size() - 2) == ".b") {

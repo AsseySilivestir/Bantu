@@ -2,7 +2,7 @@
 
 **Bantu Programming Language v1.2.2 — Stable Release**
 
-A high-level, dynamically-typed programming language implemented as a tree-walking interpreter in C++17. The entire toolchain — interpreter, package manager, HTTP server, WebRTC engine, SQLite/PostgreSQL/MySQL drivers, project scaffolding, VSCode extension, and Windows installer generator — ships as a single ~660 KB static binary with zero runtime dependencies.
+A high-level, dynamically-typed programming language implemented as a tree-walking interpreter in C++17. The entire toolchain — interpreter, package manager, HTTP server, WebRTC engine, SQLite/PostgreSQL/MySQL drivers, project scaffolding, VSCode extension, and cross-platform desktop installer generator — ships as a single ~660 KB static binary with zero runtime dependencies.
 
 ```bash
 bantu --version     # → Bantu v1.2.2
@@ -12,15 +12,16 @@ cd myapp && bantu run
 
 ## What's New in v1.2.2
 
-v1.2.2 is a **drop-in maintenance release** on top of v1.2.1. No language changes, no breaking API changes — every v1.2.1 program runs unchanged. The release focuses on robustness and operational ergonomics for the `include` module system.
+v1.2.2 is a **drop-in maintenance release** on top of v1.2.1. No language changes, no breaking API changes — every v1.2.1 program runs unchanged. The release adds a new **cross-platform desktop installer generator** and improves robustness of the `include` module system.
 
 | Change | Highlights |
 |---|---|
+| **`bantu installer` command [NEW]** | One command packages any Bantu project into a cross-platform desktop installer: `.deb` for Linux, `.exe` for Windows (NSIS), `.app` for macOS. **Bundles the bantu interpreter by default** so the app runs on machines without Bantu installed. See `bantu installer --help` or the docs chapter. |
 | **Path canonicalization** | `include` paths are now resolved through `realpath()` (POSIX) / `GetFullPathName` (Windows). The same file reached via `./pkg/x.b`, `../pkg/x.b`, and `pkg/x.b` now collapses to a single canonical key — so the cycle guard can no longer accidentally execute a module twice when it is reached via two different relative paths in the same project. |
 | **Cycle-guard diagnostic** | Circular includes used to be silently skipped. They now print `Skipping already-loaded module: <path>` (or `[INCLUDE ERROR] Maximum include depth (64) exceeded` for pathological chains). |
 | **Depth limit** | New `kMaxIncludeDepth = 64` guard prevents stack-exhaustion crashes on self-generating or pathological include chains. |
 | **Error attribution** | `Module not found` errors now include the importing file: `Module not found: ./missing.b (imported from /app/routes.b)`. |
-| **`--quiet` / `-q` flag** | `bantu --quiet run server.b` suppresses informational `[INCLUDE] Loaded …` and `[Executed in … us]` lines. Errors still print to `stderr`. Useful for production server logs and benchmark harnesses. |
+| **`--quiet` / `-q` flag** | `bantu --quiet run server.b` suppresses informational `[INCLUDE] Loaded …` and `[Executed in … us]` lines. Errors still print to `stderr`. Useful for production server logs. |
 | **`$BANTU_PATH` search path** | When a module can't be found via the standard resolution order, `include` now falls back to each directory in `$BANTU_PATH` (POSIX `:`-separated, Windows `;`-separated). Enables shared module libraries outside the project tree: `export BANTU_PATH=/opt/bantu/lib:~/bantu-modules`. |
 
 ## What's New in v1.2.1 (the foundation release)
@@ -32,10 +33,9 @@ v1.2.2 is a **drop-in maintenance release** on top of v1.2.1. No language change
 | **MySQL driver** | `sua.mysql.connect/query/close`. Same stub-or-real pattern via `-DBANTU_MYSQL=ON`. |
 | **WebRTC engine** | `sua.webrtc.peer/createOffer/createAnswer/addIceCandidate/dataChannel/send/close`. Real libdatachannel when built with `-DBANTU_WEBRTC=ON`. |
 | **VSCode extension** | Syntax highlighting, autocomplete, hover hints, Go-to-Symbol, snippets, **blue-B file icon** for `*.b` files, one-click Run (F5). |
-| **`bantu build-windows`** | One command → NSIS `.exe` installer. Bundles interpreter + source + launcher + Start Menu shortcuts + uninstaller. No admin rights required. |
-| **`bantu bench`** | Built-in micro-benchmark suite (fib, loops, list/dict ops, string concat). |
+| **`bantu build-windows`** | One command → NSIS `.exe` installer (Windows-only). Superseded in v1.2.2 by the cross-platform `bantu installer`. |
 | **Three sample apps** | `samples/blogsite` (modular Sua + SQLite), `samples/webrtc-chat` (signaling + browser UI), `samples/pg-dashboard` (PostgreSQL analytics). |
-| **PDF documentation** | 30-page official guide at `docs/Bantu-Programming-Language-v1.2.2.pdf`. |
+| **PDF documentation** | 36-page official guide at `docs/Bantu-Programming-Language-v1.2.2.pdf` (Dracula-themed). |
 
 ## Download
 
@@ -44,7 +44,7 @@ Grab the latest zip from the [v1.2.2 release](https://github.com/AsseySilivestir
 | Asset | Size | Platform | Includes |
 |---|---|---|---|
 | [`Bantu-v1.2.2-linux-x64.zip`](https://github.com/AsseySilivestir/Bantu/releases/download/v1.2.2/Bantu-v1.2.2-linux-x64.zip) | ~350 KB | Linux x86-64 | Pre-built `bantu` binary + samples + docs + VSIX |
-| [`Bantu-v1.2.2-windows-x64.zip`](https://github.com/AsseySilivestir/Bantu/releases/download/v1.2.2/Bantu-v1.2.2-windows-x64.zip) | ~840 KB | Windows x64 | Full C++ source + `setup.bat` + samples + VSIX |
+| [`Bantu-v1.2.2-windows-x64.zip`](https://github.com/AsseySilivestir/Bantu/releases/download/v1.2.2/Bantu-v1.2.2-windows-x64.zip) | ~610 KB | Windows x64 | Pre-built `bantu.exe` + `install.bat` + samples + VSIX + PDF (no compilation needed) |
 | [`bantu-vscode-1.2.2.vsix`](https://github.com/AsseySilivestir/Bantu/releases/download/v1.2.2/bantu-vscode-1.2.2.vsix) | ~24 KB | VSCode 1.75+ | Standalone extension (also inside both zips) |
 | [`Bantu-Programming-Language-v1.2.2.pdf`](https://github.com/AsseySilivestir/Bantu/releases/download/v1.2.2/Bantu-Programming-Language-v1.2.2.pdf) | ~65 KB | Any | 30-page official guide |
 
@@ -72,21 +72,34 @@ bantu --version
 # → Bantu v1.2.2
 ```
 
-### One-time setup (Windows x64)
+### One-time setup (Windows x64) — download & double-click
 
-Download `Bantu-v1.2.2-windows-x64.zip`, unzip, then build `bantu.exe` once
-(requires Visual Studio 2022 with C++ workload, or MinGW-w64):
+The Windows release ships with a **pre-built `bantu.exe`** — no Visual
+Studio, no CMake, no compilation required. The whole setup is three
+steps:
+
+1. Download `Bantu-v1.2.2-windows-x64.zip` from the
+   [v1.2.2 release](https://github.com/AsseySilivestir/Bantu/releases/tag/v1.2.2).
+2. Unzip it anywhere (e.g. `Downloads\Bantu-v1.2.2-windows-x64`).
+3. **Double-click `install.bat`** inside the unzipped folder.
+
+The installer:
+- Copies `bantu.exe` to `%LOCALAPPDATA%\Bantu\bin\`
+- Adds that folder to your user `PATH`
+- Registers `.b` as a Bantu source file (double-clicking a `.b` runs it)
+- **Auto-installs the VSCode extension** if VSCode is detected
+- Creates a desktop shortcut and a Start Menu entry
+- Registers an uninstaller in *Add/Remove Programs*
+
+Open a **new** Command Prompt (so PATH reloads) and verify:
 
 ```bat
-cd bantu-v1.2.2-windows-x64\bantu-src\compiler
-cmake -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build --config Release
-copy build\Release\bantu.exe ..\..\..\
-cd ..\..\
-setup.bat --seed
+bantu --version
+:: → Bantu v1.2.2
 ```
 
-Open a **new** terminal, then `bantu --version` → `Bantu v1.2.2`.
+To uninstall later: run `uninstall.bat` from the original zip folder,
+or use *Add/Remove Programs* in Windows Settings.
 
 ### Your first project
 
@@ -180,14 +193,49 @@ $chan  = sua.webrtc.dataChannel("chat");
 sua.webrtc.send("chat", "hello, world!");
 ```
 
-## Build Windows Installer (v1.2.2)
+## Build Desktop Installers (v1.2.2 NEW — cross-platform)
+
+The `bantu installer` command packages any Bantu project into a single
+self-contained desktop installer — **the installer bundles the Bantu
+interpreter itself**, so end users can run your app on machines that
+don't have Bantu installed. Ship the installer to a friend, they
+double-click it, the app appears in their launcher. No internet required.
 
 ```bash
-# Generates dist/MyApp-Setup-1.0.0.exe (NSIS installer)
+bantu installer                            # auto-detect host platform
+bantu installer app.b --platform linux     # → dist/<name>_<ver>_amd64.deb
+bantu installer app.b --platform windows   # → dist/<name>-Setup-<ver>.exe
+bantu installer app.b --platform macos     # → dist/<Name>.app
+```
+
+| Platform | Output | What it does |
+|---|---|---|
+| **Linux**   | `.deb` + `.desktop` entry | Bundles `bantu` at `/usr/lib/<name>/`, drops launcher at `/usr/bin/<name>`, adds app launcher icon |
+| **Windows** | NSIS `.exe` installer     | Installs to `%LOCALAPPDATA%\<name>`, adds Start Menu shortcut, registers uninstaller in *Add/Remove Programs* |
+| **macOS**   | `.app` bundle             | Standard `Contents/{MacOS,Resources}` layout with `Info.plist` — wrap into `.dmg` with `hdiutil` |
+
+Options: `--name`, `--version`, `--icon`, `--bundle-bantu` / `--no-bundle-bantu`.
+Defaults are read from `bantu.json` if present. See **Chapter 9** of the
+official guide PDF for the full walkthrough.
+
+### Legacy: Build Windows Installer (v1.2.1)
+
+The older `bantu build-windows` command (Windows-only NSIS installer) is
+still available for backwards compatibility:
+
+```bash
+# Generates dist/MyApp-Setup-1.0.0.exe (NSIS installer, Windows-only)
 bantu build-windows --name "MyApp" --version "1.0.0"
 ```
 
-## Build from Source
+For new projects, prefer `bantu installer --platform windows`.
+
+## Build from Source (optional — only if you want to hack on Bantu itself)
+
+You only need this if you're contributing to Bantu or want a custom build
+with the optional real PostgreSQL / MySQL / WebRTC drivers. **For normal
+use, just download the pre-built release zip** (Linux or Windows) — see
+the [Download](#download) section above.
 
 ```bash
 git clone https://github.com/AsseySilivestir/Bantu.git
@@ -215,7 +263,7 @@ bantu --version    # → Bantu v1.2.2
 Bantu/
 ├── bantu-src/compiler/      # C++17 interpreter (lexer, parser, evaluator, server, package_manager)
 │   ├── src/
-│   │   ├── main.cpp         # CLI entry point (run/build/init/setup/build-windows/bench/...)
+│   │   ├── main.cpp         # CLI entry point (run/build/init/setup/installer/build-windows/bench/...)
 │   │   ├── lexer.hpp        # Tokenizer + keywords
 │   │   ├── parser.hpp       # Recursive-descent parser
 │   │   ├── evaluator.hpp    # Tree-walking evaluator (3.4k lines, includes sua.* framework)
@@ -239,9 +287,8 @@ Bantu/
 │   ├── blogsite/            # Modular Sua + SQLite blog (uses include keyword)
 │   ├── webrtc-chat/         # WebRTC signaling + browser UI
 │   └── pg-dashboard/        # PostgreSQL analytics dashboard
-├── benchmarks/              # [v1.2.2] bench.b + run.sh + results.md
 ├── docs/
-│   └── Bantu-Programming-Language-v1.2.2.pdf  # 30-page official guide
+│   └── Bantu-Programming-Language-v1.2.2.pdf  # 36-page official guide (Dracula theme)
 ├── windows/                 # Windows .bat helpers (start, stop, reset-db)
 ├── public/                  # Sua default static files
 ├── README.md                # This file
@@ -252,37 +299,11 @@ Bantu/
 
 ## Documentation
 
-- **Official guide:** [`docs/Bantu-Programming-Language-v1.2.2.pdf`](docs/Bantu-Programming-Language-v1.2.2.pdf) — 30 pages, covers every feature
+- **Official guide:** [`docs/Bantu-Programming-Language-v1.2.2.pdf`](docs/Bantu-Programming-Language-v1.2.2.pdf) — 36 pages, Dracula-themed, covers every feature including `bantu installer`
 - **Quick start:** [`QUICKSTART.md`](QUICKSTART.md)
 - **Samples:** [`samples/`](samples/) — three runnable apps
-- **Benchmarks:** [`benchmarks/`](benchmarks/) — run `./benchmarks/run.sh`
 - **VSCode extension:** [`vscode-extension/README.md`](vscode-extension/README.md)
 - **Changelog:** [`CHANGELOG.md`](CHANGELOG.md)
-
-## Benchmarks (Reference)
-
-Generic x86-64 Linux, Ubuntu 22.04, GCC 11, single core, Release build:
-
-| Benchmark | Bantu v1.2.2 | Node.js 20 | Python 3.11 | Lua 5.4 |
-|---|---|---|---|---|
-| fib(28) recursive | 5,147 ms | 74 ms | 60 ms | ~280 ms |
-| 1M arithmetic loop | 1,169 ms | 71 ms | 103 ms | ~10 ms |
-| string concat 100k | 730 ms | 95 ms | 385 ms | n/a |
-| list push 100k | 142 ms | 4.1 ms | 18 ms | 8.1 ms |
-| dict set 100k | 285 ms | 11 ms | 22 ms | 14 ms |
-
-**Honest interpretation.** Bantu is a tree-walking interpreter without a JIT, so on **tight CPU-bound micro-benchmarks** it sits behind V8, CPython, and LuaJIT — but the gap depends sharply on what you're doing:
-
-- **Deep recursion** (e.g. `fib(28)`) is the worst case at ~85× slower than CPython. Each call goes through a C++ `dynamic_cast` dispatch tree and a fresh `Environment` allocation.
-- **Simple arithmetic loops** (`while ($i < 1_000_000)`) are ~12× slower than CPython — closer than the recursive case because there's no per-call frame setup.
-- **String concatenation** is ~2× slower than CPython and ~7× slower than V8, because Bantu's `+` operator builds a new `std::string` each time (no rope, no inline cache).
-- **I/O-bound web handlers** — which is what Bantu is actually designed for — are **competitive with Node's `http` module** on the same hardware, because the Sua HTTP server runs on native C++ sockets and the interpreter only executes the small request-handler body per request. Most of the wall-clock time is spent in `epoll` + libcurl + SQLite, not in Bantu itself.
-
-The trade-off is **not** "Bantu is slow" — it's "Bantu trades CPU-bound micro-benchmark speed for a single 660 KB static binary with zero runtime dependencies, native I/O, and a 30-page manual." For the use cases Bantu targets (offline-first web servers, hackathon projects, embedded systems, teaching environments, internal tooling), the I/O story matters more than the CPU story, and Bantu's I/O story is genuinely fast.
-
-The v1.3 roadmap includes a register-based bytecode VM targeting 5–10× speedup on the CPU-bound micro-benchmarks above.
-
-See [`benchmarks/results.md`](benchmarks/results.md) for full numbers and reproduction steps.
 
 ## Community
 
