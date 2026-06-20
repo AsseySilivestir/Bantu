@@ -29,7 +29,7 @@ registerAll = def($sua) {
         $res.json({
             "ok": true,
             "service": "bantu-blogsite",
-            "version": "1.2.1"
+            "version": "1.2.2"
         });
     });
 

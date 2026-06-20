@@ -79,7 +79,7 @@
     "body": [
       "include \"./${1:module}.b\"${2: as ${3:alias}};"
     ],
-    "description": "Include a Bantu module (v1.2.1)"
+    "description": "Include a Bantu module (v1.2.2)"
   },
   "Sua HTTP server": {
     "prefix": "sua.server",
@@ -128,7 +128,7 @@
       "$chan = sua.webrtc.dataChannel(\"${2:chat}\");",
       "sua.webrtc.send(\"${2:chat}\", \"${3:hello}\");"
     ],
-    "description": "Sua WebRTC peer setup (v1.2.1)"
+    "description": "Sua WebRTC peer setup (v1.2.2)"
   },
   "Print": {
     "prefix": "print",

@@ -8,7 +8,7 @@ cd "$(dirname "$0")/.."
 
 OUT="benchmarks/results.txt"
 {
-    echo "=== Bantu v1.2.1 Benchmark Results ==="
+    echo "=== Bantu v1.2.2 Benchmark Results ==="
     echo "Date:     $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
     echo "Host:     $(uname -srm)"
     echo "CPU:      $(grep -m1 'model name' /proc/cpuinfo 2>/dev/null | cut -d: -f2 | xargs || echo 'n/a')"

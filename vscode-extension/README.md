@@ -1,4 +1,4 @@
-# Bantu — VSCode Extension (v1.2.1)
+# Bantu — VSCode Extension (v1.2.2)
 
 First-class VSCode support for the [Bantu](https://github.com/AsseySilivestir/Bantu) programming language.
 

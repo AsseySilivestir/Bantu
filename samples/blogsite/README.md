@@ -1,6 +1,6 @@
 # Bantu Blogsite Sample
 
-A modular blog backend demonstrating Bantu v1.2.1's `include` keyword for splitting a real app across `server.b`, `db.b`, `controller.b`, `routes.b`, and `login.b`.
+A modular blog backend demonstrating Bantu v1.2.2's `include` keyword for splitting a real app across `server.b`, `db.b`, `controller.b`, `routes.b`, and `login.b`.
 
 ## Structure
 

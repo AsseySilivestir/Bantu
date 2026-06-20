@@ -48,7 +48,7 @@
     #include <unistd.h>
 #endif
 
-const std::string BANTU_VERSION = "1.2.1";
+const std::string BANTU_VERSION = "1.2.2";
 const std::string BANTU_LANG = "Bantu";
 
 // ─── Helpers ──────────────────────────────────────────────────────────
@@ -145,7 +145,7 @@ void printHelp() {
     std::cout << "    bantu publish <dir>      Add a folder to local registry\n";
     std::cout << "    bantu publish <dir> --as <n>   Publish under a different name\n";
     std::cout << "\n";
-    std::cout << "  v1.2.1 RELEASE COMMANDS:\n";
+    std::cout << "  v1.2.2 RELEASE COMMANDS:\n";
     std::cout << "    bantu build-windows [opts] [entry.b]  Generate NSIS installer (.exe)\n";
     std::cout << "      --name <Name>      Application name (default: BantuApp)\n";
     std::cout << "      --version <x.y.z>  Application version (default: 1.0.0)\n";
@@ -154,6 +154,8 @@ void printHelp() {
     std::cout << "  GLOBAL FLAGS:\n";
     std::cout << "    bantu --help             Show this help\n";
     std::cout << "    bantu --version          Show version\n";
+    std::cout << "    bantu --quiet run app.b  Run quietly (no [INCLUDE]/[Executed in..] logs)\n";
+    std::cout << "    bantu -q run app.b       Alias of --quiet\n";
     std::cout << "\n";
     std::cout << "  EXAMPLES:\n";
     std::cout << "    bantu setup              # one-time: put bantu on PATH\n";
@@ -186,6 +188,10 @@ void printHelp() {
 
 // ─── Run Code ─────────────────────────────────────────────────────────
 
+// v1.2.2: global quiet flag — flips evaluator into quiet mode and suppresses
+// the "Running:" / "[Executed in ...]" chit-chat. Set by --quiet on the CLI.
+static bool g_quietMode = false;
+
 void runCode(const std::string& source, const std::string& filename = "<repl>") {
     auto start = std::chrono::high_resolution_clock::now();
 
@@ -196,6 +202,7 @@ void runCode(const std::string& source, const std::string& filename = "<repl>") 
     auto ast = parser.parse();
 
     Evaluator evaluator;
+    evaluator.setQuiet(g_quietMode);
     // v1.2.1: tell the evaluator which file it's running so that
     // `include "./..."` statements resolve relative to it.
     if (filename != "<repl>") {
@@ -205,7 +212,7 @@ void runCode(const std::string& source, const std::string& filename = "<repl>") 
 
     auto end = std::chrono::high_resolution_clock::now();
     auto us = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
-    if (filename != "<repl>") {
+    if (filename != "<repl>" && !g_quietMode) {
         std::cout << "\n  [Executed in " << us.count() << " us]\n";
     }
 }
@@ -278,7 +285,7 @@ int cmdRun(const std::string& filePath) {
             path = "index.b";
         } else {
             std::cerr << "  [ERROR] No file specified and no main.b, app.b, or index.b found.\n";
-            std::cerr << "  Usage: bantu run <file.b>\n";
+            std::cerr << "  Usage: bantu run <file.b> [--quiet]\n";
             return 1;
         }
     }
@@ -288,8 +295,10 @@ int cmdRun(const std::string& filePath) {
         return 1;
     }
 
-    std::cout << "  Running: " << path << "\n";
-    std::cout << "  ────────────────────────────\n";
+    if (!g_quietMode) {
+        std::cout << "  Running: " << path << "\n";
+        std::cout << "  ────────────────────────────\n";
+    }
 
     std::string source = readFile(path);
     if (source.empty()) return 1;
@@ -995,6 +1004,26 @@ int main(int argc, char* argv[]) {
 
     std::string command = argv[1];
 
+    // v1.2.2: --quiet / -q is a global flag. It must be the FIRST argument
+    // and applies to whichever command follows. Usage:
+    //   bantu --quiet run server.b
+    //   bantu -q run server.b
+    if (command == "--quiet" || command == "-q") {
+        g_quietMode = true;
+        if (argc < 3) {
+            runRepl();
+            return 0;
+        }
+        // Shift argv so the rest of the dispatcher sees the real command
+        command = argv[2];
+        // Rebuild argv without the --quiet slot: shift everything left.
+        for (int i = 2; i < argc - 1; ++i) {
+            argv[i] = argv[i + 1];
+        }
+        argv[argc - 1] = nullptr;
+        argc -= 1;
+    }
+
     // ─── Global flags ───
     if (command == "--help" || command == "-h") {
         printHelp();
@@ -1008,7 +1037,12 @@ int main(int argc, char* argv[]) {
 
     // ─── bantu run ───
     if (command == "run") {
-        std::string file = (argc >= 3) ? argv[2] : "";
+        std::string file = "";
+        for (int i = 2; i < argc; ++i) {
+            std::string a = argv[i];
+            if (a == "--quiet" || a == "-q") { g_quietMode = true; }
+            else if (!a.empty() && a[0] != '-') { file = a; }
+        }
         return cmdRun(file);
     }
 

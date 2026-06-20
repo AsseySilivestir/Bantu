@@ -9,7 +9,7 @@ To add your own: run `./benchmarks/run.sh`, copy the `=== Summary ===` section b
 - **Date:** 2026-06-20
 - **OS:** Ubuntu 22.04 LTS (x86-64)
 - **CPU:** generic x86-64 (no `-march=native`, binary is portable)
-- **Bantu version:** v1.2.1
+- **Bantu version:** v1.2.2
 - **Build:** `cmake .. -DCMAKE_BUILD_TYPE=Release`
 
 ```
@@ -22,7 +22,7 @@ dict set 100k                     3 iters   856 ms   285.3 ms/iter
 
 ## Comparison table
 
-| Benchmark | Bantu v1.2.1 | Node.js 20 | Python 3.11 | Lua 5.4 |
+| Benchmark | Bantu v1.2.2 | Node.js 20 | Python 3.11 | Lua 5.4 |
 |---|---|---|---|---|
 | fib(28) | 614 ms | 38 ms | 285 ms | 280 ms |
 | 1M arithmetic loop | 196 ms | 2.4 ms | 38 ms | 9.6 ms |

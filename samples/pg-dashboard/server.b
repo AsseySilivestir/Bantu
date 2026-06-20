@@ -1,5 +1,5 @@
 // ============================================================================
-// pg-dashboard/server.b — Analytics dashboard backed by PostgreSQL (v1.2.1)
+// pg-dashboard/server.b — Analytics dashboard backed by PostgreSQL (v1.2.2)
 //
 // Demonstrates:
 //   - sua.postgres.connect / query
@@ -7,7 +7,7 @@
 //   - Modular separation (db layer + dashboard routes)
 // ============================================================================
 
-print("=== Bantu PG Dashboard v1.2.1 ===");
+print("=== Bantu PG Dashboard v1.2.2 ===");
 
 include "./db.b";                       // brings $pg, initSchema, metrics() into scope
 include "./dashboard_routes.b" as dash; // namespaced — exposes dash.registerAll(sua)

@@ -22,7 +22,7 @@ const KEYWORDS: { name: string; snippet?: string; doc: string }[] = [
     { name: 'return',    snippet: 'return ${1:value};',                                            doc: 'Return from function' },
     { name: 'class',     snippet: 'class ${1:Name} {\n\tpublic def ${2:method}() {\n\t\t${3:// body}\n\t}\n}', doc: 'Class definition' },
     { name: 'try',       snippet: 'try {\n\t${1:// risky}\n} catch {\n\t${2:// handler}\n}',        doc: 'Try-catch block' },
-    { name: 'include',   snippet: 'include "./${1:module}.b"${2: as ${3:alias}};',                  doc: 'Module include (v1.2.1)' },
+    { name: 'include',   snippet: 'include "./${1:module}.b"${2: as ${3:alias}};',                  doc: 'Module include (v1.2.2)' },
     { name: 'import',    snippet: 'import ${1:module};',                                           doc: 'Import (alias of include)' },
     { name: 'print',     snippet: 'print(${1:"hello"});',                                          doc: 'Print to stdout' },
     { name: 'const',     snippet: 'const $${1:NAME} = ${2:value};',                                doc: 'Constant declaration' },
@@ -46,8 +46,8 @@ const SUA_NAMESPACES: { name: string; doc: string }[] = [
     { name: 'postgres', doc: 'sua.postgres — PostgreSQL driver (libpq-backed when available)' },
     { name: 'mysql',    doc: 'sua.mysql — MySQL/MariaDB driver (mysqlclient-backed when available)' },
     { name: 'json',     doc: 'sua.json — JSON parse/stringify' },
-    { name: 'webrtc',   doc: 'sua.webrtc — WebRTC peer/data-channel API (libdatachannel-backed when available, v1.2.1)' },
-    { name: 'include',  doc: 'sua.include(path) — Runtime module loader (v1.2.1)' },
+    { name: 'webrtc',   doc: 'sua.webrtc — WebRTC peer/data-channel API (libdatachannel-backed when available, v1.2.2)' },
+    { name: 'include',  doc: 'sua.include(path) — Runtime module loader (v1.2.2)' },
     { name: 'channel',  doc: 'sua.channel(name) — Real-time channel primitive' },
     { name: 'stun',     doc: 'sua.stun() — STUN NAT discovery' },
     { name: 'broadcast',doc: 'sua.broadcast(channel, message)' },
@@ -95,7 +95,7 @@ const SUA_METHODS: Record<string, { name: string; snippet?: string; doc: string 
         { name: 'stringify', snippet: 'stringify(${1:$obj})',                          doc: 'Serialize value to JSON' },
     ],
     webrtc: [
-        { name: 'peer',            snippet: 'peer("${1:alice}")',                      doc: 'Create a WebRTC peer (v1.2.1)' },
+        { name: 'peer',            snippet: 'peer("${1:alice}")',                      doc: 'Create a WebRTC peer (v1.2.2)' },
         { name: 'createOffer',     snippet: 'createOffer("${1:alice}")',               doc: 'Generate SDP offer' },
         { name: 'createAnswer',    snippet: 'createAnswer("${1:alice}")',              doc: 'Generate SDP answer' },
         { name: 'addIceCandidate', snippet: 'addIceCandidate("${1:alice}", "${2:candidate}")', doc: 'Add remote ICE candidate' },
@@ -183,8 +183,8 @@ export class BantuCompletionProvider implements vscode.CompletionItemProvider {
                 '- `sua.http`   — HTTP client\n' +
                 '- `sua.sqlite` / `sua.postgres` / `sua.mysql` — database drivers\n' +
                 '- `sua.json`   — JSON helpers\n' +
-                '- `sua.webrtc` — WebRTC peer/data channels (v1.2.1)\n' +
-                '- `sua.include(path)` — runtime module loader (v1.2.1)'
+                '- `sua.webrtc` — WebRTC peer/data channels (v1.2.2)\n' +
+                '- `sua.include(path)` — runtime module loader (v1.2.2)'
             );
             items.push(suaItem);
         }

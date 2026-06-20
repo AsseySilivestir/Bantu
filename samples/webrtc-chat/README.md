@@ -1,6 +1,6 @@
 # Bantu WebRTC Chat Sample
 
-A small WebRTC signaling server + chat UI built entirely in Bantu v1.2.1.
+A small WebRTC signaling server + chat UI built entirely in Bantu v1.2.2.
 
 ## Run
 

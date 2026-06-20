@@ -15,7 +15,7 @@ const HOVERS: Record<string, string> = {
     'return':   '**return** — Return a value from a function.',
     'class':    '**class** — Define a class with methods:\n```\nclass Name {\n  public def method() { ... }\n}\n```',
     'try':      '**try** — Try-catch block:\n```\ntry { ... } catch { ... }\n```',
-    'include':  '**include** (v1.2.1) — Load a Bantu module:\n```\ninclude "./routes.b";            // direct\ninclude "./controller.b" as ctrl; // namespaced\n```\nModules execute in a child scope and their symbols are imported.',
+    'include':  '**include** (v1.2.2) — Load a Bantu module:\n```\ninclude "./routes.b";            // direct\ninclude "./controller.b" as ctrl; // namespaced\n```\nModules execute in a child scope and their symbols are imported.',
     'import':   '**import** — Alias for `include`.',
     'print':    '**print** — Print to stdout.',
     'const':    '**const** — Constant declaration.',
@@ -47,12 +47,12 @@ const SUA_METHOD_HOVERS: Record<string, string> = {
     'sua.mysql.query':   '**sua.mysql.query(sql)** — Run SQL and return rows.',
     'sua.json.parse':    '**sua.json.parse(str)** — Parse a JSON string to a dict.',
     'sua.json.stringify':'**sua.json.stringify(value)** — Serialize a value to a JSON string.',
-    'sua.webrtc.peer':   '**sua.webrtc.peer(id)** (v1.2.1) — Create a WebRTC peer.',
-    'sua.webrtc.createOffer':  '**sua.webrtc.createOffer(peerId)** (v1.2.1) — Generate an SDP offer.',
-    'sua.webrtc.createAnswer': '**sua.webrtc.createAnswer(peerId)** (v1.2.1) — Generate an SDP answer.',
-    'sua.webrtc.dataChannel':  '**sua.webrtc.dataChannel(label)** (v1.2.1) — Open a data channel.',
-    'sua.webrtc.send':   '**sua.webrtc.send(channel, message)** (v1.2.1) — Send a message over a data channel.',
-    'sua.include':       '**sua.include(path)** (v1.2.1) — Runtime module loader. Returns the module as a dict (does not pollute scope).',
+    'sua.webrtc.peer':   '**sua.webrtc.peer(id)** (v1.2.2) — Create a WebRTC peer.',
+    'sua.webrtc.createOffer':  '**sua.webrtc.createOffer(peerId)** (v1.2.2) — Generate an SDP offer.',
+    'sua.webrtc.createAnswer': '**sua.webrtc.createAnswer(peerId)** (v1.2.2) — Generate an SDP answer.',
+    'sua.webrtc.dataChannel':  '**sua.webrtc.dataChannel(label)** (v1.2.2) — Open a data channel.',
+    'sua.webrtc.send':   '**sua.webrtc.send(channel, message)** (v1.2.2) — Send a message over a data channel.',
+    'sua.include':       '**sua.include(path)** (v1.2.2) — Runtime module loader. Returns the module as a dict (does not pollute scope).',
 };
 
 export class BantuHoverProvider implements vscode.HoverProvider {

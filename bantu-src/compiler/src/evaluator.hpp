@@ -489,6 +489,10 @@ public:
         curl_global_cleanup();
     }
 
+    // v1.2.2: Suppress informational [INCLUDE] log lines. Errors still print.
+    void setQuiet(bool q) { quietMode_ = q; }
+    bool isQuiet() const { return quietMode_; }
+
     Value evaluate(std::vector<std::shared_ptr<ASTNode>>& program) {
         Value result;
         for (auto& node : program) {
@@ -524,6 +528,13 @@ private:
 
     // Cycle guard: includes already loaded in the current chain
     std::vector<std::string> loadedModules_;
+
+    // v1.2.2: include depth guard (prevent infinite include chains)
+    int includeDepth_ = 0;
+    static constexpr int kMaxIncludeDepth = 64;
+
+    // v1.2.2: quiet mode suppresses informational [INCLUDE] logs
+    bool quietMode_ = false;
 
     // ════════════════════════════════════════════════════════════
     // CORE EVALUATION DISPATCH
@@ -3386,14 +3397,27 @@ private:
 
         auto mod = bantu::resolveAndParse(n->path, importingFile);
         if (!mod.ok) {
-            std::cerr << "  [INCLUDE] " << mod.err << "\n";
+            std::cerr << "  [INCLUDE ERROR] " << mod.err << "\n";
             return Value();
         }
 
-        // Cycle guard
-        for (const auto& prev : loadedModules_) {
-            if (prev == mod.resolvedPath) {
-                // Already loaded — skip silently (idempotent include)
+        // v1.2.2: depth guard — protects against pathological include chains
+        // that the cycle guard might miss (e.g. generated files).
+        if (includeDepth_ >= kMaxIncludeDepth) {
+            std::cerr << "  [INCLUDE ERROR] Maximum include depth ("
+                      << kMaxIncludeDepth << ") exceeded while loading '"
+                      << mod.resolvedPath << "'. Possible include chain too deep.\n";
+            return Value();
+        }
+
+        // v1.2.2: cycle guard with clearer diagnostic. Tracks the chain
+        // so the user can see exactly which files caused the cycle.
+        for (size_t i = 0; i < loadedModules_.size(); ++i) {
+            if (loadedModules_[i] == mod.resolvedPath) {
+                if (!quietMode_) {
+                    std::cerr << "  [INCLUDE] Skipping already-loaded module: "
+                              << mod.resolvedPath << "\n";
+                }
                 return Value();
             }
         }
@@ -3405,12 +3429,14 @@ private:
         auto savedEnv = env_;
         env_ = childEnv;
         filePathStack_.push_back(mod.resolvedPath);
+        ++includeDepth_;
 
         Value last;
         for (auto& node : mod.ast) {
             last = evalNode(node);
         }
 
+        --includeDepth_;
         filePathStack_.pop_back();
         env_ = savedEnv;
 
@@ -3426,13 +3452,17 @@ private:
             for (const auto& [k, v] : moduleObj) {
                 env_->define(k, v);
             }
-            std::cout << "  [INCLUDE] Loaded " << mod.resolvedPath
-                      << " (" << moduleObj.size() << " symbols)\n";
+            if (!quietMode_) {
+                std::cout << "  [INCLUDE] Loaded " << mod.resolvedPath
+                          << " (" << moduleObj.size() << " symbols)\n";
+            }
         } else {
             // Namespaced include: bind alias -> module object
             env_->define(n->alias, Value(std::move(moduleObj)));
-            std::cout << "  [INCLUDE] Loaded " << mod.resolvedPath
-                      << " as '" << n->alias << "'\n";
+            if (!quietMode_) {
+                std::cout << "  [INCLUDE] Loaded " << mod.resolvedPath
+                          << " as '" << n->alias << "'\n";
+            }
         }
 
         return Value();

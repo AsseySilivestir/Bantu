@@ -1,5 +1,5 @@
 // ============================================================================
-// webrtc-chat/server.b — Signaling server for a WebRTC chat demo (v1.2.1)
+// webrtc-chat/server.b — Signaling server for a WebRTC chat demo (v1.2.2)
 //
 // Demonstrates:
 //   - sua.webrtc.peer / createOffer / createAnswer / addIceCandidate / send
@@ -7,7 +7,7 @@
 //   - Room-based peer pairing
 // ============================================================================
 
-print("=== Bantu WebRTC Chat v1.2.1 ===");
+print("=== Bantu WebRTC Chat v1.2.2 ===");
 
 // In-memory room registry: { roomId: [peerId1, peerId2, ...] }
 $rooms = {};
@@ -35,7 +35,7 @@ def leaveRoom($roomId, $peerId) {
 // ─── HTTP signaling endpoints ─────────────────────────────────────
 
 sua.server.get("/health", def($req, $res) {
-    $res.json({ "ok": true, "service": "webrtc-chat", "version": "1.2.1" });
+    $res.json({ "ok": true, "service": "webrtc-chat", "version": "1.2.2" });
 });
 
 // POST /join  { roomId, peerId }

@@ -1,4 +1,4 @@
-# Bantu v1.2.1 Benchmarks
+# Bantu v1.2.2 Benchmarks
 
 This directory contains the Bantu benchmark suite — both the built-in C++ benchmarks (`bantu bench`) and the pure-Bantu benchmarks (`benchmarks/bench.b`).
 
@@ -30,7 +30,7 @@ bantu run benchmarks/bench.b
 Run on a generic x86-64 Linux host (Ubuntu 22.04, GCC 11, single core):
 
 ```
-=== Bantu v1.2.1 Benchmark Suite ===
+=== Bantu v1.2.2 Benchmark Suite ===
 fib(28) recursive                   3 iters in 1842 ms   (614.0 ms/iter)
 1M-iteration arithmetic loop        5 iters in 980 ms     (196.0 ms/iter)
 list push 100k                      5 iters in 712 ms     (142.4 ms/iter)
@@ -40,7 +40,7 @@ dict set 100k                       3 iters in 856 ms     (285.3 ms/iter)
 
 For comparison (same machine, same algorithms):
 
-| Benchmark | Bantu v1.2.1 | Node.js 20 | Python 3.11 |
+| Benchmark | Bantu v1.2.2 | Node.js 20 | Python 3.11 |
 |---|---|---|---|
 | fib(28) | 614 ms | 38 ms | 285 ms |
 | 1M arithmetic loop | 196 ms | 2.4 ms | 38 ms |
@@ -48,7 +48,7 @@ For comparison (same machine, same algorithms):
 | string concat 10k | 413 ms | 1.9 ms | 9.2 ms |
 | dict set 100k | 285 ms | 11 ms | 22 ms |
 
-**Honest interpretation:** Bantu v1.2.1 is **~10–100x slower than V8 / CPython** on raw arithmetic and string-heavy workloads because it is a tree-walking interpreter without a JIT. The trade-off is what makes Bantu useful: the entire toolchain (interpreter, package manager, HTTP server, WebRTC engine, SQLite/Postgres/MySQL drivers, VSCode extension, Windows installer) ships in a single ~660 KB static binary that runs on any 64-bit Linux/Windows machine with no runtime dependencies.
+**Honest interpretation:** Bantu v1.2.2 is **~10–100x slower than V8 / CPython** on raw arithmetic and string-heavy workloads because it is a tree-walking interpreter without a JIT. The trade-off is what makes Bantu useful: the entire toolchain (interpreter, package manager, HTTP server, WebRTC engine, SQLite/Postgres/MySQL drivers, VSCode extension, Windows installer) ships in a single ~660 KB static binary that runs on any 64-bit Linux/Windows machine with no runtime dependencies.
 
 ## Reproducing
 

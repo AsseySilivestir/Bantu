@@ -1,4 +1,4 @@
-# Bantu v1.2.1 — Windows Install (Offline)
+# Bantu v1.2.2 — Windows Install (Offline)
 
 This folder contains everything you need to install Bantu on Windows,
 **without any internet connection**.
@@ -33,7 +33,7 @@ This folder contains everything you need to install Bantu on Windows,
 
    ```bat
    bantu --version
-   rem → Bantu v1.2.1
+   rem → Bantu v1.2.2
    ```
 
 5. Scaffold your first project:

@@ -2,6 +2,45 @@
 
 All notable changes to the Bantu programming language are documented in this file. The format is based on [Keep a Changelog](https://keepachangelog.com/), and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.2.2] — 2026-06-20
+
+### Fixed
+
+- **Module path canonicalization** — `include` now resolves through `realpath()` (POSIX) / `GetFullPathName` (Windows) so the same file reached via different relative paths (`./pkg/x.b`, `../pkg/x.b`, `pkg/x.b`) collapses to a single canonical key. This prevents the cycle guard from accidentally executing a module twice when it is reached via two different paths in the same project.
+- **Cycle-guard diagnostic** — Previously, a circular include was silently skipped with no message. It now prints `[INCLUDE] Skipping already-loaded module: <path>` so users can see what was elided. The depth limit also surfaces a clear `[INCLUDE ERROR] Maximum include depth (64) exceeded` if a generated or pathological include chain escapes the cycle guard.
+- **Depth limit** — A new `kMaxIncludeDepth = 64` guard prevents stack-exhaustion crashes on pathological include chains (e.g. self-generating scripts).
+- **Error attribution** — `Module not found` errors now include the importing file path so the user knows which file made the bad `include` call:
+  ```
+  [INCLUDE ERROR] Module not found: ./missing.b (imported from /app/routes.b)
+  ```
+- **`[INCLUDE]` log channel** — Errors now go to `stderr` with the `[INCLUDE ERROR]` tag (was previously mixed into `stdout` as `[INCLUDE]`), so users can filter them separately from informational messages.
+
+### Added
+
+- **`--quiet` / `-q` global flag** — Suppresses informational `[INCLUDE] Loaded …` and `[Executed in … us]` lines. Useful for production server logs and benchmark harnesses. Errors still print to `stderr`.
+  ```bash
+  bantu --quiet run server.b
+  bantu -q run server.b
+  bantu run server.b --quiet   # also accepted
+  ```
+- **`$BANTU_PATH` module search path** — When `include` cannot find a module via the standard resolution order (absolute → importing-file dir → cwd → with `.b` appended), it now falls back to each directory listed in the `BANTU_PATH` environment variable (POSIX `:`-separated, Windows `;`-separated). Lets users install shared module libraries outside their project tree:
+  ```bash
+  export BANTU_PATH=/opt/bantu/lib:~/bantu-modules
+  bantu run app.b   # can `include "auth.b";` from either dir
+  ```
+
+### Changed
+
+- Bumped version constant in `main.cpp`: `1.2.1` → `1.2.2`.
+- VSCode extension package version: `1.2.1` → `1.2.2` (re-packaged as `bantu-vscode-1.2.2.vsix`).
+- Sample app `bantu.json` versions bumped to `1.2.2`.
+- Benchmark script header updated to `Bantu v1.2.2 Benchmark Suite`.
+
+### Compatibility
+
+- v1.2.2 is a drop-in replacement for v1.2.1. No language changes, no breaking API changes. All v1.2.1 programs run unchanged.
+- Optional real-driver glue (`-DBANTU_POSTGRES`, `-DBANTU_MYSQL`, `-DBANTU_WEBRTC`) unchanged.
+
 ## [1.2.1] — 2026-06-20
 
 ### Added
@@ -13,7 +52,7 @@ All notable changes to the Bantu programming language are documented in this fil
   - Idempotent: a module is executed only once per execution
   - Cycle guard: circular includes are detected and broken silently
 - **`sua.include(path)` runtime function** — load a module dynamically, returns it as a dict (does not pollute scope)
-- **`sua.webrtc.*` namespace** (v1.2.1) — explicit WebRTC peer / data-channel API:
+- **`sua.webrtc.*` namespace** (v1.2.2) — explicit WebRTC peer / data-channel API:
   - `sua.webrtc.peer(id)`
   - `sua.webrtc.createOffer(peerId)` / `createAnswer(peerId)`
   - `sua.webrtc.addIceCandidate(peerId, candidate)`
@@ -42,19 +81,19 @@ All notable changes to the Bantu programming language are documented in this fil
   - `mysql_driver.hpp` (mysqlclient, `-DBANTU_MYSQL=ON`)
   - `webrtc_engine.hpp` (libdatachannel, `-DBANTU_WEBRTC=ON`)
 - **Module resolver** (`bantu-src/compiler/src/module_resolver.hpp`) — handles path resolution + lex/parse of included files
-- **30-page official PDF guide** at `docs/Bantu-Programming-Language-v1.2.1.pdf`
+- **30-page official PDF guide** at `docs/Bantu-Programming-Language-v1.2.2.pdf`
 
 ### Changed
 
 - Bumped version: `1.2.0` → `1.2.1`
-- `CMakeLists.txt` now declares `project(bantu VERSION 1.2.1)` and adds three CMake options (`BANTU_POSTGRES`, `BANTU_MYSQL`, `BANTU_WEBRTC`) with `find_path` / `find_library` detection
+- `CMakeLists.txt` now declares `project(bantu VERSION 1.2.2)` and adds three CMake options (`BANTU_POSTGRES`, `BANTU_MYSQL`, `BANTU_WEBRTC`) with `find_path` / `find_library` detection
 - `runCode()` in `main.cpp` now calls `evaluator.setEntryPoint(filename)` so that `include` statements resolve relative to the file being run
 - `sua.webrtc.peer()` returns a `platform` field indicating whether libdatachannel or the stub is in use
 
 ### Documentation
 
-- New 30-page PDF: `docs/Bantu-Programming-Language-v1.2.1.pdf`
-- Updated `README.md` to reflect v1.2.1 features
+- New 30-page PDF: `docs/Bantu-Programming-Language-v1.2.2.pdf`
+- Updated `README.md` to reflect v1.2.2 features
 - New `CHANGELOG.md` (this file)
 - New `benchmarks/README.md` and `benchmarks/results.md`
 - New `vscode-extension/README.md`

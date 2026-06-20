@@ -1,8 +1,8 @@
 {
   "name": "bantu-vscode",
   "displayName": "Bantu Language Support",
-  "description": "Syntax highlighting, autocomplete, hover hints, and snippets for the Bantu programming language (v1.2.1). Includes a blue-B file icon for .b files.",
-  "version": "1.2.1",
+  "description": "Syntax highlighting, autocomplete, hover hints, and snippets for the Bantu programming language (v1.2.2). Includes a blue-B file icon for .b files.",
+  "version": "1.2.2",
   "publisher": "AsseySilivestir",
   "license": "MIT",
   "repository": {

@@ -1,5 +1,5 @@
 // ============================================================================
-// server.b — Entry point for the Bantu Blogsite sample (v1.2.1)
+// server.b — Entry point for the Bantu Blogsite sample (v1.2.2)
 //
 // Demonstrates:
 //   - Modular structure with `include` keyword
@@ -8,7 +8,7 @@
 //   - Reusable route + controller modules
 // ============================================================================
 
-print("=== Bantu Blogsite v1.2.1 ===");
+print("=== Bantu Blogsite v1.2.2 ===");
 
 // 1. Load shared utilities and DB layer
 include "./db.b";              // brings $db, initDb() into scope

@@ -1,5 +1,5 @@
 // ============================================================================
-// bench.b — Bantu v1.2.1 Benchmark Suite (pure Bantu version)
+// bench.b — Bantu v1.2.2 Benchmark Suite (pure Bantu version)
 //
 // Run with:   bantu run bench.b
 // Or use:     bantu bench      (built-in C++ version, slightly faster)
@@ -8,7 +8,7 @@
 // also collected into a $results dict that the harness prints at the end.
 // ============================================================================
 
-print("=== Bantu v1.2.1 Benchmark Suite (pure-Bantu) ===");
+print("=== Bantu v1.2.2 Benchmark Suite (pure-Bantu) ===");
 print("");
 
 $results = [];
@@ -92,7 +92,7 @@ bench("dict set 100k", 3, def() {
 // ─── Summary ──────────────────────────────────────────────────────
 print("");
 print("=== Summary ===");
-print("Bantu v1.2.1");
+print("Bantu v1.2.2");
 each ($r in $results) {
     print("  " + $r.name + ": " + $r.opsPerSec + " ops/s");
 }
