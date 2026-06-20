@@ -24,27 +24,82 @@ cd myapp && bantu run
 | **Three sample apps** | `samples/blogsite` (modular Sua + SQLite), `samples/webrtc-chat` (signaling + browser UI), `samples/pg-dashboard` (PostgreSQL analytics). |
 | **PDF documentation** | 30-page official guide at `docs/Bantu-Programming-Language-v1.2.1.pdf`. |
 
+## Download
+
+Grab the latest zip from the [v1.2.1 release](https://github.com/AsseySilivestir/Bantu/releases/tag/v1.2.1):
+
+| Asset | Size | Platform | Includes |
+|---|---|---|---|
+| [`Bantu-v1.2.1-linux-x64.zip`](https://github.com/AsseySilivestir/Bantu/releases/download/v1.2.1/Bantu-v1.2.1-linux-x64.zip) | ~350 KB | Linux x86-64 | Pre-built `bantu` binary + samples + docs + VSIX |
+| [`Bantu-v1.2.1-windows-x64.zip`](https://github.com/AsseySilivestir/Bantu/releases/download/v1.2.1/Bantu-v1.2.1-windows-x64.zip) | ~840 KB | Windows x64 | Full C++ source + `setup.bat` + samples + VSIX |
+| [`bantu-vscode-1.2.1.vsix`](https://github.com/AsseySilivestir/Bantu/releases/download/v1.2.1/bantu-vscode-1.2.1.vsix) | ~24 KB | VSCode 1.75+ | Standalone extension (also inside both zips) |
+| [`Bantu-Programming-Language-v1.2.1.pdf`](https://github.com/AsseySilivestir/Bantu/releases/download/v1.2.1/Bantu-Programming-Language-v1.2.1.pdf) | ~65 KB | Any | 30-page official guide |
+
 ## Quick Start
 
+Bantu v1.2.1 ships as a **zip distribution** with a built-in PATH integrator
+and an offline package manager — so you can scaffold, install, and run new
+Bantu projects with the same ergonomics as `npm init`, `cargo new`, or
+Spring Initializr. **No internet required.**
+
+### One-time setup (Linux x86-64)
+
 ```bash
-# 1. Get the binary
-curl -L -o bantu https://github.com/AsseySilivestir/Bantu/releases/download/v1.2.1/bantu-linux
+# 1. Download and unzip the release
+curl -L -o bantu.zip https://github.com/AsseySilivestir/Bantu/releases/download/v1.2.1/Bantu-v1.2.1-linux-x64.zip
+unzip bantu.zip
+cd bantu-v1.2.1-linux-x64
+
+# 2. Add bantu to PATH (one-time) + seed local registry
 chmod +x bantu
+./bantu setup --seed
 
-# 2. Add to PATH (one-time)
-./bantu setup
+# 3. Open a NEW terminal (so PATH reloads), then verify
+bantu --version
+# → Bantu v1.2.1
+```
 
-# 3. Create a project
-bantu init myproject
+### One-time setup (Windows x64)
+
+Download `Bantu-v1.2.1-windows-x64.zip`, unzip, then build `bantu.exe` once
+(requires Visual Studio 2022 with C++ workload, or MinGW-w64):
+
+```bat
+cd bantu-v1.2.1-windows-x64\bantu-src\compiler
+cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build --config Release
+copy build\Release\bantu.exe ..\..\..\
+cd ..\..\
+setup.bat --seed
+```
+
+Open a **new** terminal, then `bantu --version` → `Bantu v1.2.1`.
+
+### Your first project
+
+```bash
+bantu init myproject         # new CLI project
 cd myproject
+bantu run                    # runs main.b
 
-# 4. Run it
-bantu run
-
-# 5. Scaffold a Sua web app instead
+# Or scaffold a Sua web app (Spring Initializr-style)
 bantu init --web shop
 cd shop && bantu run server.b
+
+# Install packages (offline, from the seeded local registry)
+bantu search                 # browse available packages
+bantu add math-utils         # install + add to bantu.json
+bantu list                   # show installed packages
 ```
+
+### VSCode extension (optional, recommended)
+
+```bash
+code --install-extension bantu-vscode-1.2.1.vsix
+```
+
+Gives you `.b` syntax highlighting, autocomplete, hover hints, snippets,
+Go-to-Symbol, and the **blue-B file icon** in the VSCode explorer.
 
 ## Hello, Bantu!
 
