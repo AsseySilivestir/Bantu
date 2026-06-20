@@ -39,6 +39,7 @@
 #include <bitset>
 #include <cmath>
 #include <algorithm>
+#include <filesystem>     // C++17 — cross-platform mkdir/rm/cp (replaces POSIX shell calls)
 
 // ─── Platform-specific POSIX headers ───
 #ifdef _WIN32
@@ -62,6 +63,84 @@ const std::string BANTU_LANG = "Bantu";
 bool fileExists(const std::string& path) {
     struct stat buffer;
     return (stat(path.c_str(), &buffer) == 0);
+}
+
+// ─── Cross-platform filesystem helpers (C++17 <filesystem>) ───────────
+// These replace POSIX-only `system("mkdir -p ...")` / `system("rm -rf ...")`
+// / `system("cp ...")` calls so the installer works identically on Windows,
+// macOS, and Linux without needing a POSIX shell (no Git Bash / WSL required).
+
+namespace fs = std::filesystem;
+
+// Recursively create a directory (no-op if it already exists). Returns true
+// on success or if the directory already existed.
+bool fsMkdirP(const std::string& path) {
+    if (path.empty()) return true;
+    std::error_code ec;
+    fs::create_directories(fs::path(path), ec);
+    return !ec;
+}
+
+// Recursively remove a directory tree (no-op if it doesn't exist).
+bool fsRmRf(const std::string& path) {
+    if (path.empty()) return true;
+    std::error_code ec;
+    fs::remove_all(fs::path(path), ec);
+    return !ec;
+}
+
+// Copy a single file. Overwrites the destination if it exists.
+bool fsCopyFile(const std::string& src, const std::string& dst) {
+    std::error_code ec;
+    fs::copy_file(fs::path(src), fs::path(dst),
+                  fs::copy_options::overwrite_existing, ec);
+    return !ec;
+}
+
+// Recursively copy a directory tree. Creates dst if it doesn't exist.
+bool fsCopyDir(const std::string& src, const std::string& dst) {
+    std::error_code ec;
+    fs::copy(fs::path(src), fs::path(dst),
+             fs::copy_options::recursive | fs::copy_options::overwrite_existing,
+             ec);
+    return !ec;
+}
+
+// Copy all files matching a given extension from srcDir into dstDir.
+// Used to copy *.b source files into the Android assets folder without
+// relying on a shell glob.
+int fsCopyByExtension(const std::string& srcDir, const std::string& dstDir,
+                      const std::string& extWithDot) {
+    if (!fsMkdirP(dstDir)) return 0;
+    int copied = 0;
+    std::error_code ec;
+    for (auto& entry : fs::directory_iterator(fs::path(srcDir), ec)) {
+        if (ec) break;
+        if (!entry.is_regular_file()) continue;
+        if (entry.path().extension() == extWithDot) {
+            std::string dst = dstDir + "/" + entry.path().filename().string();
+            if (fsCopyFile(entry.path().string(), dst)) copied++;
+        }
+    }
+    return copied;
+}
+
+// Copy a single named file from srcDir to dstDir if it exists.
+bool fsCopyNamedIfExists(const std::string& srcDir, const std::string& dstDir,
+                         const std::string& filename) {
+    std::string src = srcDir + "/" + filename;
+    if (!fileExists(src)) return false;
+    if (!fsMkdirP(dstDir)) return false;
+    return fsCopyFile(src, dstDir + "/" + filename);
+}
+
+// Recursively copy a named subdirectory (e.g. "public") from srcDir into dstDir.
+bool fsCopyNamedDirIfExists(const std::string& srcDir, const std::string& dstDir,
+                            const std::string& dirname) {
+    std::string src = srcDir + "/" + dirname;
+    if (!fs::is_directory(fs::path(src))) return false;
+    if (!fsMkdirP(dstDir)) return false;
+    return fsCopyDir(src, dstDir + "/" + dirname);
 }
 
 std::string readFile(const std::string& path) {
@@ -1537,7 +1616,7 @@ static int buildAndroidInstaller(
     bool bundleBantu)
 {
     std::string distDir = "dist";
-    system(("mkdir -p " + distDir).c_str());
+    fsMkdirP(distDir);
 
     std::string pkgName    = sanitizePkgName(appName);
     std::string className  = sanitizeClassName(appName);
@@ -1559,8 +1638,8 @@ static int buildAndroidInstaller(
     if (safeDirName.empty()) safeDirName = "BantuApp";
 
     std::string projectDir = distDir + "/android/" + safeDirName;
-    system(("rm -rf '" + projectDir + "'").c_str());
-    system(("mkdir -p '" + projectDir + "'").c_str());
+    fsRmRf(projectDir);
+    fsMkdirP(projectDir);
 
     // ─── Project-level Gradle files ───
     writeFile(projectDir + "/settings.gradle",
@@ -1631,15 +1710,15 @@ local.properties
     std::string assetsDir  = mainDir + "/assets/bantu";
     std::string jniDir     = mainDir + "/jniLibs/arm64-v8a";
     std::string jniX64Dir  = mainDir + "/jniLibs/x86_64";
-    system(("mkdir -p '" + javaDir + "'").c_str());
-    system(("mkdir -p '" + resDir + "/layout'").c_str());
-    system(("mkdir -p '" + resDir + "/values'").c_str());
-    system(("mkdir -p '" + resDir + "/mipmap-anydpi-v26'").c_str());
-    system(("mkdir -p '" + resDir + "/drawable'").c_str());
-    system(("mkdir -p '" + resDir + "/xml'").c_str());
-    system(("mkdir -p '" + assetsDir + "'").c_str());
-    system(("mkdir -p '" + jniDir + "'").c_str());
-    system(("mkdir -p '" + jniX64Dir + "'").c_str());
+    fsMkdirP(javaDir);
+    fsMkdirP(resDir + "/layout");
+    fsMkdirP(resDir + "/values");
+    fsMkdirP(resDir + "/mipmap-anydpi-v26");
+    fsMkdirP(resDir + "/drawable");
+    fsMkdirP(resDir + "/xml");
+    fsMkdirP(assetsDir);
+    fsMkdirP(jniDir);
+    fsMkdirP(jniX64Dir);
 
     // app/build.gradle
     writeFile(appDir + "/build.gradle",
@@ -1979,9 +2058,13 @@ class BantuRunner(private val ctx: Context) {
 )XML");
 
     // Copy .b source files + bantu.json + public/ into assets/bantu/
-    system(("cp *.b '" + assetsDir + "/' 2>/dev/null").c_str());
-    system(("cp bantu.json '" + assetsDir + "/' 2>/dev/null").c_str());
-    system(("cp -r public '" + assetsDir + "/' 2>/dev/null").c_str());
+    // (Cross-platform: uses C++17 <filesystem> instead of shell globs.)
+    int nB = fsCopyByExtension(".", assetsDir, ".b");
+    fsCopyNamedIfExists(".", assetsDir, "bantu.json");
+    fsCopyNamedDirIfExists(".", assetsDir, "public");
+    if (nB > 0) {
+        std::cout << "  [INSTALLER] Copied " << nB << " .b source file(s) into assets/.\n";
+    }
 
     // Optionally embed the bantu binary as libbantu.so.
     // Search order:
@@ -2005,7 +2088,7 @@ class BantuRunner(private val ctx: Context) {
         }
         for (const auto& p : armCandidates) {
             if (fileExists(p)) {
-                system(("cp '" + p + "' '" + jniDir + "/libbantu.so'").c_str());
+                fsCopyFile(p, jniDir + "/libbantu.so");
                 std::cout << "  [INSTALLER] Bundled arm64-v8a bantu: " << p << "\n";
                 bundledArm64 = true;
                 break;
@@ -2023,7 +2106,7 @@ class BantuRunner(private val ctx: Context) {
         }
         for (const auto& p : x64Candidates) {
             if (fileExists(p)) {
-                system(("cp '" + p + "' '" + jniX64Dir + "/libbantu.so'").c_str());
+                fsCopyFile(p, jniX64Dir + "/libbantu.so");
                 std::cout << "  [INSTALLER] Bundled x86_64 bantu: " << p << "\n";
                 bundledX64 = true;
                 break;
@@ -2084,7 +2167,63 @@ echo "[build-apk] APK ready: $OUT ($(du -h "$OUT" | cut -f1))"
 echo "[build-apk] Install on a connected device with:"
 echo "    adb install -r $OUT"
 )BASH");
-    system(("chmod +x '" + projectDir + "/build-apk.sh'").c_str());
+#ifndef _WIN32
+    // Unix: mark the shell helper executable.
+    chmod((projectDir + "/build-apk.sh").c_str(), 0755);
+#endif
+
+    // build-apk.bat — Windows equivalent so users on cmd / PowerShell can
+    // build the APK without needing Git Bash or WSL.
+    writeFile(projectDir + "/build-apk.bat",
+        R"BAT(@echo off
+REM Build the Android APK from the project generated by `bantu installer --platform android`.
+REM Requires: Android SDK + JDK 17 + (optionally) Android NDK for cross-compiling bantu.
+setlocal enabledelayedexpansion
+
+cd /d "%~dp0"
+
+REM Locate gradle wrapper
+if not exist gradlew.bat (
+    where gradle >nul 2>nul
+    if !errorlevel! == 0 (
+        call gradle wrapper --gradle-version 8.4
+        if !errorlevel! neq 0 (
+            echo [ERROR] gradle wrapper generation failed.
+            exit /b 1
+        )
+    ) else (
+        echo [ERROR] No gradlew.bat and no system gradle on PATH.
+        echo        Install gradle from https://gradle.org/install/ and re-run.
+        exit /b 1
+    )
+)
+
+REM Require ANDROID_HOME (or local.properties)
+if not exist local.properties (
+    if "%ANDROID_HOME%"=="" (
+        echo [ERROR] Neither local.properties nor ANDROID_HOME is set.
+        echo        Create local.properties with: sdk.dir=C:\path\to\Android\Sdk
+        echo        OR: set ANDROID_HOME=C:\path\to\Android\Sdk
+        exit /b 1
+    )
+)
+
+echo [build-apk] Building debug APK...
+call gradlew.bat assembleDebug --no-daemon
+if !errorlevel! neq 0 (
+    echo [ERROR] Gradle build failed.
+    exit /b !errorlevel!
+)
+
+set "APK=app\build\outputs\apk\debug\app-debug.apk"
+set "OUT=app-debug.apk"
+copy /Y "%APK%" "%OUT%" >nul
+echo.
+echo [build-apk] APK ready: %OUT%
+for %%I in (%OUT%) do echo [build-apk] Size: %%~zI bytes
+echo [build-apk] Install on a connected device with:
+echo     adb install -r %OUT%
+)BAT");
 
     // BUILD-ANDROID.md — NDK cross-compile instructions
     writeFile(projectDir + "/BUILD-ANDROID.md",
@@ -2182,13 +2321,142 @@ Enable USB debugging on the phone first (Developer options → USB debugging).
         "See `BUILD-ANDROID.md` for full instructions including how to\n"
         "cross-compile Bantu for Android arm64 with the NDK.\n");
 
-    // Try to auto-build the APK if gradle is available.
+    // ─── Try to auto-build the APK directly ────────────────────────────
+    // The user asked: "I want it to make .apk direct if I run
+    // `bantu installer --platform android`." So that's what we do —
+    // invoke gradle (the wrapper if present, otherwise the system gradle)
+    // to actually produce app-debug.apk, then copy it to a clean path
+    // at dist/<AppName>-debug.apk.
     std::cout << "\n  [INSTALLER] Android Studio project ready:\n";
     std::cout << "    " << projectDir << "/\n";
-    std::cout << "\n  Next steps:\n";
-    std::cout << "    1. Cross-compile bantu for Android arm64 (see BUILD-ANDROID.md)\n";
-    std::cout << "    2. cd " << projectDir << " && ./build-apk.sh\n";
-    std::cout << "    3. adb install -r app-debug.apk\n";
+    std::cout << "\n  [INSTALLER] Attempting to build the APK now...\n";
+
+    // Decide which gradle command to use. On Windows we use gradlew.bat;
+    // on Unix we use ./gradlew. If neither wrapper exists yet, fall back
+    // to system `gradle` and have it generate the wrapper first.
+    std::string gradleCmd;
+    bool needWrapperBoot = false;
+#ifdef _WIN32
+    if (fileExists(projectDir + "/gradlew.bat")) {
+        gradleCmd = "gradlew.bat";
+    } else if (std::system("where gradle >nul 2>nul") == 0) {
+        gradleCmd = "gradlew.bat";
+        needWrapperBoot = true;
+    }
+#else
+    if (fileExists(projectDir + "/gradlew")) {
+        gradleCmd = "./gradlew";
+    } else if (std::system("command -v gradle >/dev/null 2>&1") == 0) {
+        gradleCmd = "./gradlew";
+        needWrapperBoot = true;
+    }
+#endif
+
+    // Also check that ANDROID_HOME or local.properties is set, otherwise
+    // gradle will fail with a confusing error.
+    bool hasSdk = false;
+    if (fileExists(projectDir + "/local.properties")) {
+        hasSdk = true;
+    } else {
+        const char* ah = std::getenv("ANDROID_HOME");
+        if (!ah || !*ah) ah = std::getenv("ANDROID_SDK_ROOT");
+        if (ah && *ah) hasSdk = true;
+    }
+
+    if (gradleCmd.empty()) {
+        std::cout << "  [INSTALLER] Gradle not found on PATH.\n";
+        std::cout << "              Install gradle (apt install gradle / brew install gradle /\n";
+        std::cout << "              https://gradle.org/install/) and re-run, OR open the project\n";
+        std::cout << "              in Android Studio and press Run.\n";
+    } else if (!hasSdk) {
+        std::cout << "  [INSTALLER] Android SDK not configured.\n";
+        std::cout << "              Set ANDROID_HOME or create local.properties with:\n";
+        std::cout << "                sdk.dir=/path/to/Android/Sdk\n";
+        std::cout << "              Then re-run, OR open the project in Android Studio.\n";
+    } else {
+        // Save current directory, cd into the project, run gradle, then cd back.
+        std::string cwd = fs::current_path().string();
+        std::error_code ec;
+        fs::current_path(fs::path(projectDir), ec);
+
+        int rc = 1;
+        if (needWrapperBoot) {
+            std::cout << "  [INSTALLER] Generating gradle wrapper (one-time)...\n";
+#ifdef _WIN32
+            rc = std::system("gradle wrapper --gradle-version 8.4");
+#else
+            rc = std::system("gradle wrapper --gradle-version 8.4");
+#endif
+            if (rc == 0) {
+                std::cout << "  [INSTALLER] Building debug APK (this may take 1-3 min on first run)...\n";
+#ifdef _WIN32
+                rc = std::system("gradlew.bat assembleDebug --no-daemon");
+#else
+                rc = std::system("./gradlew assembleDebug --no-daemon");
+#endif
+            }
+        } else {
+            std::cout << "  [INSTALLER] Building debug APK (this may take 1-3 min on first run)...\n";
+#ifdef _WIN32
+            rc = std::system((gradleCmd + " assembleDebug --no-daemon").c_str());
+#else
+            rc = std::system((gradleCmd + " assembleDebug --no-daemon").c_str());
+#endif
+        }
+
+        // Restore the original working directory.
+        fs::current_path(fs::path(cwd), ec);
+
+        // Look for the built APK and copy it to a clean top-level path.
+        std::string builtApk = projectDir + "/app/build/outputs/apk/debug/app-debug.apk";
+        std::string finalApk = distDir + "/" + safeDirName + "-debug.apk";
+
+        if (rc == 0 && fileExists(builtApk)) {
+            fsCopyFile(builtApk, finalApk);
+            std::cout << "\n  [INSTALLER] ✓ APK built successfully!\n";
+            std::cout << "    " << finalApk << "\n";
+            // Show file size
+            try {
+                auto sz = fs::file_size(fs::path(finalApk));
+                std::cout << "    Size: " << (sz / 1024) << " KB\n";
+            } catch (...) {}
+            std::cout << "\n  Install on a connected device with:\n";
+            std::cout << "    adb install -r " << finalApk << "\n";
+        } else if (rc == 0) {
+            std::cout << "\n  [INSTALLER] Gradle reported success but the APK file was not found at the expected path.\n";
+            std::cout << "    Looked for: " << builtApk << "\n";
+            std::cout << "    The project is at: " << projectDir << "/\n";
+            std::cout << "    Try opening it in Android Studio and pressing Run.\n";
+        } else {
+            std::cout << "\n  [INSTALLER] Gradle build failed (exit code " << rc << ").\n";
+            std::cout << "    The project is at: " << projectDir << "/\n";
+            std::cout << "    Common causes:\n";
+            std::cout << "      - JDK 17 not installed (gradle 8.4 requires JDK 17)\n";
+            std::cout << "      - Android SDK build-tools / platform-tools not installed\n";
+            std::cout << "      - ANDROID_HOME points to the wrong directory\n";
+            std::cout << "    Open the project in Android Studio for detailed error output,\n";
+            std::cout << "    or re-run manually inside the project directory:\n";
+#ifdef _WIN32
+            std::cout << "      cd " << projectDir << " && build-apk.bat\n";
+#else
+            std::cout << "      cd " << projectDir << " && ./build-apk.sh\n";
+#endif
+        }
+    }
+
+    // Helpful next steps regardless of whether the auto-build succeeded.
+    if (!gradleCmd.empty() && hasSdk) {
+        // Already attempted the build above — nothing more to add.
+    } else {
+        std::cout << "\n  Next steps:\n";
+        std::cout << "    1. Cross-compile bantu for Android arm64 (see BUILD-ANDROID.md)\n";
+#ifdef _WIN32
+        std::cout << "    2. cd " << projectDir << " && build-apk.bat\n";
+#else
+        std::cout << "    2. cd " << projectDir << " && ./build-apk.sh\n";
+#endif
+        std::cout << "    3. adb install -r " << distDir << "/" << safeDirName << "-debug.apk\n";
+    }
     return 0;
 }
 
