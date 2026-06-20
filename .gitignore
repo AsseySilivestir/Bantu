@@ -31,3 +31,4 @@ vscode-extension/*.vsix
 
 # v1.2.1 — Windows installer build output
 dist/
+vscode-extension/package-lock.json

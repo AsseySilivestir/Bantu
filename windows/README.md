@@ -1,112 +1,74 @@
-# ChatBantu for Windows
+# Bantu v1.2.1 — Windows Install (Offline)
 
-> **Spring Initializer-style:** download, unzip, run. No installs, no internet, no WSL, no Docker.
+This folder contains everything you need to install Bantu on Windows,
+**without any internet connection**.
 
-## What's in this zip
+## One-time setup
 
-```
-chatbantu-windows-x64/
-├── bantu.exe              ← the Bantu interpreter (native Windows binary)
-├── server.b               ← the entire ChatBantu backend (one file)
-├── public/                ← frontend (HTML/CSS/JS, no build step)
-│
-├── start.bat              ← double-click to launch + open browser
-├── stop.bat               ← kill the server
-├── reset-db.bat           ← wipe chatbantu.db and reseed
-├── README.md              ← this file
-│
-└── (runtime DLLs)
-    ├── sqlite3.dll        ← SQLite runtime
-    ├── libcurl-x64.dll    ← libcurl runtime (+ its bundled TLS deps)
-    ├── libc++.dll         ← C++ standard library (llvm-mingw)
-    ├── libunwind.dll      ← stack unwinding (libc++ dep)
-    └── libwinpthread-1.dll← pthreads emulation
-```
+1. Unzip the release.
+2. If `bantu.exe` is **not** in this folder yet, build it from source:
 
-Nothing else is needed. The DLLs cover every external dependency; Windows itself supplies KERNEL32, WS2_32, and the Universal CRT (`api-ms-win-crt-*`), all of which ship with Windows 10 and later.
+   ```bat
+   cd bantu-src\compiler
+   cmake -B build -DCMAKE_BUILD_TYPE=Release
+   cmake --build build --config Release
+   copy build\Release\bantu.exe ..\..\
+   cd ..\..\
+   ```
 
-## How to run
+   (You need Visual Studio 2022 with the **Desktop C++** workload, plus CMake.
+   MinGW-w64 also works: replace the cmake lines with
+   `cmake -B build -G "MinGW Makefiles" -DCMAKE_BUILD_TYPE=Release`.)
 
-1. **Unzip** the download anywhere — `C:\chatbantu`, your Desktop, a USB stick, doesn't matter.
-2. **Double-click `start.bat`.**
-3. A console window opens, the server boots, and your default browser opens to `http://localhost:8080`.
+3. Run `setup.bat` (double-click or from a terminal):
 
-That's it. No PowerShell, no `npm install`, no `pip`, no `apt-get`. If you want to run it from PowerShell or CMD instead, just `cd` into the folder and run:
+   ```bat
+   setup.bat --seed
+   ```
 
-```powershell
-.\start.bat
-```
+   This adds the Bantu folder to your **user PATH** (persistent) and seeds
+   the local package registry with starter packages.
 
-## Login
+4. Open a **new** terminal and verify:
 
-The first run creates `chatbantu.db` with a demo user:
+   ```bat
+   bantu --version
+   rem → Bantu v1.2.1
+   ```
 
-- **username:** `silivestir`
-- **password:** `bantu123`
+5. Scaffold your first project:
 
-## Stopping
+   ```bat
+   bantu init myproject
+   cd myproject
+   bantu run
+   ```
 
-- Close the **"ChatBantu Server"** console window, **or**
-- Run `stop.bat`.
+## Files in this folder
 
-## Wiping the database
+| File | Purpose |
+|---|---|
+| `setup.bat` | One-time installer (adds to PATH, optional `--seed`) |
+| `start.bat` | Start the bundled Sua sample server in background |
+| `stop.bat`  | Stop the background server |
+| `reset-db.bat` | Delete the SQLite DB (will reseed on next start) |
+| `README.md` | This file |
 
-Run `reset-db.bat`. The next `start.bat` will recreate `chatbantu.db` from scratch with the demo user.
+## Diagnose
 
-## Changing the port
-
-From PowerShell:
-
-```powershell
-$env:PORT=9000
-.\start.bat
+```bat
+bantu doctor
 ```
 
-From CMD:
+Checks PATH, registry, and runs a tiny sample. Tells you what's wrong.
 
-```cmd
-set PORT=9000
-start.bat
+## Build a Windows installer for your own Bantu app
+
+Once you've written a Bantu app, you can wrap it in an NSIS installer:
+
+```bat
+bantu build-windows --name MyBlog --version 1.0.0 server.b
 ```
 
-## Troubleshooting
-
-**"Windows protected your PC" / SmartScreen warning**
-
-The .exe is unsigned, so Windows shows a blue SmartScreen prompt. Click **"More info" → "Run anyway"**. To avoid this permanently, sign the .exe with a code-signing certificate (not bundled here).
-
-**`start.bat` flashes and disappears**
-
-Run it from an existing PowerShell / CMD window so the error stays visible:
-
-```powershell
-cd C:\chatbantu
-.\start.bat
-```
-
-Then check `server.log` — that's where the Bantu interpreter's stderr goes.
-
-**Port 8080 is already in use**
-
-Set `PORT` to something else (see "Changing the port" above).
-
-**Antivirus quarantines `bantu.exe`**
-
-Some AV products are suspicious of unsigned executables that listen on a port. Add the folder to your AV exclusions, or build `bantu.exe` yourself from source on your own machine (see the `bantusua-local` repo's `bantu-src/compiler/build-win.sh`).
-
-**`bantu.exe` won't start and there's no error in server.log**
-
-Open `cmd.exe`, `cd` to the folder, and run `bantu.exe --version` directly. If Windows complains about missing DLLs, restore the DLLs from the zip — they're all required.
-
-## System requirements
-
-- Windows 10 (1809+) or Windows 11, 64-bit
-- ~50 MB free disk space
-- A browser (any modern one — Edge, Chrome, Firefox)
-- No admin rights needed
-
-## What this is
-
-ChatBantu is a real-world social network (posts, likes, comments, follow, real-time chat, presence, notifications, WebRTC video calls) built entirely with the **Bantu** programming language and its **Sua** web framework — no Node.js, no Python, no other runtime. The backend is a single `server.b` file interpreted by `bantu.exe`.
-
-Source code: https://github.com/AsseySilivestir/bantusua-local
+This produces `dist/MyBlog-Setup-1.0.0.exe`. (Requires
+[NSIS](https://nsis.sourceforge.io/) installed.)
