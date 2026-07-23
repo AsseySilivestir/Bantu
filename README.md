@@ -411,7 +411,7 @@ Bantu/
 
 ## Documentation
 
-- **Official guide:** [`docs/Bantu-Programming-Language-v1.2.2.pdf`](docs/Bantu-Programming-Language-v1.2.2.pdf) — 36 pages, Dracula-themed, covers every feature including `bantu installer`
+- **Official guide/documentation:** [`docs/Bantu-Programming-Language-v1.2.2.pdf`](docs/Bantu-Programming-Language-v1.2.2.pdf) — 36 pages, Dracula-themed, covers every feature including `bantu installer`
 - **Quick start:** [`QUICKSTART.md`](QUICKSTART.md)
 - **Samples:** [`samples/`](samples/) — three runnable apps
 - **VSCode extension:** [`vscode-extension/README.md`](vscode-extension/README.md)
