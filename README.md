@@ -1,4 +1,4 @@
-# Bantu
+# Bantu v1.2.2
 
 **Bantu Programming Language v1.2.2 — Stable Release**
 
