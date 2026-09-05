@@ -300,6 +300,143 @@ static std::unordered_map<int, std::fstream>& bantuFileTable() {
 }
 static int bantuNextFileId = 1;
 
+// ─── UDP socket registry (sua.udp namespace, v1.4.0) ───
+// sua.udp.socket() returns a handle dict {"__udp": id}; the actual fd lives
+// here, keyed by id. Same pattern as bantuFileTable().
+//
+// Each entry holds the OS socket fd, family (AF_INET / AF_INET6), and a
+// flag indicating whether it's been bound. Lifecycle: socket() → bind() →
+// recvfrom()/send_to() → close().
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <netdb.h>
+#include <poll.h>
+#include <unistd.h>
+#include <fcntl.h>
+struct BantuUdpSocket {
+    int fd = -1;
+    int family = AF_INET;
+    bool bound = false;
+};
+static std::unordered_map<int, BantuUdpSocket>& bantuUdpSocketTable() {
+    static std::unordered_map<int, BantuUdpSocket> table;
+    return table;
+}
+static int bantuNextUdpId = 1;
+
+// Helper: parse "host:port" → (host, port). Supports IPv6 brackets [::1]:53.
+static std::pair<std::string, int> bantuUdpParseAddr(const std::string& addr) {
+    // IPv6 form: [::1]:53
+    if (!addr.empty() && addr[0] == '[') {
+        auto end = addr.find(']');
+        if (end != std::string::npos && end + 2 <= addr.size() && addr[end + 1] == ':') {
+            std::string host = addr.substr(1, end - 1);
+            int port = std::atoi(addr.c_str() + end + 2);
+            return {host, port};
+        }
+    }
+    // IPv4 form: 127.0.0.1:53
+    auto colon = addr.rfind(':');
+    if (colon == std::string::npos) return {"", 0};
+    return {addr.substr(0, colon), std::atoi(addr.c_str() + colon + 1)};
+}
+
+// Helper: convert a Bantu list-of-bytes (numbers 0-255) into a std::vector<uint8_t>.
+static std::vector<uint8_t> bantuValueToBytes(const Value& v) {
+    std::vector<uint8_t> out;
+    if (v.isList()) {
+        out.reserve(v.listVal.size());
+        for (const auto& e : v.listVal) {
+            int b = (int)e.numberVal;
+            if (b < 0) b = 0;
+            if (b > 255) b = 255;
+            out.push_back((uint8_t)b);
+        }
+    } else if (v.isString()) {
+        const auto& s = v.stringVal;
+        out.assign(s.begin(), s.end());
+    }
+    return out;
+}
+
+// Helper: convert std::vector<uint8_t> into a Bantu list-of-bytes.
+static Value bantuBytesToValue(const std::vector<uint8_t>& buf) {
+    std::vector<Value> out;
+    out.reserve(buf.size());
+    for (uint8_t b : buf) out.push_back(Value((double)b));
+    return Value(std::move(out));
+}
+
+// Helper: resolve a host string + port into a struct sockaddr_storage.
+// Supports IPv4 dotted-quad, IPv6 (with or without brackets), and hostnames
+// (uses getaddrinfo() to resolve). Returns 0 on success, -1 on failure.
+static int bantuUdpResolve(const std::string& host, int port,
+                            struct sockaddr_storage* ss, socklen_t* sslen,
+                            int family, std::string* errOut) {
+    memset(ss, 0, sizeof(*ss));
+
+    // Try IPv4 dotted-quad first (no DNS lookup)
+    if (family == AF_INET) {
+        struct sockaddr_in* sa = (struct sockaddr_in*)ss;
+        sa->sin_family = AF_INET;
+        sa->sin_port = htons((uint16_t)port);
+        if (inet_pton(AF_INET, host.c_str(), &sa->sin_addr) == 1) {
+            *sslen = sizeof(*sa);
+            return 0;
+        }
+    }
+    // Try IPv6 literal next (no DNS lookup)
+    if (family == AF_INET6) {
+        struct sockaddr_in6* sa6 = (struct sockaddr_in6*)ss;
+        sa6->sin6_family = AF_INET6;
+        sa6->sin6_port = htons((uint16_t)port);
+        if (inet_pton(AF_INET6, host.c_str(), &sa6->sin6_addr) == 1) {
+            *sslen = sizeof(*sa6);
+            return 0;
+        }
+    }
+
+    // Hostname — use getaddrinfo() with the requested family.
+    struct addrinfo hints;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = family;
+    hints.ai_socktype = SOCK_DGRAM;
+    hints.ai_flags = 0;
+    struct addrinfo* res = nullptr;
+    std::string portStr = std::to_string(port);
+    int gai_rc = getaddrinfo(host.c_str(), portStr.c_str(), &hints, &res);
+    if (gai_rc != 0) {
+        if (errOut) *errOut = std::string("could not resolve host '") + host + "': " + gai_strerror(gai_rc);
+        return -1;
+    }
+    if (!res) {
+        if (errOut) *errOut = std::string("no addresses for host: ") + host;
+        return -1;
+    }
+    // Use the first result. (Caller could iterate res->ai_next for round-robin.)
+    memcpy(ss, res->ai_addr, res->ai_addrlen);
+    *sslen = res->ai_addrlen;
+    freeaddrinfo(res);
+    return 0;
+}
+
+// Helper: format a sockaddr_storage back into "host:port" string.
+static std::string bantuUdpFormatAddr(const struct sockaddr_storage* ss) {
+    char buf[INET6_ADDRSTRLEN];
+    if (ss->ss_family == AF_INET) {
+        const struct sockaddr_in* sa = (const struct sockaddr_in*)ss;
+        inet_ntop(AF_INET, &sa->sin_addr, buf, sizeof(buf));
+        return std::string(buf) + ":" + std::to_string(ntohs(sa->sin_port));
+    }
+    if (ss->ss_family == AF_INET6) {
+        const struct sockaddr_in6* sa6 = (const struct sockaddr_in6*)ss;
+        inet_ntop(AF_INET6, &sa6->sin6_addr, buf, sizeof(buf));
+        return std::string("[") + buf + "]:" + std::to_string(ntohs(sa6->sin6_port));
+    }
+    return "unknown";
+}
+
 // ─── FFI: call arbitrary C functions in shared libraries (via libffi) ───
 //   $m    = loadlib("libm.dylib")                 // dlopen a shared library
 //   $sqrt = func($m, "sqrt", "double", ["double"]) // bind a symbol + signature
@@ -3963,6 +4100,293 @@ private:
         });
 
         suaObj["webrtc"] = Value(std::move(webrtcObj));
+
+        // ════════════════════════════════════════════════════════════
+        // sua.udp — native UDP networking (v1.4.0)
+        // ════════════════════════════════════════════════════════════
+        //
+        //   $sock = sua.udp.socket({"family": "ipv4"})
+        //   sua.udp.bind($sock, "0.0.0.0:3478")
+        //   sua.udp.send_to($sock, "8.8.8.8:53", bytes([0xAA, 0xAB, 0xAC]))
+        //   $pkt = sua.udp.recvfrom($sock, {"timeoutMs": 2000})
+        //   // $pkt = {"from": "8.8.8.8:53", "data": [...], "timeout": false}
+        //   sua.udp.close($sock)
+        //
+        // Also a high-level one-shot:
+        //   $r = sua.udp.send("8.8.8.8:53", $queryBytes, {"timeoutMs": 2000})
+        //   // $r = {"from": "8.8.8.8:53", "data": [...]}
+        //
+        ObjectMap udpObj;
+
+        // sua.udp.socket(opts?) → handle dict
+        //   opts.family: "ipv4" (default) | "ipv6"
+        //   opts.nonblocking: bool (default false)
+        udpObj["socket"] = makeNative([](std::vector<Value> args) -> Value {
+            std::string familyStr = "ipv4";
+            bool nonblocking = false;
+            if (!args.empty() && args[0].isObject()) {
+                auto& o = *args[0].objectVal;
+                auto fit = o.find("family");
+                if (fit != o.end()) familyStr = fit->second.toString();
+                auto nit = o.find("nonblocking");
+                if (nit != o.end()) nonblocking = (bool)nit->second.numberVal;
+            }
+            int family = (familyStr == "ipv6") ? AF_INET6 : AF_INET;
+            int fd = socket(family, SOCK_DGRAM, 0);
+            if (fd < 0) {
+                ErrorHandler::throwError(std::string("sua.udp.socket: socket() failed: ") + strerror(errno),
+                                         0, 0, ErrorHandler::RUNTIME_ERROR);
+            }
+            if (nonblocking) {
+                int flags = fcntl(fd, F_GETFL, 0);
+                fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+            }
+            int id = bantuNextUdpId++;
+            bantuUdpSocketTable()[id] = BantuUdpSocket{fd, family, false};
+            ObjectMap handle;
+            handle["__udp"]   = Value((double)id);
+            handle["family"]  = Value(familyStr);
+            handle["bound"]   = Value(false);
+            return Value(std::move(handle));
+        });
+
+        // Helper: extract the socket fd + entry from a handle dict.
+        auto udpIdOf = [](const Value& h, BantuUdpSocket** outEntry) -> int {
+            if (!h.isObject()) return -1;
+            auto it = h.objectVal->find("__udp");
+            if (it == h.objectVal->end()) return -1;
+            int id = (int)it->second.numberVal;
+            auto& table = bantuUdpSocketTable();
+            auto tit = table.find(id);
+            if (tit == table.end()) return -1;
+            if (outEntry) *outEntry = &tit->second;
+            return id;
+        };
+
+        // sua.udp.bind($sock, "host:port") → true on success, throws on error.
+        // Special: port 0 means "OS-assigned" (use getsockname to find out).
+        udpObj["bind"] = makeNative([udpIdOf](std::vector<Value> args) -> Value {
+            if (args.size() < 2)
+                ErrorHandler::throwError("sua.udp.bind(sock, addr) needs 2 args", 0, 0, ErrorHandler::RUNTIME_ERROR);
+            BantuUdpSocket* entry = nullptr;
+            int id = udpIdOf(args[0], &entry);
+            if (id < 0 || !entry || entry->fd < 0)
+                ErrorHandler::throwError("sua.udp.bind: not a valid socket handle", 0, 0, ErrorHandler::RUNTIME_ERROR);
+            auto [host, port] = bantuUdpParseAddr(args[1].toString());
+            if (port == 0 && args[1].toString().find(":0") == std::string::npos) {
+                // port missing entirely
+                if (args[1].toString().find(":") == std::string::npos) {
+                    ErrorHandler::throwError("sua.udp.bind: address must be 'host:port'", 0, 0, ErrorHandler::RUNTIME_ERROR);
+                }
+            }
+            struct sockaddr_storage ss;
+            socklen_t sslen = 0;
+            std::string err;
+            if (bantuUdpResolve(host, port, &ss, &sslen, entry->family, &err) != 0) {
+                ErrorHandler::throwError("sua.udp.bind: " + err, 0, 0, ErrorHandler::RUNTIME_ERROR);
+            }
+            // Allow address reuse (common for servers restarting)
+            int yes = 1;
+            setsockopt(entry->fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+            if (::bind(entry->fd, (struct sockaddr*)&ss, sslen) < 0) {
+                ErrorHandler::throwError(std::string("sua.udp.bind: bind() failed: ") + strerror(errno),
+                                         0, 0, ErrorHandler::RUNTIME_ERROR);
+            }
+            entry->bound = true;
+            return Value(true);
+        });
+
+        // sua.udp.send_to($sock, "host:port", dataBytes) → number of bytes sent.
+        // `dataBytes` is a list of integers 0-255 (matching Bantu's existing byte
+        // representation used by the hash/crypto/uuid modules).
+        udpObj["send_to"] = makeNative([udpIdOf](std::vector<Value> args) -> Value {
+            if (args.size() < 3)
+                ErrorHandler::throwError("sua.udp.send_to(sock, addr, data) needs 3 args", 0, 0, ErrorHandler::RUNTIME_ERROR);
+            BantuUdpSocket* entry = nullptr;
+            int id = udpIdOf(args[0], &entry);
+            if (id < 0 || !entry || entry->fd < 0)
+                ErrorHandler::throwError("sua.udp.send_to: not a valid socket handle", 0, 0, ErrorHandler::RUNTIME_ERROR);
+            auto [host, port] = bantuUdpParseAddr(args[1].toString());
+            struct sockaddr_storage ss;
+            socklen_t sslen = 0;
+            std::string err;
+            if (bantuUdpResolve(host, port, &ss, &sslen, entry->family, &err) != 0) {
+                ErrorHandler::throwError("sua.udp.send_to: " + err, 0, 0, ErrorHandler::RUNTIME_ERROR);
+            }
+            std::vector<uint8_t> buf = bantuValueToBytes(args[2]);
+            if (buf.empty()) return Value((double)0);
+            ssize_t n = sendto(entry->fd, buf.data(), buf.size(), 0,
+                               (struct sockaddr*)&ss, sslen);
+            if (n < 0) {
+                ErrorHandler::throwError(std::string("sua.udp.send_to: sendto() failed: ") + strerror(errno),
+                                         0, 0, ErrorHandler::RUNTIME_ERROR);
+            }
+            return Value((double)n);
+        });
+
+        // sua.udp.recvfrom($sock, opts?) → {from, data, timeout}
+        //   opts.timeoutMs: int (default 0 = blocking forever)
+        //   opts.maxBytes:  int (default 4096)
+        // Returns {"timeout": true} on timeout. Throws on hard error.
+        udpObj["recvfrom"] = makeNative([udpIdOf](std::vector<Value> args) -> Value {
+            if (args.empty())
+                ErrorHandler::throwError("sua.udp.recvfrom(sock, [opts]) needs at least 1 arg", 0, 0, ErrorHandler::RUNTIME_ERROR);
+            BantuUdpSocket* entry = nullptr;
+            int id = udpIdOf(args[0], &entry);
+            if (id < 0 || !entry || entry->fd < 0)
+                ErrorHandler::throwError("sua.udp.recvfrom: not a valid socket handle", 0, 0, ErrorHandler::RUNTIME_ERROR);
+            int timeoutMs = 0;
+            size_t maxBytes = 4096;
+            if (args.size() > 1 && args[1].isObject()) {
+                auto& o = *args[1].objectVal;
+                auto tit = o.find("timeoutMs");
+                if (tit != o.end()) timeoutMs = (int)tit->second.numberVal;
+                auto mit = o.find("maxBytes");
+                if (mit != o.end()) maxBytes = (size_t)mit->second.numberVal;
+            }
+            // Wait for data with optional timeout via poll()
+            if (timeoutMs > 0) {
+                struct pollfd pfd;
+                pfd.fd = entry->fd;
+                pfd.events = POLLIN;
+                pfd.revents = 0;
+                int rc = poll(&pfd, 1, timeoutMs);
+                if (rc == 0) {
+                    ObjectMap r;
+                    r["timeout"] = Value(true);
+                    r["from"]    = Value(std::string(""));
+                    r["data"]    = Value(std::vector<Value>{});
+                    return Value(std::move(r));
+                }
+                if (rc < 0) {
+                    ErrorHandler::throwError(std::string("sua.udp.recvfrom: poll() failed: ") + strerror(errno),
+                                             0, 0, ErrorHandler::RUNTIME_ERROR);
+                }
+            }
+            std::vector<uint8_t> buf(maxBytes);
+            struct sockaddr_storage peer;
+            socklen_t peerLen = sizeof(peer);
+            ssize_t n = recvfrom(entry->fd, buf.data(), buf.size(), 0,
+                                 (struct sockaddr*)&peer, &peerLen);
+            if (n < 0) {
+                ErrorHandler::throwError(std::string("sua.udp.recvfrom: recvfrom() failed: ") + strerror(errno),
+                                         0, 0, ErrorHandler::RUNTIME_ERROR);
+            }
+            buf.resize(n);
+            ObjectMap r;
+            r["timeout"] = Value(false);
+            r["from"]    = Value(bantuUdpFormatAddr(&peer));
+            r["data"]    = bantuBytesToValue(buf);
+            return Value(std::move(r));
+        });
+
+        // sua.udp.send("host:port", data, opts?) → {from, data} or {timeout: true}
+        // High-level one-shot: creates a socket, sends, waits for reply, closes.
+        udpObj["send"] = makeNative([](std::vector<Value> args) -> Value {
+            if (args.size() < 2)
+                ErrorHandler::throwError("sua.udp.send(addr, data, [opts]) needs at least 2 args", 0, 0, ErrorHandler::RUNTIME_ERROR);
+            std::string addrStr = args[0].toString();
+            auto [host, port] = bantuUdpParseAddr(addrStr);
+            int timeoutMs = 2000;
+            size_t maxBytes = 4096;
+            std::string familyStr = "ipv4";
+            if (host.find(':') != std::string::npos) familyStr = "ipv6";  // looks like IPv6
+            if (args.size() > 2 && args[2].isObject()) {
+                auto& o = *args[2].objectVal;
+                auto tit = o.find("timeoutMs");
+                if (tit != o.end()) timeoutMs = (int)tit->second.numberVal;
+                auto mit = o.find("maxBytes");
+                if (mit != o.end()) maxBytes = (size_t)mit->second.numberVal;
+                auto fit = o.find("family");
+                if (fit != o.end()) familyStr = fit->second.toString();
+            }
+            int family = (familyStr == "ipv6") ? AF_INET6 : AF_INET;
+            int fd = socket(family, SOCK_DGRAM, 0);
+            if (fd < 0) {
+                ErrorHandler::throwError(std::string("sua.udp.send: socket() failed: ") + strerror(errno),
+                                         0, 0, ErrorHandler::RUNTIME_ERROR);
+            }
+            struct sockaddr_storage ss;
+            socklen_t sslen = 0;
+            std::string err;
+            if (bantuUdpResolve(host, port, &ss, &sslen, family, &err) != 0) {
+                close(fd);
+                ErrorHandler::throwError("sua.udp.send: " + err, 0, 0, ErrorHandler::RUNTIME_ERROR);
+            }
+            std::vector<uint8_t> buf = bantuValueToBytes(args[1]);
+            ssize_t sent = sendto(fd, buf.data(), buf.size(), 0,
+                                  (struct sockaddr*)&ss, sslen);
+            if (sent < 0) {
+                close(fd);
+                ErrorHandler::throwError(std::string("sua.udp.send: sendto() failed: ") + strerror(errno),
+                                         0, 0, ErrorHandler::RUNTIME_ERROR);
+            }
+            // Wait for response
+            struct pollfd pfd;
+            pfd.fd = fd;
+            pfd.events = POLLIN;
+            pfd.revents = 0;
+            int rc = poll(&pfd, 1, timeoutMs);
+            ObjectMap r;
+            if (rc == 0) {
+                close(fd);
+                r["timeout"] = Value(true);
+                r["from"]    = Value(std::string(""));
+                r["data"]    = Value(std::vector<Value>{});
+                return Value(std::move(r));
+            }
+            if (rc < 0) {
+                close(fd);
+                ErrorHandler::throwError(std::string("sua.udp.send: poll() failed: ") + strerror(errno),
+                                         0, 0, ErrorHandler::RUNTIME_ERROR);
+            }
+            std::vector<uint8_t> rbuf(maxBytes);
+            struct sockaddr_storage peer;
+            socklen_t peerLen = sizeof(peer);
+            ssize_t n = recvfrom(fd, rbuf.data(), rbuf.size(), 0,
+                                 (struct sockaddr*)&peer, &peerLen);
+            close(fd);
+            if (n < 0) {
+                ErrorHandler::throwError(std::string("sua.udp.send: recvfrom() failed: ") + strerror(errno),
+                                         0, 0, ErrorHandler::RUNTIME_ERROR);
+            }
+            rbuf.resize(n);
+            r["timeout"] = Value(false);
+            r["from"]    = Value(bantuUdpFormatAddr(&peer));
+            r["data"]    = bantuBytesToValue(rbuf);
+            return Value(std::move(r));
+        });
+
+        // sua.udp.close($sock) → true. Safe to call multiple times.
+        udpObj["close"] = makeNative([udpIdOf](std::vector<Value> args) -> Value {
+            BantuUdpSocket* entry = nullptr;
+            int id = udpIdOf(args.empty() ? Value() : args[0], &entry);
+            if (id < 0 || !entry) return Value(false);
+            if (entry->fd >= 0) {
+                close(entry->fd);
+                entry->fd = -1;
+            }
+            bantuUdpSocketTable().erase(id);
+            return Value(true);
+        });
+
+        // sua.udp.getsockname($sock) → "host:port" (the locally-bound address).
+        // Useful after binding to port 0 to discover the OS-assigned port.
+        udpObj["getsockname"] = makeNative([udpIdOf](std::vector<Value> args) -> Value {
+            BantuUdpSocket* entry = nullptr;
+            int id = udpIdOf(args.empty() ? Value() : args[0], &entry);
+            if (id < 0 || !entry || entry->fd < 0)
+                ErrorHandler::throwError("sua.udp.getsockname: not a valid socket handle", 0, 0, ErrorHandler::RUNTIME_ERROR);
+            struct sockaddr_storage ss;
+            socklen_t sslen = sizeof(ss);
+            if (getsockname(entry->fd, (struct sockaddr*)&ss, &sslen) < 0) {
+                ErrorHandler::throwError(std::string("sua.udp.getsockname: ") + strerror(errno),
+                                         0, 0, ErrorHandler::RUNTIME_ERROR);
+            }
+            return Value(bantuUdpFormatAddr(&ss));
+        });
+
+        suaObj["udp"] = Value(std::move(udpObj));
 
         // ════════════════════════════════════════════════════════
         // Register sua as a global variable
