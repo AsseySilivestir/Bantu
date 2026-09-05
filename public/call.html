@@ -41,11 +41,15 @@
     document.getElementById('remote-label').textContent = peerName;
 
     // ─── WebRTC setup ────────────────────────────────────
-    const STUN_SERVERS = {
+    // STUN gets us through most NATs on the same network. For strict/symmetric
+    // NATs a TURN relay is required — inject one via window.__ICE_SERVERS__
+    // (e.g. [{ urls:'turn:host:3478', username:'u', credential:'p' }]) and it is
+    // appended to the ICE config below. Without TURN, cross-NAT calls may fail.
+    const ICE_CONFIG = {
       iceServers: [
         { urls: 'stun:stun.l.google.com:19302' },
         { urls: 'stun:stun1.l.google.com:19302' }
-      ]
+      ].concat(Array.isArray(window.__ICE_SERVERS__) ? window.__ICE_SERVERS__ : [])
     };
     let pc = null;
     let localStream = null;
@@ -78,7 +82,7 @@
     }
 
     function createPeerConnection() {
-      pc = new RTCPeerConnection(STUN_SERVERS);
+      pc = new RTCPeerConnection(ICE_CONFIG);
       // Add local tracks
       localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
       // Receive remote tracks
@@ -93,8 +97,21 @@
           api.post('/api/call/ice/' + peerId, { candidate: JSON.stringify(event.candidate) }).catch(() => {});
         }
       };
+      // Drive status from the REAL negotiated state, not optimistic guesses.
       pc.onconnectionstatechange = () => {
-        setStatus('Connection: ' + pc.connectionState);
+        const s = pc.connectionState;
+        if (s === 'connected')       setStatus('Connected — call in progress');
+        else if (s === 'connecting') setStatus('Connecting…');
+        else if (s === 'failed')     setStatus('Connection failed — retrying…');
+        else if (s === 'disconnected') setStatus('Connection lost…');
+        else if (s === 'closed')     setStatus('Call ended');
+        else setStatus('Connection: ' + s);
+      };
+      // Recover from transient ICE failures by restarting negotiation.
+      pc.oniceconnectionstatechange = () => {
+        if (pc.iceConnectionState === 'failed') {
+          try { pc.restartIce(); } catch (e) { /* older browsers */ }
+        }
       };
     }
 
@@ -114,7 +131,7 @@
             offerPollTimer = null;
             const answer = JSON.parse(r.sdp);
             await pc.setRemoteDescription(new RTCSessionDescription(answer));
-            setStatus('Connected — call in progress');
+            setStatus('Answer received — connecting…');
             startIcePolling();
           }
         } catch (e) { /* ignore */ }
@@ -136,7 +153,7 @@
             const answer = await pc.createAnswer();
             await pc.setLocalDescription(answer);
             await api.post('/api/call/answer/' + peerId, { sdp: JSON.stringify(answer) });
-            setStatus('Connected — call in progress');
+            setStatus('Answer sent — connecting…');
             startIcePolling();
           }
         } catch (e) { /* ignore */ }

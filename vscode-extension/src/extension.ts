@@ -9,6 +9,7 @@ import { BantuCompletionProvider } from './completionProvider';
 import { BantuHoverProvider } from './hoverProvider';
 import { BantuSymbolProvider } from './symbolProvider';
 import { BantuTaskProvider } from './taskProvider';
+import { BantuDiagnostics } from './diagnosticsProvider';
 
 export function activate(context: vscode.ExtensionContext) {
     const bantuSel: vscode.DocumentSelector = [
@@ -42,6 +43,11 @@ export function activate(context: vscode.ExtensionContext) {
     context.subscriptions.push(
         vscode.tasks.registerTaskProvider('bantu', taskProvider)
     );
+
+    // ─── Live diagnostics (linter) ───
+    // Runs `bantu lint --json` as you type; errors → red, warnings → yellow.
+    const diagnostics = new BantuDiagnostics(context);
+    diagnostics.activate();
 
     // ─── Commands ───
     context.subscriptions.push(

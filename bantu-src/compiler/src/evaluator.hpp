@@ -28,6 +28,17 @@
 #include <curl/curl.h>
 #include <sqlite3.h>
 
+// ─── FFI (foreign function interface) headers ───
+// Compiled in when BANTU_FFI is defined and libffi + libdl are linked.
+#ifdef BANTU_FFI
+#include <dlfcn.h>
+#if defined(__APPLE__)
+  #include <ffi/ffi.h>
+#else
+  #include <ffi.h>
+#endif
+#endif
+
 // Helper to create native function values without ambiguity
 inline Value makeNative(NativeFn fn) { return Value(std::move(fn)); }
 
@@ -280,6 +291,121 @@ inline std::vector<std::string> bantuSplitPath(const std::string& p) {
 static sqlite3* bantuSqliteDb = nullptr;
 static std::string bantuSqlitePath = "";
 
+// ─── Open-file registry (Python-style file I/O) ───
+// open() returns a handle dict {"__file": id}; the actual std::fstream lives
+// here, keyed by id. Wrapped in a function to dodge static init-order issues.
+static std::unordered_map<int, std::fstream>& bantuFileTable() {
+    static std::unordered_map<int, std::fstream> table;
+    return table;
+}
+static int bantuNextFileId = 1;
+
+// ─── FFI: call arbitrary C functions in shared libraries (via libffi) ───
+//   $m    = loadlib("libm.dylib")                 // dlopen a shared library
+//   $sqrt = func($m, "sqrt", "double", ["double"]) // bind a symbol + signature
+//   $sqrt(2.0)                                     // → 1.41421356
+// Type names: "int" | "double" | "string" | "pointer" | "void".
+#ifdef BANTU_FFI
+static std::unordered_map<int, void*>& bantuLibTable() {
+    static std::unordered_map<int, void*> t; return t;
+}
+static int bantuNextLibId = 1;
+
+static ffi_type* bantuFfiType(const std::string& t) {
+    if (t == "int")                                   return &ffi_type_sint;
+    if (t == "double" || t == "float")                return &ffi_type_double;
+    if (t == "string" || t == "pointer" || t == "ptr") return &ffi_type_pointer;
+    if (t == "void")                                  return &ffi_type_void;
+    return &ffi_type_sint;  // sensible default
+}
+
+static Value bantuFfiLoadLib(std::vector<Value> args) {
+    if (args.empty()) ErrorHandler::throwError("loadlib() needs a library path", 0, 0, ErrorHandler::RUNTIME_ERROR);
+    std::string path = args[0].toString();
+    void* h = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
+    if (!h) {
+        const char* e = dlerror();
+        ErrorHandler::throwError(std::string("loadlib failed for '") + path + "': " + (e ? e : "unknown"),
+                                 0, 0, ErrorHandler::RUNTIME_ERROR);
+    }
+    int id = bantuNextLibId++;
+    bantuLibTable()[id] = h;
+    ObjectMap handle;
+    handle["__lib"] = Value((double)id);
+    handle["path"] = Value(path);
+    return Value(std::move(handle));
+}
+
+static Value bantuFfiFunc(std::vector<Value> args) {
+    if (args.size() < 3)
+        ErrorHandler::throwError("func(lib, name, retType, [argTypes]) needs at least 3 arguments", 0, 0, ErrorHandler::RUNTIME_ERROR);
+    void* lib = nullptr;
+    if (args[0].isObject()) {
+        auto it = args[0].objectVal->find("__lib");
+        if (it != args[0].objectVal->end()) {
+            auto lt = bantuLibTable().find((int)it->second.numberVal);
+            if (lt != bantuLibTable().end()) lib = lt->second;
+        }
+    }
+    if (!lib) ErrorHandler::throwError("func(): first argument is not a library from loadlib()", 0, 0, ErrorHandler::RUNTIME_ERROR);
+    std::string name = args[1].toString();
+    void* sym = dlsym(lib, name.c_str());
+    if (!sym) ErrorHandler::throwError("func(): symbol '" + name + "' not found", 0, 0, ErrorHandler::RUNTIME_ERROR);
+    std::string retType = args[2].toString();
+    std::vector<std::string> argTypes;
+    if (args.size() > 3 && args[3].isList())
+        for (auto& a : args[3].listVal) argTypes.push_back(a.toString());
+
+    // Return a callable that marshals Bantu values through libffi and invokes sym.
+    return makeNative([sym, retType, argTypes](std::vector<Value> callArgs) -> Value {
+        size_t n = argTypes.size();
+        std::vector<ffi_type*> atypes(n);
+        for (size_t i = 0; i < n; i++) atypes[i] = bantuFfiType(argTypes[i]);
+
+        ffi_cif cif;
+        if (ffi_prep_cif(&cif, FFI_DEFAULT_ABI, (unsigned)n, bantuFfiType(retType),
+                         n ? atypes.data() : nullptr) != FFI_OK)
+            ErrorHandler::throwError("ffi_prep_cif failed", 0, 0, ErrorHandler::RUNTIME_ERROR);
+
+        // Stable storage for marshalled args (addresses must survive ffi_call).
+        std::vector<long long> ints(n);
+        std::vector<double> dbls(n);
+        std::vector<std::string> strs(n);
+        std::vector<const char*> cstrs(n);
+        std::vector<void*> values(n);
+        for (size_t i = 0; i < n; i++) {
+            const std::string& t = argTypes[i];
+            Value v = i < callArgs.size() ? callArgs[i] : Value();
+            if (t == "double" || t == "float") { dbls[i] = v.numberVal; values[i] = &dbls[i]; }
+            else if (t == "string" || t == "pointer" || t == "ptr") { strs[i] = v.toString(); cstrs[i] = strs[i].c_str(); values[i] = &cstrs[i]; }
+            else { ints[i] = (long long)v.numberVal; values[i] = &ints[i]; }
+        }
+
+        if (retType == "double" || retType == "float") {
+            double r = 0; ffi_call(&cif, FFI_FN(sym), &r, n ? values.data() : nullptr); return Value(r);
+        } else if (retType == "string" || retType == "pointer" || retType == "ptr") {
+            void* r = nullptr; ffi_call(&cif, FFI_FN(sym), &r, n ? values.data() : nullptr);
+            if (retType == "string" && r) return Value(std::string((const char*)r));
+            return Value((double)(intptr_t)r);
+        } else if (retType == "void") {
+            ffi_arg r; ffi_call(&cif, FFI_FN(sym), &r, n ? values.data() : nullptr); return Value();
+        } else {
+            ffi_arg r = 0; ffi_call(&cif, FFI_FN(sym), &r, n ? values.data() : nullptr); return Value((double)(long long)r);
+        }
+    });
+}
+#else
+// Stubs when FFI is not compiled in.
+static Value bantuFfiLoadLib(std::vector<Value>) {
+    ErrorHandler::throwError("FFI not available in this build (rebuild with -DBANTU_FFI and link -lffi)", 0, 0, ErrorHandler::RUNTIME_ERROR);
+    return Value();
+}
+static Value bantuFfiFunc(std::vector<Value>) {
+    ErrorHandler::throwError("FFI not available in this build (rebuild with -DBANTU_FFI and link -lffi)", 0, 0, ErrorHandler::RUNTIME_ERROR);
+    return Value();
+}
+#endif
+
 // ─── PostgreSQL State ───
 // When built with -DBANTU_POSTGRES=ON (and libpq available), bantuPgConn
 // holds a real PGconn* and queries hit a real PostgreSQL database.
@@ -292,6 +418,31 @@ static std::string bantuPgUser = "";
 #ifdef HAS_LIBPQ
     #include <libpq-fe.h>
     static PGconn* bantuPgConn = nullptr;
+
+    // Build libpq text-format parameter arrays from a Bantu params list, for
+    // PQexecParams ($1..$n placeholders). libpq sends every parameter as text
+    // and lets the server coerce it, so this stays type-agnostic and is
+    // injection-safe. A null Bantu value maps to a SQL NULL (null pointer).
+    // NOTE: `storage` is reserved up-front so it never reallocates — the
+    // c_str() pointers handed to libpq must stay valid for the call.
+    static void bantuPgBuildParams(const std::vector<Value>& params,
+                                   std::vector<std::string>& storage,
+                                   std::vector<const char*>& out) {
+        storage.reserve(params.size());
+        out.reserve(params.size());
+        for (const auto& p : params) {
+            if (p.isNull()) {
+                storage.push_back("");
+                out.push_back(nullptr);
+            } else if (p.isBool()) {
+                storage.push_back(p.boolVal ? "true" : "false");
+                out.push_back(storage.back().c_str());
+            } else {
+                storage.push_back(p.toString());
+                out.push_back(storage.back().c_str());
+            }
+        }
+    }
 #endif
 
 // ─── MySQL State (simulated for static binary) ───
@@ -337,6 +488,39 @@ static int bantuSqliteCallback(void* data, int argc, char** argv, char** colName
     }
     rows->push_back(Value(std::move(row)));
     return 0;
+}
+
+// Bind a list of Bantu values to a prepared statement's `?` placeholders
+// (1-based). This is the safe, injection-proof path for parameterized SQL.
+static void bantuSqliteBindParams(sqlite3_stmt* stmt, const std::vector<Value>& params) {
+    for (size_t i = 0; i < params.size(); i++) {
+        int idx = (int)i + 1;
+        const Value& p = params[i];
+        if (p.isNull()) {
+            sqlite3_bind_null(stmt, idx);
+        } else if (p.isNumber()) {
+            double d = p.numberVal;
+            if (d == std::floor(d) && !std::isinf(d)) sqlite3_bind_int64(stmt, idx, (sqlite3_int64)d);
+            else sqlite3_bind_double(stmt, idx, d);
+        } else if (p.isBool()) {
+            sqlite3_bind_int(stmt, idx, p.boolVal ? 1 : 0);
+        } else {
+            std::string s = p.toString();
+            sqlite3_bind_text(stmt, idx, s.c_str(), (int)s.size(), SQLITE_TRANSIENT);
+        }
+    }
+}
+
+// Convert a text column value to a number when it is fully numeric, mirroring
+// bantuSqliteCallback so parameterized queries return the same shapes.
+static Value bantuSqliteCellToValue(const char* txt) {
+    std::string val = txt ? txt : "NULL";
+    try {
+        size_t pos;
+        double nv = std::stod(val, &pos);
+        if (pos == val.size()) return Value(nv);
+    } catch (...) {}
+    return Value(val);
 }
 
 // ─── HTTP Status Text Helper ───
@@ -502,8 +686,16 @@ public:
 
     Value evaluate(std::vector<std::shared_ptr<ASTNode>>& program) {
         Value result;
-        for (auto& node : program) {
-            result = evalNode(node);
+        try {
+            for (auto& node : program) {
+                result = evalNode(node);
+            }
+        } catch (const BreakSignal&) {
+            ErrorHandler::throwRuntimeError("'break' used outside of a loop");
+        } catch (const ContinueSignal&) {
+            ErrorHandler::throwRuntimeError("'continue' used outside of a loop");
+        } catch (const ReturnSignal&) {
+            // A top-level `return` simply ends the program.
         }
         return result;
     }
@@ -514,8 +706,18 @@ public:
     Value runFile(const std::string& path, std::vector<std::shared_ptr<ASTNode>>& program) {
         filePathStack_.push_back(path);
         Value result;
-        for (auto& node : program) {
-            result = evalNode(node);
+        try {
+            for (auto& node : program) {
+                result = evalNode(node);
+            }
+        } catch (const BreakSignal&) {
+            if (!filePathStack_.empty()) filePathStack_.pop_back();
+            ErrorHandler::throwRuntimeError("'break' used outside of a loop");
+        } catch (const ContinueSignal&) {
+            if (!filePathStack_.empty()) filePathStack_.pop_back();
+            ErrorHandler::throwRuntimeError("'continue' used outside of a loop");
+        } catch (const ReturnSignal&) {
+            // A top-level `return` simply ends the file.
         }
         if (!filePathStack_.empty()) filePathStack_.pop_back();
         return result;
@@ -574,6 +776,10 @@ private:
         if (auto n = dynamic_cast<DotAccessNode*>(node.get())) return evalDotAccess(n);
         if (auto n = dynamic_cast<IndexAccessNode*>(node.get())) return evalIndexAccess(n);
         if (auto n = dynamic_cast<TryCatchNode*>(node.get()))  return evalTryCatch(n);
+        if (dynamic_cast<BreakNode*>(node.get()))              throw BreakSignal{};
+        if (dynamic_cast<ContinueNode*>(node.get()))           throw ContinueSignal{};
+        if (auto n = dynamic_cast<ThrowNode*>(node.get()))     return evalThrow(n);
+        if (auto n = dynamic_cast<SwitchNode*>(node.get()))    return evalSwitch(n);
         if (auto n = dynamic_cast<ClassDeclNode*>(node.get())) return evalClassDecl(n);
         if (auto n = dynamic_cast<SuperNode*>(node.get()))     return evalSuper(n);
         if (auto n = dynamic_cast<PrintNode*>(node.get()))     return evalPrint(n);
@@ -629,7 +835,10 @@ private:
 
     Value evalVarDecl(VarDeclNode* n) {
         Value val = evalNode(n->init);
-        env_->define(n->name, val);
+        // `const $x = …` makes the binding final; typed decls (number/string/…)
+        // define normally (annotations remain non-enforcing at runtime).
+        bool isConst = (n->typeAnnotation == "const");
+        env_->define(n->name, val, isConst);
         return val;
     }
 
@@ -859,24 +1068,53 @@ private:
         return Value();
     }
 
+    // each ($x in list) / each ($k, $v in dict) / for $x in ... / for $k, $v in ...
+    // Iterates lists (element, or unpacking a [k,v] pair into two vars) and dicts
+    // (key, or key+value). break/continue are honored; return/errors propagate.
     Value evalEach(EachNode* n) {
         Value iterable = evalNode(n->iterable);
+        bool twoVars = !n->valueVar.empty();
+
+        // Runs the body once with the loop var(s) bound. Returns false on break.
+        auto runBody = [&](const Value& a, const Value& b) -> bool {
+            auto prevEnv = env_;
+            env_ = std::make_shared<Environment>(prevEnv);
+            env_->define(n->varName, a);
+            if (twoVars) env_->define(n->valueVar, b);
+            try {
+                for (auto& stmt : n->body) evalNode(stmt);
+            } catch (const BreakSignal&) {
+                env_ = prevEnv;
+                return false;
+            } catch (const ContinueSignal&) {
+                env_ = prevEnv;
+                return true;
+            } catch (...) {
+                env_ = prevEnv;   // return / error → restore scope and propagate
+                throw;
+            }
+            env_ = prevEnv;
+            return true;
+        };
+
         if (iterable.isList()) {
             for (auto& item : iterable.listVal) {
-                auto prevEnv = env_;
-                env_ = std::make_shared<Environment>(env_);
-                env_->define(n->varName, item);
-                try {
-                    for (auto& stmt : n->body) {
-                        evalNode(stmt);
+                if (twoVars) {
+                    // Unpack a [key, value] pair (e.g. from $dict.items()); if the
+                    // element isn't a 2+ list, bind value to null.
+                    Value a = item, b;
+                    if (item.isList() && item.listVal.size() >= 2) {
+                        a = item.listVal[0];
+                        b = item.listVal[1];
                     }
-                } catch (const BreakSignal&) {
-                    env_ = prevEnv;
-                    break;
-                } catch (const ContinueSignal&) {
-                    // continue
+                    if (!runBody(a, b)) break;
+                } else {
+                    if (!runBody(item, Value())) break;
                 }
-                env_ = prevEnv;
+            }
+        } else if (iterable.isObject()) {
+            for (auto& kv : *iterable.objectVal) {
+                if (!runBody(Value(kv.first), kv.second)) break;
             }
         }
         return Value();
@@ -1334,8 +1572,14 @@ private:
 
     Value evalFuncDecl(FuncDeclNode* n) {
         auto fn = std::make_shared<BantuFunction>(n->name, n->params, n->body, env_);
-        env_->define(n->name, Value(std::move(fn)));
-        return Value();
+        Value fnVal(std::move(fn));
+        // Named declarations bind into the current scope; anonymous function
+        // expressions (empty name) just yield the value so `def(...) { }` can be
+        // used inline (as a dict value, argument, etc.).
+        if (!n->name.empty()) {
+            env_->define(n->name, fnVal);
+        }
+        return fnVal;
     }
 
     Value evalReturn(ReturnNode* n) {
@@ -1343,7 +1587,110 @@ private:
         throw ReturnSignal{val};
     }
 
+    // Resolve an assignable slot (variable / list element / dict entry) to a
+    // mutable Value*, or nullptr if the node isn't a valid lvalue. Powers the
+    // in-place list mutators below.
+    Value* resolveLValue(ASTNode* node) {
+        if (auto v = dynamic_cast<VariableNode*>(node)) {
+            if (env_->has(v->name)) return &env_->getRef(v->name);
+            return nullptr;
+        }
+        if (auto idx = dynamic_cast<IndexAccessNode*>(node)) {
+            Value* base = resolveLValue(idx->object.get());
+            if (!base) return nullptr;
+            Value key = evalNode(idx->index);
+            if (base->isList()) {
+                int i = (int)key.numberVal;
+                if (i < 0 || i >= (int)base->listVal.size()) return nullptr;
+                return &base->listVal[i];
+            }
+            if (base->isObject()) return &(*base->objectVal)[key.toString()];
+            return nullptr;
+        }
+        if (auto dot = dynamic_cast<DotAccessNode*>(node)) {
+            Value* base = resolveLValue(dot->object.get());
+            if (base && base->isObject()) return &(*base->objectVal)[dot->property];
+            return nullptr;
+        }
+        return nullptr;
+    }
+
+    // In-place list mutators operating on the resolved list `lst`.
+    //   append(l, x…) · push(l, x…) · pop(l) · insert(l, i, x) · remove(l, i) · extend(l, l2)
+    // `argStart` is where the value arguments begin: 1 for function form
+    // (arg0 is the list), 0 for method form ($l.push(x) — the list is the receiver).
+    Value listMutator(const std::string& op, Value& lst, CallNode* n, size_t argStart = 1) {
+        std::vector<Value> args;
+        for (size_t i = argStart; i < n->args.size(); i++) args.push_back(evalNode(n->args[i]));
+        auto& vec = lst.listVal;
+        if (op == "append") {
+            for (auto& a : args) vec.push_back(a);
+            return Value((double)vec.size());
+        }
+        if (op == "push") {
+            // Same as append, but returns the (mutated) list so the older
+            // `$l = push($l, x)` idiom keeps working correctly.
+            for (auto& a : args) vec.push_back(a);
+            return lst;
+        }
+        if (op == "pop") {
+            if (vec.empty()) return Value();
+            Value last = vec.back(); vec.pop_back(); return last;
+        }
+        if (op == "insert") {
+            if (args.size() < 2) ErrorHandler::throwRuntimeError("insert(list, index, value) needs an index and a value", n->line, n->col);
+            int i = (int)args[0].numberVal;
+            if (i < 0) i = 0;
+            if (i > (int)vec.size()) i = (int)vec.size();
+            vec.insert(vec.begin() + i, args[1]);
+            return Value((double)vec.size());
+        }
+        if (op == "remove") {
+            if (args.empty()) return Value();
+            int i = (int)args[0].numberVal;
+            if (i < 0 || i >= (int)vec.size()) return Value();
+            Value removed = vec[i];
+            vec.erase(vec.begin() + i);
+            return removed;
+        }
+        if (op == "extend") {
+            if (!args.empty() && args[0].isList())
+                for (auto& e : args[0].listVal) vec.push_back(e);
+            return Value((double)vec.size());
+        }
+        return Value();
+    }
+
     Value evalCall(CallNode* n) {
+        // In-place list mutators (append/push/pop/insert/remove/extend). Resolved
+        // here because a native builtin only receives args by value and could not
+        // mutate the caller's list. A user-defined function of the same name wins.
+        if (auto callVar = dynamic_cast<VariableNode*>(n->callee.get())) {
+            const std::string& fname = callVar->name;
+            if (!env_->has(fname) && !n->args.empty() &&
+                (fname == "append" || fname == "push" || fname == "pop" || fname == "insert" ||
+                 fname == "remove" || fname == "extend")) {
+                Value* lv = resolveLValue(n->args[0].get());
+                if (!lv || !lv->isList()) {
+                    ErrorHandler::throwRuntimeError(fname + "() expects a list variable as its first argument", n->line, n->col);
+                }
+                return listMutator(fname, *lv, n, 1);
+            }
+        }
+
+        // Method-style list mutation: $list.push(x) / $list.pop().
+        // evalDotAccess only ever sees a COPY of the list, so these are resolved
+        // against the real storage here. If the receiver isn't an addressable
+        // list (e.g. a literal), we fall through to the value-copy methods.
+        if (auto dot = dynamic_cast<DotAccessNode*>(n->callee.get())) {
+            if (dot->property == "push" || dot->property == "pop") {
+                Value* lv = resolveLValue(dot->object.get());
+                if (lv && lv->isList()) {
+                    return listMutator(dot->property, *lv, n, 0);
+                }
+            }
+        }
+
         // Check for 'new ClassName()' pattern
         if (auto varNode = dynamic_cast<VariableNode*>(n->callee.get())) {
             // Check if it's preceded by 'new' keyword (handled via variable lookup)
@@ -1436,7 +1783,44 @@ private:
         // Object (dict)
         if (obj.isObject()) {
             auto it = obj.objectVal->find(n->property);
-            if (it != obj.objectVal->end()) return it->second;
+            if (it != obj.objectVal->end()) return it->second;   // a real key always wins
+
+            // Dict pseudo-methods (only reachable when no key of that name exists),
+            // returned as callables so `$d.keys()`, `$d.items()`, etc. work:
+            //   .keys()  → list of keys
+            //   .values()→ list of values
+            //   .items() → list of [key, value] pairs (for  for $k,$v in $d.items())
+            //   .size()/.length() → number of entries
+            auto omap = obj.objectVal;
+            if (n->property == "size" || n->property == "length") {
+                return makeNative([omap](std::vector<Value>) -> Value { return Value((double)omap->size()); });
+            }
+            if (n->property == "keys") {
+                return makeNative([omap](std::vector<Value>) -> Value {
+                    std::vector<Value> ks; ks.reserve(omap->size());
+                    for (auto& kv : *omap) ks.push_back(Value(kv.first));
+                    return Value(std::move(ks));
+                });
+            }
+            if (n->property == "values") {
+                return makeNative([omap](std::vector<Value>) -> Value {
+                    std::vector<Value> vs; vs.reserve(omap->size());
+                    for (auto& kv : *omap) vs.push_back(kv.second);
+                    return Value(std::move(vs));
+                });
+            }
+            if (n->property == "items") {
+                return makeNative([omap](std::vector<Value>) -> Value {
+                    std::vector<Value> items; items.reserve(omap->size());
+                    for (auto& kv : *omap) {
+                        std::vector<Value> pair;
+                        pair.push_back(Value(kv.first));
+                        pair.push_back(kv.second);
+                        items.push_back(Value(std::move(pair)));
+                    }
+                    return Value(std::move(items));
+                });
+            }
             // For leniency with $req.body.X access patterns, return null
             // instead of throwing when a key is missing on a plain object.
             // (Class instances still throw — they use the class-instance branch above.)
@@ -1446,6 +1830,11 @@ private:
         // List methods
         if (obj.isList()) {
             if (n->property == "length") return Value((double)obj.listVal.size());
+            // .size() as a callable (parallels dict/string; blogsite uses $list.size())
+            if (n->property == "size") {
+                double count = (double)obj.listVal.size();
+                return makeNative([count](std::vector<Value>) -> Value { return Value(count); });
+            }
             if (n->property == "push") {
                 return makeNative([this, listRef = obj.listVal](std::vector<Value> args) mutable -> Value {
                     for (auto& a : args) listRef.push_back(a);
@@ -1465,6 +1854,10 @@ private:
         // String methods
         if (obj.isString()) {
             if (n->property == "length") return Value((double)obj.stringVal.size());
+            if (n->property == "size") {
+                double count = (double)obj.stringVal.size();
+                return makeNative([count](std::vector<Value>) -> Value { return Value(count); });
+            }
             if (n->property == "upper") return makeNative([s = obj.stringVal](std::vector<Value>) -> Value {
                 std::string upper = s;
                 std::transform(upper.begin(), upper.end(), upper.begin(), ::toupper);
@@ -1590,23 +1983,76 @@ private:
     // ERROR HANDLING
     // ════════════════════════════════════════════════════════════
 
+    // try { ... } catch ($e) { ... }
+    // Binds $e to the thrown value (for `throw`) or a structured error dict
+    // { message, type, line } (for runtime/type errors). Control-flow signals
+    // (break/continue/return) intentionally pass straight through.
     Value evalTryCatch(TryCatchNode* n) {
+        auto prevEnv = env_;
         try {
-            auto prevEnv = env_;
-            env_ = std::make_shared<Environment>(env_);
-            for (auto& stmt : n->tryBody) {
-                evalNode(stmt);
-            }
-            env_ = prevEnv;
-        } catch (const std::exception& e) {
-            auto prevEnv = env_;
-            env_ = std::make_shared<Environment>(env_);
-            env_->define(n->catchVar, Value(std::string(e.what())));
-            for (auto& stmt : n->catchBody) {
-                evalNode(stmt);
-            }
+            env_ = std::make_shared<Environment>(prevEnv);
+            for (auto& stmt : n->tryBody) evalNode(stmt);
             env_ = prevEnv;
         }
+        catch (const BantuThrow& t) {
+            // A Bantu `throw <expr>` — bind the catch var to the thrown value.
+            env_ = std::make_shared<Environment>(prevEnv);
+            env_->define(n->catchVar, t.value);
+            for (auto& stmt : n->catchBody) evalNode(stmt);
+            env_ = prevEnv;
+        }
+        catch (const BantuError& e) {
+            // A runtime/type/reference error — bind a structured error dict.
+            env_ = std::make_shared<Environment>(prevEnv);
+            ObjectMap err;
+            err["message"] = Value(e.message);
+            err["type"]    = Value(e.typeName);
+            err["line"]    = Value((double)e.line);
+            env_->define(n->catchVar, Value(std::move(err)));
+            for (auto& stmt : n->catchBody) evalNode(stmt);
+            env_ = prevEnv;
+        }
+        catch (const std::exception& e) {
+            // Any other C++ exception — bind its message string.
+            env_ = std::make_shared<Environment>(prevEnv);
+            env_->define(n->catchVar, Value(std::string(e.what())));
+            for (auto& stmt : n->catchBody) evalNode(stmt);
+            env_ = prevEnv;
+        }
+        catch (...) {
+            // break/continue/return must not be swallowed by try/catch —
+            // restore scope and let them reach the enclosing loop/function.
+            env_ = prevEnv;
+            throw;
+        }
+        return Value();
+    }
+
+    // throw <expr>; — raise the evaluated value as a catchable BantuThrow.
+    Value evalThrow(ThrowNode* n) {
+        throw BantuThrow(evalNode(n->value));
+    }
+
+    // switch ($subject) { case <v> { … } … default { … } }
+    // First case whose value `equals` the subject runs (no fallthrough); else
+    // the default block, if present. Each block runs in its own child scope.
+    Value evalSwitch(SwitchNode* n) {
+        Value subject = evalNode(n->subject);
+        auto runBlock = [&](std::vector<std::shared_ptr<ASTNode>>& body) {
+            auto prevEnv = env_;
+            env_ = std::make_shared<Environment>(prevEnv);
+            try {
+                for (auto& stmt : body) evalNode(stmt);
+            } catch (...) { env_ = prevEnv; throw; }
+            env_ = prevEnv;
+        };
+        for (auto& c : n->cases) {
+            if (subject.equals(evalNode(c.value))) {
+                runBlock(c.body);
+                return Value();
+            }
+        }
+        if (n->hasDefault) runBlock(n->defaultBody);
         return Value();
     }
 
@@ -1937,13 +2383,145 @@ private:
             return Value(std::string(1, (char)code));
         }));
 
-        env_->define("push", makeNative([](std::vector<Value> args) -> Value {
-            // push(list, item) - adds item to list
-            if (args.size() >= 2 && args[0].isList()) {
-                args[0].listVal.push_back(args[1]);
+        // NOTE: `push` is intentionally NOT registered as a builtin. A native fn
+        // receives its args by value and so could never mutate the caller's list
+        // (the old registration here silently did nothing). It is handled in
+        // evalCall's lvalue intercept instead, alongside append/pop/insert/
+        // remove/extend, so that it mutates in place for real.
+
+        // ─── Dict introspection (v1.3.0) ───
+        // keys($d) → list of keys, values($d) → list of values,
+        // entries($d) → list of [key, value] pairs. (each/for can also iterate
+        // dicts directly; these builtins are handy for one-off use.)
+        env_->define("keys", makeNative([](std::vector<Value> args) -> Value {
+            std::vector<Value> out;
+            if (!args.empty() && args[0].isObject()) {
+                for (auto& kv : *args[0].objectVal) out.push_back(Value(kv.first));
             }
-            return Value();
+            return Value(std::move(out));
         }));
+        env_->define("values", makeNative([](std::vector<Value> args) -> Value {
+            std::vector<Value> out;
+            if (!args.empty() && args[0].isObject()) {
+                for (auto& kv : *args[0].objectVal) out.push_back(kv.second);
+            }
+            return Value(std::move(out));
+        }));
+        env_->define("entries", makeNative([](std::vector<Value> args) -> Value {
+            std::vector<Value> out;
+            if (!args.empty() && args[0].isObject()) {
+                for (auto& kv : *args[0].objectVal) {
+                    std::vector<Value> pair;
+                    pair.push_back(Value(kv.first));
+                    pair.push_back(kv.second);
+                    out.push_back(Value(std::move(pair)));
+                }
+            }
+            return Value(std::move(out));
+        }));
+
+        // ─── Python-style file I/O (v1.3.0) ───
+        // $f = open(path, mode)   modes: "r" read, "w" truncate-write, "a" append
+        // read($f) whole file · readline($f) one line · readlines($f) list of lines
+        // write($f, text) · close($f) · plus one-shot readfile/writefile/appendfile.
+        env_->define("open", makeNative([](std::vector<Value> args) -> Value {
+            if (args.empty()) ErrorHandler::throwError("open() needs a path", 0, 0, ErrorHandler::FILE_ERROR);
+            std::string path = args[0].toString();
+            std::string mode = args.size() > 1 ? args[1].toString() : "r";
+            std::ios_base::openmode m;
+            if (mode == "w")      m = std::ios::out | std::ios::trunc;
+            else if (mode == "a") m = std::ios::out | std::ios::app;
+            else                  m = std::ios::in;   // default "r"
+            std::fstream fs(path, m);
+            if (!fs.is_open()) {
+                ErrorHandler::throwError("Cannot open file '" + path + "' (mode " + mode + ")",
+                                         0, 0, ErrorHandler::FILE_ERROR);
+            }
+            int id = bantuNextFileId++;
+            bantuFileTable()[id] = std::move(fs);
+            ObjectMap handle;
+            handle["__file"] = Value((double)id);
+            handle["path"] = Value(path);
+            handle["mode"] = Value(mode);
+            return Value(std::move(handle));
+        }));
+        auto fileIdOf = [](const Value& h) -> int {
+            if (h.isObject()) {
+                auto it = h.objectVal->find("__file");
+                if (it != h.objectVal->end()) return (int)it->second.numberVal;
+            }
+            return -1;
+        };
+        env_->define("read", makeNative([fileIdOf](std::vector<Value> args) -> Value {
+            if (args.empty()) return Value(std::string(""));
+            int id = fileIdOf(args[0]);
+            auto it = bantuFileTable().find(id);
+            if (it == bantuFileTable().end()) ErrorHandler::throwError("read(): not an open file", 0, 0, ErrorHandler::FILE_ERROR);
+            std::stringstream ss; ss << it->second.rdbuf();
+            return Value(ss.str());
+        }));
+        env_->define("readline", makeNative([fileIdOf](std::vector<Value> args) -> Value {
+            if (args.empty()) return Value();
+            int id = fileIdOf(args[0]);
+            auto it = bantuFileTable().find(id);
+            if (it == bantuFileTable().end()) ErrorHandler::throwError("readline(): not an open file", 0, 0, ErrorHandler::FILE_ERROR);
+            std::string line;
+            if (!std::getline(it->second, line)) return Value();   // null at EOF
+            return Value(line);
+        }));
+        env_->define("readlines", makeNative([fileIdOf](std::vector<Value> args) -> Value {
+            std::vector<Value> lines;
+            if (args.empty()) return Value(std::move(lines));
+            int id = fileIdOf(args[0]);
+            auto it = bantuFileTable().find(id);
+            if (it == bantuFileTable().end()) ErrorHandler::throwError("readlines(): not an open file", 0, 0, ErrorHandler::FILE_ERROR);
+            std::string line;
+            while (std::getline(it->second, line)) lines.push_back(Value(line));
+            return Value(std::move(lines));
+        }));
+        env_->define("write", makeNative([fileIdOf](std::vector<Value> args) -> Value {
+            if (args.size() < 2) return Value(false);
+            int id = fileIdOf(args[0]);
+            auto it = bantuFileTable().find(id);
+            if (it == bantuFileTable().end()) ErrorHandler::throwError("write(): not an open file", 0, 0, ErrorHandler::FILE_ERROR);
+            std::string data = args[1].toString();
+            it->second << data;
+            return Value((double)data.size());
+        }));
+        env_->define("close", makeNative([fileIdOf](std::vector<Value> args) -> Value {
+            if (args.empty()) return Value(false);
+            int id = fileIdOf(args[0]);
+            auto it = bantuFileTable().find(id);
+            if (it == bantuFileTable().end()) return Value(false);
+            it->second.close();
+            bantuFileTable().erase(it);
+            return Value(true);
+        }));
+        env_->define("readfile", makeNative([](std::vector<Value> args) -> Value {
+            if (args.empty()) return Value(std::string(""));
+            std::ifstream fs(args[0].toString());
+            if (!fs.is_open()) ErrorHandler::throwError("Cannot read file '" + args[0].toString() + "'", 0, 0, ErrorHandler::FILE_ERROR);
+            std::stringstream ss; ss << fs.rdbuf();
+            return Value(ss.str());
+        }));
+        env_->define("writefile", makeNative([](std::vector<Value> args) -> Value {
+            if (args.size() < 2) return Value(false);
+            std::ofstream fs(args[0].toString(), std::ios::trunc);
+            if (!fs.is_open()) ErrorHandler::throwError("Cannot write file '" + args[0].toString() + "'", 0, 0, ErrorHandler::FILE_ERROR);
+            fs << args[1].toString();
+            return Value(true);
+        }));
+        env_->define("appendfile", makeNative([](std::vector<Value> args) -> Value {
+            if (args.size() < 2) return Value(false);
+            std::ofstream fs(args[0].toString(), std::ios::app);
+            if (!fs.is_open()) ErrorHandler::throwError("Cannot append file '" + args[0].toString() + "'", 0, 0, ErrorHandler::FILE_ERROR);
+            fs << args[1].toString();
+            return Value(true);
+        }));
+
+        // ─── FFI (v1.3.0): call C functions in shared libraries via libffi ───
+        env_->define("loadlib", makeNative(&bantuFfiLoadLib));
+        env_->define("func", makeNative(&bantuFfiFunc));
 
         env_->define("range", makeNative([](std::vector<Value> args) -> Value {
             double start = args.size() > 0 ? args[0].numberVal : 0;
@@ -2619,6 +3197,30 @@ private:
                 std::cout << "  [SQLITE] Auto-opened: :memory:\n";
             }
 
+            // Parameterized path: exec(sql, [params]) binds `?` placeholders
+            // via a prepared statement (safe against SQL injection).
+            if (args.size() > 1 && args[1].isList()) {
+                sqlite3_stmt* stmt = nullptr;
+                if (sqlite3_prepare_v2(bantuSqliteDb, sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK) {
+                    ObjectMap e; e["error"] = Value(std::string(sqlite3_errmsg(bantuSqliteDb))); e["success"] = Value(false);
+                    return Value(std::move(e));
+                }
+                bantuSqliteBindParams(stmt, args[1].listVal);
+                int rc = sqlite3_step(stmt);
+                if (rc != SQLITE_DONE && rc != SQLITE_ROW) {
+                    std::string err = sqlite3_errmsg(bantuSqliteDb);
+                    sqlite3_finalize(stmt);
+                    ObjectMap e; e["error"] = Value(err); e["success"] = Value(false);
+                    return Value(std::move(e));
+                }
+                sqlite3_finalize(stmt);
+                ObjectMap info;
+                info["changes"] = Value((double)sqlite3_changes(bantuSqliteDb));
+                info["lastInsertId"] = Value((double)sqlite3_last_insert_rowid(bantuSqliteDb));
+                info["success"] = Value(true);
+                return Value(std::move(info));
+            }
+
             char* errMsg = nullptr;
             int rc = sqlite3_exec(bantuSqliteDb, sql.c_str(), nullptr, nullptr, &errMsg);
 
@@ -2644,7 +3246,7 @@ private:
             return Value(std::move(execInfo));
         });
 
-        // sua.sqlite.query(sql)
+        // sua.sqlite.query(sql [, params])
         sqliteObj["query"] = makeNative([](std::vector<Value> args) -> Value {
             std::string sql = args.size() > 0 ? args[0].toString() : "SELECT 1";
 
@@ -2652,6 +3254,29 @@ private:
                 sqlite3_open(":memory:", &bantuSqliteDb);
                 bantuSqlitePath = ":memory:";
                 std::cout << "  [SQLITE] Auto-opened: :memory:\n";
+            }
+
+            // Parameterized path: query(sql, [params]) binds `?` placeholders
+            // via a prepared statement, then collects rows.
+            if (args.size() > 1 && args[1].isList()) {
+                sqlite3_stmt* stmt = nullptr;
+                if (sqlite3_prepare_v2(bantuSqliteDb, sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK) {
+                    ObjectMap e; e["error"] = Value(std::string(sqlite3_errmsg(bantuSqliteDb))); e["success"] = Value(false);
+                    return Value(std::move(e));
+                }
+                bantuSqliteBindParams(stmt, args[1].listVal);
+                std::vector<Value> prows;
+                int cols = sqlite3_column_count(stmt);
+                while (sqlite3_step(stmt) == SQLITE_ROW) {
+                    ObjectMap row;
+                    for (int c = 0; c < cols; c++) {
+                        row[sqlite3_column_name(stmt, c)] =
+                            bantuSqliteCellToValue(reinterpret_cast<const char*>(sqlite3_column_text(stmt, c)));
+                    }
+                    prows.push_back(Value(std::move(row)));
+                }
+                sqlite3_finalize(stmt);
+                return Value(std::move(prows));
             }
 
             std::vector<Value> rows;
@@ -2832,7 +3457,18 @@ private:
             }
             std::cout << "  [POSTGRES] Query: " << sql.substr(0, 80)
                       << (sql.length() > 80 ? "..." : "") << "\n";
-            PGresult* res = PQexec(bantuPgConn, sql.c_str());
+            // Parameterized path: query(sql, [params]) binds $1..$n via
+            // PQexecParams (injection-safe); otherwise a plain PQexec.
+            PGresult* res = nullptr;
+            if (args.size() > 1 && args[1].isList()) {
+                std::vector<std::string> storage;
+                std::vector<const char*> vals;
+                bantuPgBuildParams(args[1].listVal, storage, vals);
+                res = PQexecParams(bantuPgConn, sql.c_str(), (int)vals.size(), nullptr,
+                                   vals.empty() ? nullptr : vals.data(), nullptr, nullptr, 0);
+            } else {
+                res = PQexec(bantuPgConn, sql.c_str());
+            }
             if (res == nullptr) {
                 ObjectMap errInfo;
                 errInfo["error"] = Value(std::string("PQexec returned null"));
@@ -2966,7 +3602,18 @@ private:
             }
                 std::cout << "  [POSTGRES] Exec: " << sql.substr(0, 80)
                           << (sql.length() > 80 ? "..." : "") << "\n";
-            PGresult* res = PQexec(bantuPgConn, sql.c_str());
+            // Parameterized path: exec(sql, [params]) binds $1..$n via
+            // PQexecParams (injection-safe); otherwise a plain PQexec.
+            PGresult* res = nullptr;
+            if (args.size() > 1 && args[1].isList()) {
+                std::vector<std::string> storage;
+                std::vector<const char*> vals;
+                bantuPgBuildParams(args[1].listVal, storage, vals);
+                res = PQexecParams(bantuPgConn, sql.c_str(), (int)vals.size(), nullptr,
+                                   vals.empty() ? nullptr : vals.data(), nullptr, nullptr, 0);
+            } else {
+                res = PQexec(bantuPgConn, sql.c_str());
+            }
             if (res == nullptr) {
                 ObjectMap errInfo;
                 errInfo["error"] = Value(std::string("PQexec returned null"));

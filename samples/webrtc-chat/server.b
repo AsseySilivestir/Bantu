@@ -34,12 +34,11 @@ def leaveRoom($roomId, $peerId) {
 
 // ─── HTTP signaling endpoints ─────────────────────────────────────
 
-sua.server.get("/health", def($req, $res) {
+def health() {
     $res.json({ "ok": true, "service": "webrtc-chat", "version": "1.2.2" });
-});
+}
 
-// POST /join  { roomId, peerId }
-sua.server.post("/join", def($req, $res) {
+def create_call() {
     $roomId = $req.body["roomId"];
     $peerId = $req.body["peerId"];
     $peers = joinRoom($roomId, $peerId);
@@ -54,8 +53,12 @@ sua.server.post("/join", def($req, $res) {
         "peerId": $peerId,
         "peersInRoom": $peers,
         "offer": $offer.sdp
-    });
-});
+    }
+sua.server.get("/health",health());
+
+// POST /join  { roomId, peerId }
+sua.server.post("/join",create_call());
+}); 
 
 // POST /answer  { peerId, sdp }
 sua.server.post("/answer", def($req, $res) {
