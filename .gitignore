@@ -35,4 +35,5 @@ vscode-extension/package-lock.json
 
 # PG-enabled local build (kept separate so default build is unaffected)
 bantu-src/compiler/build_pg/
-
+samples
+samples/webrtc-chat/server.b

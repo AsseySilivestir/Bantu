@@ -109,10 +109,42 @@ struct ForNode : ASTNode {
 
 struct EachNode : ASTNode {
     std::string varName;
+    std::string valueVar;   // optional 2nd loop var for `for $k, $v in ...` ("" = single-var)
     std::shared_ptr<ASTNode> iterable;
     std::vector<std::shared_ptr<ASTNode>> body;
-    EachNode(const std::string& v, std::shared_ptr<ASTNode> it, std::vector<std::shared_ptr<ASTNode>> b, int l, int c)
-        : ASTNode(l, c), varName(v), iterable(std::move(it)), body(std::move(b)) {}
+    EachNode(const std::string& v, std::shared_ptr<ASTNode> it, std::vector<std::shared_ptr<ASTNode>> b,
+             int l, int c, const std::string& vv = "")
+        : ASTNode(l, c), varName(v), valueVar(vv), iterable(std::move(it)), body(std::move(b)) {}
+};
+
+// ─── Loop control (break / continue) ───
+struct BreakNode : ASTNode {
+    BreakNode(int l, int c) : ASTNode(l, c) {}
+};
+struct ContinueNode : ASTNode {
+    ContinueNode(int l, int c) : ASTNode(l, c) {}
+};
+
+// ─── throw <expr>; ───
+struct ThrowNode : ASTNode {
+    std::shared_ptr<ASTNode> value;
+    ThrowNode(std::shared_ptr<ASTNode> v, int l, int c) : ASTNode(l, c), value(std::move(v)) {}
+};
+
+// ─── switch / case / default (no fallthrough) ───
+struct SwitchCase {
+    std::shared_ptr<ASTNode> value;                // case <value> { ... }
+    std::vector<std::shared_ptr<ASTNode>> body;
+};
+struct SwitchNode : ASTNode {
+    std::shared_ptr<ASTNode> subject;
+    std::vector<SwitchCase> cases;
+    std::vector<std::shared_ptr<ASTNode>> defaultBody;
+    bool hasDefault = false;
+    SwitchNode(std::shared_ptr<ASTNode> s, std::vector<SwitchCase> cs,
+               std::vector<std::shared_ptr<ASTNode>> db, bool hd, int l, int c)
+        : ASTNode(l, c), subject(std::move(s)), cases(std::move(cs)),
+          defaultBody(std::move(db)), hasDefault(hd) {}
 };
 
 // ─── Functions ───

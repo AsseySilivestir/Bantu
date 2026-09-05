@@ -21,6 +21,7 @@
 #include "types.hpp"
 #include "lexer.hpp"
 #include "parser.hpp"
+#include "linter.hpp"
 #include "evaluator.hpp"
 #include "environment.hpp"
 #include "server.hpp"
@@ -55,7 +56,7 @@
     #include <unistd.h>
 #endif
 
-const std::string BANTU_VERSION = "1.2.2";
+const std::string BANTU_VERSION = "1.3.0";
 const std::string BANTU_LANG = "Bantu";
 
 // ─── Helpers ──────────────────────────────────────────────────────────
@@ -289,6 +290,9 @@ void printHelp() {
 // v1.2.2: global quiet flag — flips evaluator into quiet mode and suppresses
 // the "Running:" / "[Executed in ...]" chit-chat. Set by --quiet on the CLI.
 static bool g_quietMode = false;
+// Compile gate: when true, `run`/`build` lint the source and refuse to execute
+// on error-severity diagnostics. Disabled with `--no-lint`.
+static bool g_lintGate = true;
 
 void runCode(const std::string& source, const std::string& filename = "<repl>") {
     auto start = std::chrono::high_resolution_clock::now();
@@ -298,6 +302,25 @@ void runCode(const std::string& source, const std::string& filename = "<repl>") 
 
     Parser parser(std::move(tokens));
     auto ast = parser.parse();
+
+    // Compile gate: lint the parsed program (syntax errors from recovery + the
+    // static checks) and refuse to execute if ANY error-severity diagnostic is
+    // present. Warnings are printed but do not block. Fix-then-run, like a real
+    // toolchain. (`--no-lint` is honored by the caller for an escape hatch.)
+    if (g_lintGate) {
+        std::vector<LintDiag> diags;
+        for (const auto& e : parser.errors()) diags.push_back({e.line, e.col, "error", e.message});
+        { std::set<std::string> consts; for (auto& node : ast) bantuLintWalk(node, consts, diags); }
+        int errCount = 0;
+        for (const auto& d : diags) {
+            std::cerr << "  [" << d.severity << "] line " << d.line << ", col " << d.col << ": " << d.message << "\n";
+            if (d.severity == "error") errCount++;
+        }
+        if (errCount > 0) {
+            throw BantuError("compilation blocked by " + std::to_string(errCount)
+                             + " error(s) — fix them and re-run", "LINT");
+        }
+    }
 
     Evaluator evaluator;
     evaluator.setQuiet(g_quietMode);
@@ -366,6 +389,60 @@ void runRepl() {
             buffer.clear();
         }
     }
+}
+
+// ─── bantu lint ───────────────────────────────────────────────────────
+// Static analysis without executing. `--json` emits machine-readable
+// diagnostics for the VS Code extension; otherwise a human summary.
+// Exit code is non-zero when any error-severity diagnostic is present.
+int cmdLint(int argc, char* argv[]) {
+    std::string path;
+    bool json = false;
+    for (int i = 2; i < argc; ++i) {
+        std::string a = argv[i];
+        if (a == "--json") json = true;
+        else if (a == "--help" || a == "-h") {
+            std::cout << "  Usage: bantu lint <file.b> [--json]\n";
+            return 0;
+        } else if (!a.empty() && a[0] != '-') {
+            path = a;
+        }
+    }
+    if (path.empty()) {
+        std::cerr << "  Usage: bantu lint <file.b> [--json]\n";
+        return 1;
+    }
+    if (!fileExists(path)) {
+        std::cerr << "  [ERROR] File not found: " << path << "\n";
+        return 1;
+    }
+
+    std::string source = readFile(path);
+    auto diags = bantuLintSource(source);
+
+    if (json) {
+        std::cout << "[";
+        for (size_t i = 0; i < diags.size(); ++i) {
+            if (i) std::cout << ",";
+            std::cout << "{\"line\":" << diags[i].line
+                      << ",\"col\":" << diags[i].col
+                      << ",\"severity\":\"" << diags[i].severity << "\""
+                      << ",\"message\":\"" << bantuJsonEscape(diags[i].message) << "\"}";
+        }
+        std::cout << "]\n";
+    } else {
+        int errs = 0, warns = 0;
+        for (auto& d : diags) {
+            (d.severity == "error" ? errs : warns)++;
+            std::cerr << "  " << d.severity << " (line " << d.line << ", col " << d.col << "): "
+                      << d.message << "\n";
+        }
+        if (diags.empty()) std::cout << "  ✓ " << path << " — no issues found\n";
+        else std::cout << "  " << errs << " error(s), " << warns << " warning(s)\n";
+    }
+
+    for (auto& d : diags) if (d.severity == "error") return 1;
+    return 0;
 }
 
 // ─── bantu run ────────────────────────────────────────────────────────
@@ -2668,10 +2745,14 @@ int main(int argc, char* argv[]) {
         for (int i = 2; i < argc; ++i) {
             std::string a = argv[i];
             if (a == "--quiet" || a == "-q") { g_quietMode = true; }
+            else if (a == "--no-lint") { g_lintGate = false; }
             else if (!a.empty() && a[0] != '-') { file = a; }
         }
         return cmdRun(file);
     }
+
+    // ─── bantu lint ───
+    if (command == "lint") return cmdLint(argc, argv);
 
     // ─── bantu build ───
     if (command == "build") {
