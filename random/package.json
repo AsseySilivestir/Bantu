@@ -1,0 +1,6 @@
+{
+  "name": "random",
+  "version": "1.0.0",
+  "main": "random.b",
+  "description": "A Python-style random-number module for Bantu: a seedable pure-Bantu generator with random, uniform, randint, randrange, choice, choices, sample, shuffle, gauss, expovariate, triangular, and getrandbits."
+}

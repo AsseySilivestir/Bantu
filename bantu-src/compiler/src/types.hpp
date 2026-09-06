@@ -13,6 +13,7 @@
 #include <iostream>
 #include <sstream>
 #include <cmath>
+#include <exception>
 #include <algorithm>
 
 // ============================================================
@@ -217,7 +218,7 @@ enum class BantuTokenType {
     DEF, RETURN,
     PRINT, READ, DB, FETCH, AWAIT,
     CONST, PRIVATE, PUBLIC, FROM,
-    TRY, CATCH,
+    TRY, CATCH, THROW,
     BREAK, CONTINUE, SWITCH, CASE, DEFAULT,
     NEW, CREATE, DELETE, UPDATE, CALC,
     CLASS, EXTENDS, IMPLEMENTS, SUPER,
@@ -244,6 +245,43 @@ struct Token {
 };
 
 // ============================================================
+// EXCEPTIONS (real, catchable error propagation)
+// ============================================================
+//
+// Bantu control flow uses two families of C++ exceptions:
+//   * BantuError  — a runtime/syntax/type error. Derives from std::exception
+//                   so `try { } catch ($e) { }` (evalTryCatch) can catch it and
+//                   the top-level/parser can recover instead of looping.
+//   * BantuThrow  — a value thrown by a Bantu `throw <expr>;` statement. Carries
+//                   the thrown Value so the catch block receives it verbatim.
+// (BreakSignal/ContinueSignal/ReturnSignal are deliberately NOT std::exception,
+//  so they pass through try/catch untouched — see evaluator.hpp.)
+
+// A structured, position-carrying error. `what()` returns a formatted message.
+struct BantuError : std::exception {
+    std::string message;   // human-readable text
+    std::string typeName;  // e.g. "RUNTIME ERROR", "SYNTAX ERROR"
+    int line = 0;
+    int col = 0;
+    std::string full;      // cached "[TYPE] message (line L, col C)"
+
+    BantuError(std::string msg, std::string type, int l = 0, int c = 0)
+        : message(std::move(msg)), typeName(std::move(type)), line(l), col(c) {
+        full = "[" + typeName + "] " + message;
+        if (line && col) full += " (line " + std::to_string(line) + ", col " + std::to_string(col) + ")";
+    }
+    const char* what() const noexcept override { return full.c_str(); }
+};
+
+// A value thrown by a Bantu `throw` statement.
+struct BantuThrow : std::exception {
+    Value value;
+    std::string rendered;
+    explicit BantuThrow(Value v) : value(std::move(v)) { rendered = value.toString(); }
+    const char* what() const noexcept override { return rendered.c_str(); }
+};
+
+// ============================================================
 // ERROR HANDLER
 // ============================================================
 
@@ -266,10 +304,12 @@ public:
         return "ERROR";
     }
 
-    static void throwError(const std::string& msg, int line = 0, int col = 0, ErrorType etype = RUNTIME_ERROR) {
-        std::cerr << "\n[" << errorTypeName(etype) << "] " << msg;
-        if (line && col) std::cerr << "\n  at line " << line << ", col " << col;
-        std::cerr << "\n";
+    // Raise a Bantu error. As of v1.3.0 this THROWS a catchable BantuError
+    // instead of merely printing — the linchpin that makes try/catch work and
+    // stops the parser from looping on a stuck token. Uncaught errors are
+    // reported by the top-level handler in evaluator.hpp / main.cpp.
+    [[noreturn]] static void throwError(const std::string& msg, int line = 0, int col = 0, ErrorType etype = RUNTIME_ERROR) {
+        throw BantuError(msg, errorTypeName(etype), line, col);
     }
 
     static void throwSyntaxError(const std::string& msg, int line = 0, int col = 0) {

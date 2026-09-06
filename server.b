@@ -857,6 +857,37 @@ def handleCallHangup($req, $res) {
     $res.json({"ok": true, "message": "Call ended"});
 }
 
+// Peek for an incoming call addressed to me WITHOUT consuming the offer.
+// The global poller in api.js calls this to ring the Accept banner; the
+// callee's call.html later performs the real (consuming) GET /api/call/offer.
+// Returns the newest unconsumed offer's caller id, name and video flag.
+def handleCallIncoming($req, $res) {
+    dict $me = authUser($req);
+    if (!$me) {
+        $res.status(401).json({"error": "Not authenticated"});
+        return null;
+    }
+    list $rows = sua.sqlite.query(
+        "SELECT s.from_id AS from_id, u.display_name AS from_name, s.payload AS payload, s.created_at AS created_at " +
+        "FROM signaling s JOIN users u ON u.id = s.from_id " +
+        "WHERE s.to_id = " + str($me.id) + " AND s.type = 'offer' AND s.consumed = 0 " +
+        "ORDER BY s.id DESC LIMIT 1;"
+    );
+    if (len($rows) == 0) {
+        $res.json({"incoming": false});
+        return null;
+    }
+    string $payload = $rows[0].payload;
+    bool $hasVideo = contains($payload, "m=video");
+    $res.json({
+        "incoming": true,
+        "fromId": num($rows[0].from_id),
+        "fromName": $rows[0].from_name,
+        "hasVideo": $hasVideo,
+        "createdAt": $rows[0].created_at
+    });
+}
+
 // ════════════════════════════════════════════════════════════════════
 //  HEALTH & OPTIONS
 // ════════════════════════════════════════════════════════════════════
@@ -924,6 +955,7 @@ sua.server.get("/api/call/answer/:id",                handleCallAnswerGet);
 sua.server.post("/api/call/ice/:id",                  handleCallIcePost);
 sua.server.get("/api/call/ice/:id",                   handleCallIceGet);
 sua.server.post("/api/call/hangup/:id",               handleCallHangup);
+sua.server.get("/api/call/incoming",                  handleCallIncoming);
 
 // CORS preflight
 sua.server.options("/*",                              handleOptions);

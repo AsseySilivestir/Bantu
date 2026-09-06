@@ -1,14 +1,35 @@
-# Bantu v1.2.2
+# Bantu
 
-**Bantu Programming Language v1.2.2 — Stable Release**
+**Bantu Programming Language v1.3.0 — Stable Release**
 
-A high-level, dynamically-typed programming language implemented as a tree-walking interpreter in C++17. The entire toolchain — interpreter, package manager, HTTP server, WebRTC engine, SQLite/PostgreSQL/MySQL drivers, project scaffolding, VSCode extension, and cross-platform desktop installer generator — ships as a single ~660 KB static binary with zero runtime dependencies.
+A high-level, dynamically-typed programming language implemented as a tree-walking interpreter in C++17. The entire toolchain — interpreter, linter, package manager, HTTP server, WebRTC engine, SQLite/PostgreSQL drivers, FFI, project scaffolding, VSCode extension, and cross-platform desktop installer generator — ships as a single static binary with zero runtime dependencies.
 
 ```bash
-bantu --version     # → Bantu v1.2.2
+bantu --version     # → Bantu v1.3.0
 bantu init myapp
 cd myapp && bantu run
 ```
+
+## What's New in v1.3.0
+
+A **core-language correctness release**: several features that were advertised via keywords but silently failed now work, the parser can no longer loop on a bad token, and a batch of requested capabilities lands. Full details in [`CHANGELOG.md`](CHANGELOG.md) (entries are tagged `[feature]` / `[bug fix]` / `[patch]`), [`docs/language-features.md`](docs/language-features.md), and [`docs/v1.3.0-status.md`](docs/v1.3.0-status.md).
+
+| Change | Highlights |
+|---|---|
+| **Fixed: compound assignment** | `+=` `-=` `*=` `/=` used to raise `Unknown operator` and could spin a `for` loop forever. They now apply the base operator correctly. |
+| **Fixed: `break` / `continue`** | Were inert no-ops; they now exit/skip loop iterations. |
+| **Fixed: `try` / `catch`** | Runtime errors are genuinely catchable — `$e` is `{message, type, line}`. Errors now propagate instead of printing and continuing. |
+| **Fixed: parser recovery** | A syntax error is reported once and the parser resynchronizes (no more runaway loops). `run`/`build` refuse to execute code with errors. |
+| **`const` is truly final** | Reassigning a `const` is now a compile **and** runtime error (like Java's `final`). |
+| **`switch` / `case` / `default` [NEW]** | Braces required, no fallthrough. |
+| **`throw` [NEW]** | `throw <any value>;` — caught by `try`/`catch`. |
+| **Dict iteration [NEW]** | `for $key, $value in $dict.items() { }`, plus `.keys()` `.values()` `.size()` and `keys()`/`values()`/`entries()`. |
+| **List mutators [NEW]** | `append` `pop` `insert` `remove` `extend` — and `push()`/`.push()`/`.pop()` now actually mutate (they were silent no-ops). |
+| **File I/O [NEW]** | Python-style `open/read/readline/readlines/write/close` + `readfile`/`writefile`/`appendfile`. |
+| **FFI [NEW]** | `loadlib("libm.dylib")` + `func(lib, "sqrt", "double", ["double"])` calls real C via libffi (Linux/macOS). |
+| **Parameterized SQL [NEW]** | `sua.sqlite.query(sql, [params])` binds `?` safely; the ORM now binds every value instead of escaping. |
+| **Linter + compile gate [NEW]** | `bantu lint file.b [--json]`; the VSCode extension shows errors (red) and warnings (yellow) live as you type. |
+| **Anonymous functions [NEW]** | `def($a, $b) { … }` as a first-class value; also `$reserved` words usable as variable names and bare `return;`. |
 
 ## What's New in v1.2.2
 
@@ -30,73 +51,104 @@ v1.2.2 is a **drop-in maintenance release** on top of v1.2.1. No language change
 |---|---|
 | **`include` keyword** | Language-level module imports. `include "./routes.b";` (direct) or `include "./ctrl.b" as ctrl;` (namespaced). Path resolution + cycle guard. |
 | **PostgreSQL driver** | `sua.postgres.connect/query/exec/close`. Default binary ships a deterministic stub; build with `-DBANTU_POSTGRES=ON` for real libpq. |
-| **MySQL driver** | `sua.mysql.connect/query/close`. Same stub-or-real pattern via `-DBANTU_MYSQL=ON`. |
+| **MySQL driver** | `sua.mysql.connect/query/close`. ⚠️ **Simulation only** — despite the `-DBANTU_MYSQL=ON` option, `sua.mysql.*` returns canned rows and never reaches a real server (see [`docs/v1.3.0-status.md`](docs/v1.3.0-status.md)). Use SQLite or PostgreSQL for real data. |
 | **WebRTC engine** | `sua.webrtc.peer/createOffer/createAnswer/addIceCandidate/dataChannel/send/close`. Real libdatachannel when built with `-DBANTU_WEBRTC=ON`. |
 | **VSCode extension** | Syntax highlighting, autocomplete, hover hints, Go-to-Symbol, snippets, **blue-B file icon** for `*.b` files, one-click Run (F5). |
 | **`bantu build-windows`** | One command → NSIS `.exe` installer (Windows-only). Superseded in v1.2.2 by the cross-platform `bantu installer`. |
 | **Three sample apps** | `samples/blogsite` (modular Sua + SQLite), `samples/webrtc-chat` (signaling + browser UI), `samples/pg-dashboard` (PostgreSQL analytics). |
 | **PDF documentation** | 36-page official guide at `docs/Bantu-Programming-Language-v1.2.2.pdf` (Dracula-themed). |
 
+## Install (standalone, one line)
+
+The fastest way to get the `bantu` toolchain — no manual PATH editing, no compiler:
+
+**Linux / macOS**
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/AsseySilivestir/Bantu/main/scripts/installers/install.sh | sh
+```
+
+**Windows (PowerShell)**
+
+```powershell
+irm https://raw.githubusercontent.com/AsseySilivestir/Bantu/main/scripts/installers/install.ps1 | iex
+```
+
+**macOS installer package** — prefer a graphical install? Download `Bantu-<ver>-macos-<arch>.pkg`
+from the [releases page](https://github.com/AsseySilivestir/Bantu/releases) and double-click it
+(installs `bantu` to `/usr/local/bin`, the Python-style standard). Windows users can likewise use
+the `Bantu-<ver>-x64.msi`.
+
+Then open a new terminal and run `bantu --version`. Installer sources live in
+[`scripts/installers/`](scripts/installers/); release artifacts are built by
+[`.github/workflows/release.yml`](.github/workflows/release.yml).
+
 ## Download
 
-Grab the latest zip from the [v1.2.2 release](https://github.com/AsseySilivestir/Bantu/releases/tag/v1.2.2):
+Prefer to grab an archive yourself? Every asset below is built and attached automatically on each version tag by [`release.yml`](.github/workflows/release.yml) — see the [latest release](https://github.com/AsseySilivestir/Bantu/releases/latest).
 
-| Asset | Size | Platform | Includes |
-|---|---|---|---|
-| [`Bantu-v1.2.2-linux-x64.zip`](https://github.com/AsseySilivestir/Bantu/releases/download/v1.2.2/Bantu-v1.2.2-linux-x64.zip) | ~380 KB | Linux x86-64 | Pre-built `bantu` binary + samples + docs + VSIX |
-| [`Bantu-v1.2.2-windows-x64.zip`](https://github.com/AsseySilivestir/Bantu/releases/download/v1.2.2/Bantu-v1.2.2-windows-x64.zip) | ~650 KB | Windows x64 | Pre-built `bantu.exe` + `install.bat` + samples + VSIX + PDF (no compilation needed) |
-| [`bantu-vscode-1.2.2.vsix`](https://github.com/AsseySilivestir/Bantu/releases/download/v1.2.2/bantu-vscode-1.2.2.vsix) | ~24 KB | VSCode 1.75+ | Standalone extension (also inside both zips) |
-| [`Bantu-Programming-Language-v1.2.2.pdf`](https://github.com/AsseySilivestir/Bantu/releases/download/v1.2.2/Bantu-Programming-Language-v1.2.2.pdf) | ~75 KB | Any | Dracula-themed 31-page official guide |
-| — *(build from source)* | — | **macOS** | No pre-built binary — see [One-time setup (macOS)](#one-time-setup-macos--build-from-source) below |
+| Asset | Platform | Notes |
+|---|---|---|
+| `bantu-linux-x64.tar.gz` | Linux x86-64 | Pre-built `bantu` binary |
+| `bantu-macos-arm64.tar.gz` | macOS (Apple silicon) | Pre-built `bantu` binary |
+| `bantu-macos-x64.tar.gz` | macOS (Intel) | Pre-built `bantu` binary |
+| `Bantu-<ver>-macos-<arch>.pkg` | macOS | Double-click installer → `/usr/local/bin/bantu` |
+| `bantu-windows-x64.zip` | Windows x64 | Pre-built `bantu.exe` |
+| `Bantu-<ver>-x64.msi` | Windows x64 | Standard MSI installer (adds Bantu to PATH) |
+| `bantu-vscode-<ver>.vsix` | VSCode 1.75+ | Extension: highlighting, autocomplete, **live linting** |
+| [`Bantu-Programming-Language-v1.2.2.pdf`](docs/Bantu-Programming-Language-v1.2.2.pdf) | Any | Official guide (still the v1.2.2 edition) |
+
+The one-line installers above consume these assets, so `curl … | sh` is the recommended path on every platform.
 
 ## Quick Start
 
-Bantu v1.2.2 ships as a **zip distribution** with a built-in PATH integrator
+Bantu ships as a **single static binary** with a built-in PATH integrator
 and an offline package manager — so you can scaffold, install, and run new
 Bantu projects with the same ergonomics as `npm init`, `cargo new`, or
 Spring Initializr. **No internet required.**
 
-### One-time setup (Linux x86-64)
+### One-time setup (Linux / macOS)
+
+The [one-line installer](#install-standalone-one-line) above is the recommended
+path — it detects your OS/arch, installs the binary onto your `PATH`, and
+verifies it. To also seed the offline package registry:
 
 ```bash
-# 1. Download and unzip the release
-curl -L -o bantu.zip https://github.com/AsseySilivestir/Bantu/releases/download/v1.2.2/Bantu-v1.2.2-linux-x64.zip
-unzip bantu.zip
-cd bantu-v1.2.2-linux-x64
+curl -fsSL https://raw.githubusercontent.com/AsseySilivestir/Bantu/main/scripts/installers/install.sh | sh
 
-# 2. Add bantu to PATH (one-time) + seed local registry
-chmod +x bantu
-./bantu setup --seed
+# optional: seed the local package registry
+bantu setup --seed
 
-# 3. Open a NEW terminal (so PATH reloads), then verify
+# verify (open a NEW terminal if PATH was just changed)
 bantu --version
-# → Bantu v1.2.2
+# → Bantu v1.3.0
 ```
 
-### One-time setup (Windows x64) — download & double-click
+Prefer a graphical install on macOS? Download `Bantu-<ver>-macos-<arch>.pkg`
+from the [releases page](https://github.com/AsseySilivestir/Bantu/releases) and
+double-click it — it installs `bantu` to `/usr/local/bin`.
 
-The Windows release ships with a **pre-built `bantu.exe`** — no Visual
-Studio, no CMake, no compilation required. The whole setup is three
-steps:
+### One-time setup (Windows x64)
 
-1. Download `Bantu-v1.2.2-windows-x64.zip` from the
-   [v1.2.2 release](https://github.com/AsseySilivestir/Bantu/releases/tag/v1.2.2).
-2. Unzip it anywhere (e.g. `Downloads\Bantu-v1.2.2-windows-x64`).
-3. **Double-click `install.bat`** inside the unzipped folder.
+No Visual Studio, no CMake, no compilation required. Either run the one-liner:
 
-The installer:
-- Copies `bantu.exe` to `%LOCALAPPDATA%\Bantu\bin\`
-- Adds that folder to your user `PATH`
-- Registers `.b` as a Bantu source file (double-clicking a `.b` runs it)
-- **Auto-installs the VSCode extension** if VSCode is detected
-- Creates a desktop shortcut and a Start Menu entry
-- Registers an uninstaller in *Add/Remove Programs*
+```powershell
+irm https://raw.githubusercontent.com/AsseySilivestir/Bantu/main/scripts/installers/install.ps1 | iex
+```
+
+…or download `Bantu-<ver>-x64.msi` from the
+[releases page](https://github.com/AsseySilivestir/Bantu/releases) and double-click it.
+
+Either way you get:
+- `bantu.exe` installed to `%LOCALAPPDATA%\Bantu\bin\` (one-liner) or `Program Files\Bantu` (MSI)
+- That folder added to your `PATH`
+- An entry in *Add/Remove Programs* (MSI)
 
 Open a **new** Command Prompt (so PATH reloads) and verify:
 
 ```bat
 bantu --version
-:: → Bantu v1.2.2
+:: → Bantu v1.3.0
 ```
 
 To uninstall later: run `uninstall.bat` from the original zip folder,
@@ -104,7 +156,7 @@ or use *Add/Remove Programs* in Windows Settings.
 
 ### One-time setup (macOS) — build from source
 
-The v1.2.2 release ships pre-built binaries for **Linux x86-64** and
+The v1.3.0 release ships pre-built binaries for **Linux x86-64**, **macOS**, and
 **Windows x64** only. There is no pre-built macOS binary in the release
 (yet) — on macOS, build `bantu` from source. It's a single C++17 file
 that compiles in ~30 seconds with the Xcode command-line tools.
@@ -127,7 +179,7 @@ sudo chmod +x /usr/local/bin/bantu
 
 # 5. Open a NEW terminal, then verify
 bantu --version
-# → Bantu v1.2.2
+# → Bantu v1.3.0
 ```
 
 **Optional — real PostgreSQL/MySQL/WebRTC drivers:**
@@ -202,7 +254,7 @@ bantu list                   # show installed packages
 ### VSCode extension (optional, recommended)
 
 ```bash
-code --install-extension bantu-vscode-1.2.2.vsix
+code --install-extension bantu-vscode-1.3.0.vsix
 ```
 
 Gives you `.b` syntax highlighting, autocomplete, hover hints, snippets,
@@ -264,6 +316,30 @@ $rows = sua.postgres.query("SELECT * FROM users");
 sua.mysql.connect("localhost", "root", "secret", "app", 3306);
 $rows = sua.mysql.query("SELECT * FROM users");
 ```
+
+## ORM (Django + ultraorm style)
+
+Prefer models and query builders to raw SQL? Bantu ships a full ORM written in
+Bantu itself — models, chained/lazy querysets with field lookups (`age__gte`,
+`name__icontains`, `id__in`, …), `Q` objects for OR/NOT, bulk insert, auto-diff
+migrations, and one-line database switching across SQLite/Postgres/MySQL.
+
+```bantu
+include "lib/orm.b" as orm;
+
+$conn = orm.open({"driver": "sqlite", "path": "app.db"});
+$User = orm.model($conn, "users", [
+    orm.pk("id"),
+    orm.field("name",  "text", {"nullable": false}),
+    orm.field("age",   "int",  {})
+]);
+
+orm.insert($User, {"name": "Ada", "age": 36});
+$adults = orm.all(orm.orderBy(orm.filter(orm.query($User), [["age__gte", 18]]), ["-age"]));
+```
+
+Full reference: **[docs/orm.md](docs/orm.md)** · library: [`lib/orm.b`](lib/orm.b) ·
+tests: `bantu run lib/orm_test.b` · demo: `bantu run samples/orm-demo/main.b`.
 
 ## WebRTC (v1.2.2)
 
@@ -366,7 +442,7 @@ cmake .. -DCMAKE_BUILD_TYPE=Release \
 make -j$(nproc)
 
 sudo cp bantu /usr/local/bin/
-bantu --version    # → Bantu v1.2.2
+bantu --version    # → Bantu v1.3.0
 ```
 
 ## Repository Layout
@@ -404,14 +480,14 @@ Bantu/
 ├── windows/                 # Windows .bat helpers (start, stop, reset-db)
 ├── public/                  # Sua default static files
 ├── README.md                # This file
-├── CHANGELOG.md             # v1.0.0 → v1.1.0 → v1.2.0 → v1.2.2
+├── CHANGELOG.md             # v1.0.0 → v1.1.0 → v1.2.0 → v1.2.2 → v1.3.0
 ├── LICENSE                  # MIT
 └── QUICKSTART.md
 ```
 
 ## Documentation
 
-- **Official guide/documentation:** [`docs/Bantu-Programming-Language-Quick-start-v1.2.2.pdf`](docs/Bantu-Programming-Language-v1.2.2.pdf) — 36 pages, Dracula-themed, covers every feature including `bantu installer`
+- **Official guide:** [`docs/Bantu-Programming-Language-v1.2.2.pdf`](docs/Bantu-Programming-Language-v1.2.2.pdf) — 36 pages, Dracula-themed, covers every feature including `bantu installer`
 - **Quick start:** [`QUICKSTART.md`](QUICKSTART.md)
 - **Samples:** [`samples/`](samples/) — three runnable apps
 - **VSCode extension:** [`vscode-extension/README.md`](vscode-extension/README.md)
@@ -433,4 +509,4 @@ Bantu was created by **Assey Silivestir Peter**. The language is named after the
 
 ---
 
-*v1.2.2 stable release · June 2026*
+*v1.3.0 stable release · July 2026*

@@ -28,6 +28,17 @@
 #include <curl/curl.h>
 #include <sqlite3.h>
 
+// ─── FFI (foreign function interface) headers ───
+// Compiled in when BANTU_FFI is defined and libffi + libdl are linked.
+#ifdef BANTU_FFI
+#include <dlfcn.h>
+#if defined(__APPLE__)
+  #include <ffi/ffi.h>
+#else
+  #include <ffi.h>
+#endif
+#endif
+
 // Helper to create native function values without ambiguity
 inline Value makeNative(NativeFn fn) { return Value(std::move(fn)); }
 
@@ -280,6 +291,556 @@ inline std::vector<std::string> bantuSplitPath(const std::string& p) {
 static sqlite3* bantuSqliteDb = nullptr;
 static std::string bantuSqlitePath = "";
 
+// ─── Open-file registry (Python-style file I/O) ───
+// open() returns a handle dict {"__file": id}; the actual std::fstream lives
+// here, keyed by id. Wrapped in a function to dodge static init-order issues.
+static std::unordered_map<int, std::fstream>& bantuFileTable() {
+    static std::unordered_map<int, std::fstream> table;
+    return table;
+}
+static int bantuNextFileId = 1;
+
+// ─── UDP socket registry (sua.udp namespace, v1.4.0) ───
+// sua.udp.socket() returns a handle dict {"__udp": id}; the actual fd lives
+// here, keyed by id. Same pattern as bantuFileTable().
+//
+// Each entry holds the OS socket fd, family (AF_INET / AF_INET6), and a
+// flag indicating whether it's been bound. Lifecycle: socket() → bind() →
+// recvfrom()/send_to() → close().
+//
+// Platform includes — POSIX vs Windows are wrapped in #ifdef.
+#ifdef _WIN32
+    // Winsock2 — needs to be initialized via WSAStartup before any socket call.
+    #include <winsock2.h>
+    #include <ws2tcpip.h>
+    #pragma comment(lib, "ws2_32.lib")
+    #define BANTU_CLOSE_SOCKET closesocket
+    #define BANTU_SOCKET_ERRNO WSAGetLastError()
+#else
+    #include <sys/socket.h>
+    #include <netinet/in.h>
+    #include <arpa/inet.h>
+    #include <netdb.h>
+    #include <poll.h>
+    #include <unistd.h>
+    #include <fcntl.h>
+    #define BANTU_CLOSE_SOCKET close
+    #define BANTU_SOCKET_ERRNO errno
+#endif
+struct BantuUdpSocket {
+    int fd = -1;
+    int family = AF_INET;
+    bool bound = false;
+};
+static std::unordered_map<int, BantuUdpSocket>& bantuUdpSocketTable() {
+    static std::unordered_map<int, BantuUdpSocket> table;
+    return table;
+}
+static int bantuNextUdpId = 1;
+
+// ─── SHA-1 (for WebSocket handshake, RFC 6455) ────────────────────
+// We need SHA1(key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11") → base64
+// for the Sec-WebSocket-Accept header. ~50 lines of inline SHA1.
+struct BantuSha1 {
+    uint32_t h0=0x67452301, h1=0xEFCDAB89, h2=0x98BADCFE, h3=0x10325476, h4=0xC3D2E1F0;
+    uint8_t msg[64]; int msgLen=0; uint64_t totalLen=0;
+
+    void update(const uint8_t* data, size_t len) {
+        totalLen += len;
+        for (size_t i = 0; i < len; i++) {
+            msg[msgLen++] = data[i];
+            if (msgLen == 64) { process(); msgLen = 0; }
+        }
+    }
+    void update(const std::string& s) { update((const uint8_t*)s.data(), s.size()); }
+
+    void process() {
+        uint32_t w[80];
+        for (int i = 0; i < 16; i++) {
+            w[i] = (msg[i*4]<<24) | (msg[i*4+1]<<16) | (msg[i*4+2]<<8) | msg[i*4+3];
+        }
+        for (int i = 16; i < 80; i++) {
+            uint32_t t = w[i-3] ^ w[i-8] ^ w[i-14] ^ w[i-16];
+            w[i] = (t << 1) | (t >> 31);
+        }
+        uint32_t a=h0, b=h1, c=h2, d=h3, e=h4;
+        for (int i = 0; i < 80; i++) {
+            uint32_t f, k;
+            if (i<20)      { f=(b&c)|((~b)&d); k=0x5A827999; }
+            else if (i<40) { f=b^c^d;          k=0x6ED9EBA1; }
+            else if (i<60) { f=(b&c)|(b&d)|(c&d); k=0x8F1BBCDC; }
+            else           { f=b^c^d;          k=0xCA62C1D6; }
+            uint32_t temp = ((a<<5)|(a>>27)) + f + e + k + w[i];
+            e=d; d=c; c=(b<<30)|(b>>2); b=a; a=temp;
+        }
+        h0+=a; h1+=b; h2+=c; h3+=d; h4+=e;
+    }
+
+    std::string final_() {
+        uint64_t bits = totalLen * 8;
+        msg[msgLen++] = 0x80;
+        while (msgLen != 56) { if (msgLen==64) { process(); msgLen=0; } msg[msgLen++]=0; }
+        for (int i = 7; i >= 0; i--) msg[msgLen++] = (bits >> (i*8)) & 0xFF;
+        process();
+        std::string out(20, '\0');
+        uint32_t hs[5] = {h0,h1,h2,h3,h4};
+        for (int i = 0; i < 5; i++) {
+            out[i*4]   = (hs[i]>>24)&0xFF;
+            out[i*4+1] = (hs[i]>>16)&0xFF;
+            out[i*4+2] = (hs[i]>>8)&0xFF;
+            out[i*4+3] = hs[i]&0xFF;
+        }
+        return out;
+    }
+};
+
+// ─── Base64 encoder (for WebSocket handshake) ──────────────────────
+static std::string bantuBase64Encode(const std::string& input) {
+    static const char tbl[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string out;
+    int val = 0, valb = -6;
+    for (uint8_t c : input) {
+        val = (val << 8) | c;
+        valb += 8;
+        while (valb >= 0) {
+            out.push_back(tbl[(val >> valb) & 0x3F]);
+            valb -= 6;
+        }
+    }
+    if (valb > -6) out.push_back(tbl[((val << 8) >> (valb + 8)) & 0x3F]);
+    while (out.size() % 4) out.push_back('=');
+    return out;
+}
+
+// ─── WebSocket connection table ────────────────────────────────────
+struct BantuWsClient {
+    int fd = -1;
+    std::string id;       // client ID (for sua.ws.send/broadcast)
+    bool alive = true;
+};
+static std::unordered_map<int, BantuWsClient>& bantuWsTable() {
+    static std::unordered_map<int, BantuWsClient> table;
+    return table;
+}
+static int bantuNextWsId = 1;
+
+// Bantu-level WS event handlers (set by sua.ws.on)
+static Value bantuWsOnConnect = Value();
+static Value bantuWsOnMessage = Value();
+static Value bantuWsOnDisconnect = Value();
+
+// Callback function — set by Evaluator constructor, used by
+// the free-function WebSocket handler to call Bantu callbacks.
+#include <functional>
+static std::function<Value(Value, std::vector<Value>)> bantuWsCallback;
+
+// Forward declaration — the real definition is inside Evaluator class
+// (at line ~1550). The WS handler calls through this function pointer.
+
+// ─── Send a WebSocket text frame to a client ───────────────────────
+// Server→client frames are NOT masked (per RFC 6455).
+static void bantuWsSend(int fd, const std::string& message) {
+    std::vector<uint8_t> frame;
+    frame.push_back(0x81);  // FIN + text opcode
+
+    size_t len = message.size();
+    if (len <= 125) {
+        frame.push_back((uint8_t)len);
+    } else if (len <= 65535) {
+        frame.push_back(126);
+        frame.push_back((len >> 8) & 0xFF);
+        frame.push_back(len & 0xFF);
+    } else {
+        frame.push_back(127);
+        for (int i = 7; i >= 0; i--) {
+            frame.push_back((len >> (i * 8)) & 0xFF);
+        }
+    }
+    frame.insert(frame.end(), message.begin(), message.end());
+    send(fd, (const char*)frame.data(), (int)frame.size(), 0);
+}
+
+// ─── Handle a WebSocket connection (after upgrade) ─────────────────
+// Runs in the same thread that accepted the HTTP connection — blocks
+// until the WS client disconnects.
+static void bantuHandleWebSocket(int sock, const std::string& wsKey) {
+    // Compute the accept value: SHA1(key + GUID) → base64
+    BantuSha1 sha;
+    sha.update(wsKey);
+    sha.update(std::string("258EAFA5-E914-47DA-95CA-C5AB0DC85B11"));
+    std::string acceptVal = bantuBase64Encode(sha.final_());
+
+    // Send 101 Switching Protocols
+    std::string resp = "HTTP/1.1 101 Switching Protocols\r\n"
+                       "Upgrade: websocket\r\n"
+                       "Connection: Upgrade\r\n"
+                       "Sec-WebSocket-Accept: " + acceptVal + "\r\n"
+                       "\r\n";
+    send(sock, resp.c_str(), (int)resp.size(), 0);
+
+    // Register the client
+    int wsId = bantuNextWsId++;
+    BantuWsClient client;
+    client.fd = sock;
+    client.id = "ws-" + std::to_string(wsId);
+    bantuWsTable()[wsId] = client;
+    std::cout << "  [WS] Client connected: " << client.id << " (fd=" << sock << ")\n";
+
+    // Call the Bantu-level onConnect handler if registered
+    if (bantuWsOnConnect.isFunction() || bantuWsOnConnect.isNativeFn()) {
+        ObjectMap cliObj;
+        cliObj["id"] = Value(client.id);
+        cliObj["fd"] = Value((double)sock);
+        if (bantuWsCallback) {
+            try { bantuWsCallback(bantuWsOnConnect, {Value(std::move(cliObj))}); }
+            catch (const std::exception& e) { std::cerr << "  [WS] onConnect error: " << e.what() << "\n"; }
+        }
+    }
+
+    // WebSocket message loop
+    uint8_t buffer[65536];
+    bool running = true;
+    while (running) {
+        ssize_t n = recv(sock, (char*)buffer, sizeof(buffer), 0);
+        if (n <= 0) break;
+
+        if (n < 2) continue;
+        uint8_t opcode = buffer[0] & 0x0F;
+        bool masked = (buffer[1] & 0x80) != 0;
+        uint64_t payloadLen = buffer[1] & 0x7F;
+        size_t offset = 2;
+
+        if (payloadLen == 126) {
+            if (n < 4) continue;
+            payloadLen = (buffer[2] << 8) | buffer[3];
+            offset = 4;
+        } else if (payloadLen == 127) {
+            if (n < 10) continue;
+            payloadLen = 0;
+            for (int i = 0; i < 8; i++) {
+                payloadLen = (payloadLen << 8) | buffer[offset + i];
+            }
+            offset = 10;
+        }
+
+        uint8_t mask[4] = {0};
+        if (masked && offset + 4 <= (size_t)n) {
+            memcpy(mask, buffer + offset, 4);
+            offset += 4;
+        }
+
+        std::string payload;
+        for (uint64_t i = 0; i < payloadLen && offset + i < (size_t)n; i++) {
+            char c = buffer[offset + i];
+            if (masked) c ^= mask[i % 4];
+            payload += c;
+        }
+
+        if (opcode == 0x8) {  // Close
+            break;
+        }
+        if (opcode == 0x9) {  // Ping → respond with Pong
+            uint8_t pong[2] = {0x8A, 0x00};
+            send(sock, (const char*)pong, 2, 0);
+            continue;
+        }
+        if (opcode == 0xA) {  // Pong — ignore
+            continue;
+        }
+        if (opcode == 0x1) {  // Text message
+            std::cout << "  [WS] Message from " << client.id << ": " << payload << "\n";
+
+            // Call the Bantu-level onMessage handler if registered
+            if (bantuWsOnMessage.isFunction() || bantuWsOnMessage.isNativeFn()) {
+                ObjectMap msgObj;
+                msgObj["data"] = Value(payload);
+                msgObj["client"] = Value(client.id);
+                // Also try to parse as JSON — if it succeeds, pass the parsed value
+                Value parsed = Value();
+                if (!payload.empty() && (payload[0] == '{' || payload[0] == '[')) {
+                    try {
+                        size_t pos = 0;
+                        parsed = bantuJsonParse(payload, pos);
+                        msgObj["json"] = parsed;
+                    } catch (...) {}
+                }
+                if (bantuWsCallback) {
+                    try { bantuWsCallback(bantuWsOnMessage, {Value(std::move(msgObj))}); }
+                    catch (const std::exception& e) { std::cerr << "  [WS] onMessage error: " << e.what() << "\n"; }
+                }
+            }
+        }
+    }
+
+    // Cleanup
+    std::cout << "  [WS] Client disconnected: " << client.id << "\n";
+    if (bantuWsOnDisconnect.isFunction() || bantuWsOnDisconnect.isNativeFn()) {
+        ObjectMap cliObj;
+        cliObj["id"] = Value(client.id);
+        if (bantuWsCallback) {
+            try { bantuWsCallback(bantuWsOnDisconnect, {Value(std::move(cliObj))}); }
+            catch (...) {}
+        }
+    }
+    bantuWsTable().erase(wsId);
+    CLOSE_SOCKET(sock);
+}
+
+// Helper: parse "host:port" → (host, port). Supports IPv6 brackets [::1]:53.
+static std::pair<std::string, int> bantuUdpParseAddr(const std::string& addr) {
+    // IPv6 form: [::1]:53
+    if (!addr.empty() && addr[0] == '[') {
+        auto end = addr.find(']');
+        if (end != std::string::npos && end + 2 <= addr.size() && addr[end + 1] == ':') {
+            std::string host = addr.substr(1, end - 1);
+            int port = std::atoi(addr.c_str() + end + 2);
+            return {host, port};
+        }
+    }
+    // IPv4 form: 127.0.0.1:53
+    auto colon = addr.rfind(':');
+    if (colon == std::string::npos) return {"", 0};
+    return {addr.substr(0, colon), std::atoi(addr.c_str() + colon + 1)};
+}
+
+// Helper: convert a Bantu list-of-bytes (numbers 0-255) into a std::vector<uint8_t>.
+static std::vector<uint8_t> bantuValueToBytes(const Value& v) {
+    std::vector<uint8_t> out;
+    if (v.isList()) {
+        out.reserve(v.listVal.size());
+        for (const auto& e : v.listVal) {
+            int b = (int)e.numberVal;
+            if (b < 0) b = 0;
+            if (b > 255) b = 255;
+            out.push_back((uint8_t)b);
+        }
+    } else if (v.isString()) {
+        const auto& s = v.stringVal;
+        out.assign(s.begin(), s.end());
+    }
+    return out;
+}
+
+// Helper: convert std::vector<uint8_t> into a Bantu list-of-bytes.
+static Value bantuBytesToValue(const std::vector<uint8_t>& buf) {
+    std::vector<Value> out;
+    out.reserve(buf.size());
+    for (uint8_t b : buf) out.push_back(Value((double)b));
+    return Value(std::move(out));
+}
+
+// Helper: resolve a host string + port into a struct sockaddr_storage.
+// Supports IPv4 dotted-quad, IPv6 (with or without brackets), and hostnames
+// (uses getaddrinfo() to resolve). Returns 0 on success, -1 on failure.
+static int bantuUdpResolve(const std::string& host, int port,
+                            struct sockaddr_storage* ss, socklen_t* sslen,
+                            int family, std::string* errOut) {
+    memset(ss, 0, sizeof(*ss));
+
+    // Try IPv4 dotted-quad first (no DNS lookup)
+    if (family == AF_INET) {
+        struct sockaddr_in* sa = (struct sockaddr_in*)ss;
+        sa->sin_family = AF_INET;
+        sa->sin_port = htons((uint16_t)port);
+        if (inet_pton(AF_INET, host.c_str(), &sa->sin_addr) == 1) {
+            *sslen = sizeof(*sa);
+            return 0;
+        }
+    }
+    // Try IPv6 literal next (no DNS lookup)
+    if (family == AF_INET6) {
+        struct sockaddr_in6* sa6 = (struct sockaddr_in6*)ss;
+        sa6->sin6_family = AF_INET6;
+        sa6->sin6_port = htons((uint16_t)port);
+        if (inet_pton(AF_INET6, host.c_str(), &sa6->sin6_addr) == 1) {
+            *sslen = sizeof(*sa6);
+            return 0;
+        }
+    }
+
+    // Hostname — use getaddrinfo() with the requested family.
+    struct addrinfo hints;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = family;
+    hints.ai_socktype = SOCK_DGRAM;
+    hints.ai_flags = 0;
+    struct addrinfo* res = nullptr;
+    std::string portStr = std::to_string(port);
+    int gai_rc = getaddrinfo(host.c_str(), portStr.c_str(), &hints, &res);
+    if (gai_rc != 0) {
+        if (errOut) *errOut = std::string("could not resolve host '") + host + "': " + gai_strerror(gai_rc);
+        return -1;
+    }
+    if (!res) {
+        if (errOut) *errOut = std::string("no addresses for host: ") + host;
+        return -1;
+    }
+    // Use the first result. (Caller could iterate res->ai_next for round-robin.)
+    memcpy(ss, res->ai_addr, res->ai_addrlen);
+    *sslen = res->ai_addrlen;
+    freeaddrinfo(res);
+    return 0;
+}
+
+// Helper: format a sockaddr_storage back into "host:port" string.
+static std::string bantuUdpFormatAddr(const struct sockaddr_storage* ss) {
+    char buf[INET6_ADDRSTRLEN];
+    if (ss->ss_family == AF_INET) {
+        const struct sockaddr_in* sa = (const struct sockaddr_in*)ss;
+        inet_ntop(AF_INET, &sa->sin_addr, buf, sizeof(buf));
+        return std::string(buf) + ":" + std::to_string(ntohs(sa->sin_port));
+    }
+    if (ss->ss_family == AF_INET6) {
+        const struct sockaddr_in6* sa6 = (const struct sockaddr_in6*)ss;
+        inet_ntop(AF_INET6, &sa6->sin6_addr, buf, sizeof(buf));
+        return std::string("[") + buf + "]:" + std::to_string(ntohs(sa6->sin6_port));
+    }
+    return "unknown";
+}
+
+// Helper: cross-platform poll() wrapper.
+#ifdef _WIN32
+static int bantuUdpPoll(SOCKET fd, int timeoutMs) {
+    WSAPOLLFD pfd;
+    pfd.fd = fd;
+    pfd.events = POLLIN;
+    pfd.revents = 0;
+    return WSAPoll(&pfd, 1, timeoutMs);
+}
+static std::string bantuUdpErrStr() {
+    int e = WSAGetLastError();
+    char buf[256];
+    FormatMessageA(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+                   nullptr, e, 0, buf, sizeof(buf), nullptr);
+    return std::string(buf);
+}
+static void bantuUdpSetNonblocking(SOCKET fd) {
+    u_long mode = 1;
+    ioctlsocket(fd, FIONBIO, &mode);
+}
+#else
+static int bantuUdpPoll(int fd, int timeoutMs) {
+    struct pollfd pfd;
+    pfd.fd = fd;
+    pfd.events = POLLIN;
+    pfd.revents = 0;
+    return poll(&pfd, 1, timeoutMs);
+}
+static std::string bantuUdpErrStr() {
+    return std::string(strerror(errno));
+}
+static void bantuUdpSetNonblocking(int fd) {
+    int flags = fcntl(fd, F_GETFL, 0);
+    fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+}
+#endif
+
+// ─── FFI: call arbitrary C functions in shared libraries (via libffi) ───
+//   $m    = loadlib("libm.dylib")                 // dlopen a shared library
+//   $sqrt = func($m, "sqrt", "double", ["double"]) // bind a symbol + signature
+//   $sqrt(2.0)                                     // → 1.41421356
+// Type names: "int" | "double" | "string" | "pointer" | "void".
+#ifdef BANTU_FFI
+static std::unordered_map<int, void*>& bantuLibTable() {
+    static std::unordered_map<int, void*> t; return t;
+}
+static int bantuNextLibId = 1;
+
+static ffi_type* bantuFfiType(const std::string& t) {
+    if (t == "int")                                   return &ffi_type_sint;
+    if (t == "double" || t == "float")                return &ffi_type_double;
+    if (t == "string" || t == "pointer" || t == "ptr") return &ffi_type_pointer;
+    if (t == "void")                                  return &ffi_type_void;
+    return &ffi_type_sint;  // sensible default
+}
+
+static Value bantuFfiLoadLib(std::vector<Value> args) {
+    if (args.empty()) ErrorHandler::throwError("loadlib() needs a library path", 0, 0, ErrorHandler::RUNTIME_ERROR);
+    std::string path = args[0].toString();
+    void* h = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
+    if (!h) {
+        const char* e = dlerror();
+        ErrorHandler::throwError(std::string("loadlib failed for '") + path + "': " + (e ? e : "unknown"),
+                                 0, 0, ErrorHandler::RUNTIME_ERROR);
+    }
+    int id = bantuNextLibId++;
+    bantuLibTable()[id] = h;
+    ObjectMap handle;
+    handle["__lib"] = Value((double)id);
+    handle["path"] = Value(path);
+    return Value(std::move(handle));
+}
+
+static Value bantuFfiFunc(std::vector<Value> args) {
+    if (args.size() < 3)
+        ErrorHandler::throwError("func(lib, name, retType, [argTypes]) needs at least 3 arguments", 0, 0, ErrorHandler::RUNTIME_ERROR);
+    void* lib = nullptr;
+    if (args[0].isObject()) {
+        auto it = args[0].objectVal->find("__lib");
+        if (it != args[0].objectVal->end()) {
+            auto lt = bantuLibTable().find((int)it->second.numberVal);
+            if (lt != bantuLibTable().end()) lib = lt->second;
+        }
+    }
+    if (!lib) ErrorHandler::throwError("func(): first argument is not a library from loadlib()", 0, 0, ErrorHandler::RUNTIME_ERROR);
+    std::string name = args[1].toString();
+    void* sym = dlsym(lib, name.c_str());
+    if (!sym) ErrorHandler::throwError("func(): symbol '" + name + "' not found", 0, 0, ErrorHandler::RUNTIME_ERROR);
+    std::string retType = args[2].toString();
+    std::vector<std::string> argTypes;
+    if (args.size() > 3 && args[3].isList())
+        for (auto& a : args[3].listVal) argTypes.push_back(a.toString());
+
+    // Return a callable that marshals Bantu values through libffi and invokes sym.
+    return makeNative([sym, retType, argTypes](std::vector<Value> callArgs) -> Value {
+        size_t n = argTypes.size();
+        std::vector<ffi_type*> atypes(n);
+        for (size_t i = 0; i < n; i++) atypes[i] = bantuFfiType(argTypes[i]);
+
+        ffi_cif cif;
+        if (ffi_prep_cif(&cif, FFI_DEFAULT_ABI, (unsigned)n, bantuFfiType(retType),
+                         n ? atypes.data() : nullptr) != FFI_OK)
+            ErrorHandler::throwError("ffi_prep_cif failed", 0, 0, ErrorHandler::RUNTIME_ERROR);
+
+        // Stable storage for marshalled args (addresses must survive ffi_call).
+        std::vector<long long> ints(n);
+        std::vector<double> dbls(n);
+        std::vector<std::string> strs(n);
+        std::vector<const char*> cstrs(n);
+        std::vector<void*> values(n);
+        for (size_t i = 0; i < n; i++) {
+            const std::string& t = argTypes[i];
+            Value v = i < callArgs.size() ? callArgs[i] : Value();
+            if (t == "double" || t == "float") { dbls[i] = v.numberVal; values[i] = &dbls[i]; }
+            else if (t == "string" || t == "pointer" || t == "ptr") { strs[i] = v.toString(); cstrs[i] = strs[i].c_str(); values[i] = &cstrs[i]; }
+            else { ints[i] = (long long)v.numberVal; values[i] = &ints[i]; }
+        }
+
+        if (retType == "double" || retType == "float") {
+            double r = 0; ffi_call(&cif, FFI_FN(sym), &r, n ? values.data() : nullptr); return Value(r);
+        } else if (retType == "string" || retType == "pointer" || retType == "ptr") {
+            void* r = nullptr; ffi_call(&cif, FFI_FN(sym), &r, n ? values.data() : nullptr);
+            if (retType == "string" && r) return Value(std::string((const char*)r));
+            return Value((double)(intptr_t)r);
+        } else if (retType == "void") {
+            ffi_arg r; ffi_call(&cif, FFI_FN(sym), &r, n ? values.data() : nullptr); return Value();
+        } else {
+            ffi_arg r = 0; ffi_call(&cif, FFI_FN(sym), &r, n ? values.data() : nullptr); return Value((double)(long long)r);
+        }
+    });
+}
+#else
+// Stubs when FFI is not compiled in.
+static Value bantuFfiLoadLib(std::vector<Value>) {
+    ErrorHandler::throwError("FFI not available in this build (rebuild with -DBANTU_FFI and link -lffi)", 0, 0, ErrorHandler::RUNTIME_ERROR);
+    return Value();
+}
+static Value bantuFfiFunc(std::vector<Value>) {
+    ErrorHandler::throwError("FFI not available in this build (rebuild with -DBANTU_FFI and link -lffi)", 0, 0, ErrorHandler::RUNTIME_ERROR);
+    return Value();
+}
+#endif
+
 // ─── PostgreSQL State ───
 // When built with -DBANTU_POSTGRES=ON (and libpq available), bantuPgConn
 // holds a real PGconn* and queries hit a real PostgreSQL database.
@@ -292,6 +853,31 @@ static std::string bantuPgUser = "";
 #ifdef HAS_LIBPQ
     #include <libpq-fe.h>
     static PGconn* bantuPgConn = nullptr;
+
+    // Build libpq text-format parameter arrays from a Bantu params list, for
+    // PQexecParams ($1..$n placeholders). libpq sends every parameter as text
+    // and lets the server coerce it, so this stays type-agnostic and is
+    // injection-safe. A null Bantu value maps to a SQL NULL (null pointer).
+    // NOTE: `storage` is reserved up-front so it never reallocates — the
+    // c_str() pointers handed to libpq must stay valid for the call.
+    static void bantuPgBuildParams(const std::vector<Value>& params,
+                                   std::vector<std::string>& storage,
+                                   std::vector<const char*>& out) {
+        storage.reserve(params.size());
+        out.reserve(params.size());
+        for (const auto& p : params) {
+            if (p.isNull()) {
+                storage.push_back("");
+                out.push_back(nullptr);
+            } else if (p.isBool()) {
+                storage.push_back(p.boolVal ? "true" : "false");
+                out.push_back(storage.back().c_str());
+            } else {
+                storage.push_back(p.toString());
+                out.push_back(storage.back().c_str());
+            }
+        }
+    }
 #endif
 
 // ─── MySQL State (simulated for static binary) ───
@@ -337,6 +923,39 @@ static int bantuSqliteCallback(void* data, int argc, char** argv, char** colName
     }
     rows->push_back(Value(std::move(row)));
     return 0;
+}
+
+// Bind a list of Bantu values to a prepared statement's `?` placeholders
+// (1-based). This is the safe, injection-proof path for parameterized SQL.
+static void bantuSqliteBindParams(sqlite3_stmt* stmt, const std::vector<Value>& params) {
+    for (size_t i = 0; i < params.size(); i++) {
+        int idx = (int)i + 1;
+        const Value& p = params[i];
+        if (p.isNull()) {
+            sqlite3_bind_null(stmt, idx);
+        } else if (p.isNumber()) {
+            double d = p.numberVal;
+            if (d == std::floor(d) && !std::isinf(d)) sqlite3_bind_int64(stmt, idx, (sqlite3_int64)d);
+            else sqlite3_bind_double(stmt, idx, d);
+        } else if (p.isBool()) {
+            sqlite3_bind_int(stmt, idx, p.boolVal ? 1 : 0);
+        } else {
+            std::string s = p.toString();
+            sqlite3_bind_text(stmt, idx, s.c_str(), (int)s.size(), SQLITE_TRANSIENT);
+        }
+    }
+}
+
+// Convert a text column value to a number when it is fully numeric, mirroring
+// bantuSqliteCallback so parameterized queries return the same shapes.
+static Value bantuSqliteCellToValue(const char* txt) {
+    std::string val = txt ? txt : "NULL";
+    try {
+        size_t pos;
+        double nv = std::stod(val, &pos);
+        if (pos == val.size()) return Value(nv);
+    } catch (...) {}
+    return Value(val);
 }
 
 // ─── HTTP Status Text Helper ───
@@ -481,6 +1100,9 @@ struct ReturnSignal { Value value; };
 class Evaluator {
 public:
     Evaluator() : env_(std::make_shared<Environment>()), globalEnv_(env_) {
+        bantuWsCallback = [this](Value callee, std::vector<Value> args) -> Value {
+            return this->bantuCallFunction(callee, std::move(args));
+        };
         curl_global_init(CURL_GLOBAL_DEFAULT);
         registerBuiltins();
     }
@@ -502,8 +1124,16 @@ public:
 
     Value evaluate(std::vector<std::shared_ptr<ASTNode>>& program) {
         Value result;
-        for (auto& node : program) {
-            result = evalNode(node);
+        try {
+            for (auto& node : program) {
+                result = evalNode(node);
+            }
+        } catch (const BreakSignal&) {
+            ErrorHandler::throwRuntimeError("'break' used outside of a loop");
+        } catch (const ContinueSignal&) {
+            ErrorHandler::throwRuntimeError("'continue' used outside of a loop");
+        } catch (const ReturnSignal&) {
+            // A top-level `return` simply ends the program.
         }
         return result;
     }
@@ -514,8 +1144,18 @@ public:
     Value runFile(const std::string& path, std::vector<std::shared_ptr<ASTNode>>& program) {
         filePathStack_.push_back(path);
         Value result;
-        for (auto& node : program) {
-            result = evalNode(node);
+        try {
+            for (auto& node : program) {
+                result = evalNode(node);
+            }
+        } catch (const BreakSignal&) {
+            if (!filePathStack_.empty()) filePathStack_.pop_back();
+            ErrorHandler::throwRuntimeError("'break' used outside of a loop");
+        } catch (const ContinueSignal&) {
+            if (!filePathStack_.empty()) filePathStack_.pop_back();
+            ErrorHandler::throwRuntimeError("'continue' used outside of a loop");
+        } catch (const ReturnSignal&) {
+            // A top-level `return` simply ends the file.
         }
         if (!filePathStack_.empty()) filePathStack_.pop_back();
         return result;
@@ -574,6 +1214,10 @@ private:
         if (auto n = dynamic_cast<DotAccessNode*>(node.get())) return evalDotAccess(n);
         if (auto n = dynamic_cast<IndexAccessNode*>(node.get())) return evalIndexAccess(n);
         if (auto n = dynamic_cast<TryCatchNode*>(node.get()))  return evalTryCatch(n);
+        if (dynamic_cast<BreakNode*>(node.get()))              throw BreakSignal{};
+        if (dynamic_cast<ContinueNode*>(node.get()))           throw ContinueSignal{};
+        if (auto n = dynamic_cast<ThrowNode*>(node.get()))     return evalThrow(n);
+        if (auto n = dynamic_cast<SwitchNode*>(node.get()))    return evalSwitch(n);
         if (auto n = dynamic_cast<ClassDeclNode*>(node.get())) return evalClassDecl(n);
         if (auto n = dynamic_cast<SuperNode*>(node.get()))     return evalSuper(n);
         if (auto n = dynamic_cast<PrintNode*>(node.get()))     return evalPrint(n);
@@ -629,7 +1273,10 @@ private:
 
     Value evalVarDecl(VarDeclNode* n) {
         Value val = evalNode(n->init);
-        env_->define(n->name, val);
+        // `const $x = …` makes the binding final; typed decls (number/string/…)
+        // define normally (annotations remain non-enforcing at runtime).
+        bool isConst = (n->typeAnnotation == "const");
+        env_->define(n->name, val, isConst);
         return val;
     }
 
@@ -859,24 +1506,53 @@ private:
         return Value();
     }
 
+    // each ($x in list) / each ($k, $v in dict) / for $x in ... / for $k, $v in ...
+    // Iterates lists (element, or unpacking a [k,v] pair into two vars) and dicts
+    // (key, or key+value). break/continue are honored; return/errors propagate.
     Value evalEach(EachNode* n) {
         Value iterable = evalNode(n->iterable);
+        bool twoVars = !n->valueVar.empty();
+
+        // Runs the body once with the loop var(s) bound. Returns false on break.
+        auto runBody = [&](const Value& a, const Value& b) -> bool {
+            auto prevEnv = env_;
+            env_ = std::make_shared<Environment>(prevEnv);
+            env_->define(n->varName, a);
+            if (twoVars) env_->define(n->valueVar, b);
+            try {
+                for (auto& stmt : n->body) evalNode(stmt);
+            } catch (const BreakSignal&) {
+                env_ = prevEnv;
+                return false;
+            } catch (const ContinueSignal&) {
+                env_ = prevEnv;
+                return true;
+            } catch (...) {
+                env_ = prevEnv;   // return / error → restore scope and propagate
+                throw;
+            }
+            env_ = prevEnv;
+            return true;
+        };
+
         if (iterable.isList()) {
             for (auto& item : iterable.listVal) {
-                auto prevEnv = env_;
-                env_ = std::make_shared<Environment>(env_);
-                env_->define(n->varName, item);
-                try {
-                    for (auto& stmt : n->body) {
-                        evalNode(stmt);
+                if (twoVars) {
+                    // Unpack a [key, value] pair (e.g. from $dict.items()); if the
+                    // element isn't a 2+ list, bind value to null.
+                    Value a = item, b;
+                    if (item.isList() && item.listVal.size() >= 2) {
+                        a = item.listVal[0];
+                        b = item.listVal[1];
                     }
-                } catch (const BreakSignal&) {
-                    env_ = prevEnv;
-                    break;
-                } catch (const ContinueSignal&) {
-                    // continue
+                    if (!runBody(a, b)) break;
+                } else {
+                    if (!runBody(item, Value())) break;
                 }
-                env_ = prevEnv;
+            }
+        } else if (iterable.isObject()) {
+            for (auto& kv : *iterable.objectVal) {
+                if (!runBody(Value(kv.first), kv.second)) break;
             }
         }
         return Value();
@@ -1143,6 +1819,19 @@ private:
             }
         }
 
+        // ─── WebSocket upgrade detection (RFC 6455) ────────────────
+        // If the request has Upgrade: websocket, handle it as a WS
+        // connection instead of a normal HTTP request.
+        if (headers.count("upgrade") &&
+            headers["upgrade"].toString().find("websocket") != std::string::npos) {
+            std::string wsKey = headers.count("sec-websocket-key")
+                ? headers["sec-websocket-key"].toString() : "";
+            if (!wsKey.empty()) {
+                bantuHandleWebSocket(sock, wsKey);
+                return;
+            }
+        }
+
         // Match route (exact first, then :param patterns)
         Value matchedHandler;
         ObjectMap params;
@@ -1191,14 +1880,39 @@ private:
                 }
             }
         }
-
-        // If no route matched, try static files (GET only)
+        // Third pass: wildcard match (route ends with *)
+        // Enables SPA fallback: sua.server.get("/*", handler)
+        // NOTE: This runs AFTER static file serving, so /style.css etc.
+        // are served as static files, not as SPA fallback.
         if (!found && method == "GET") {
+            // Try static files first — if served, we're done.
             if (bantuServeStaticFile(sock, path)) {
                 CLOSE_SOCKET(sock);
                 return;
             }
         }
+        if (!found) {
+            for (auto& route : bantuServerRoutes) {
+                if (route.method != method) continue;
+                if (route.path.size() >= 2 && route.path.substr(route.path.size() - 2) == "/*") {
+                    std::string prefix = route.path.substr(0, route.path.size() - 1);
+                    if (path.find(prefix) == 0 || path == route.path.substr(0, route.path.size() - 2)) {
+                        matchedHandler = route.handler;
+                        found = true;
+                        break;
+                    }
+                } else if (!route.path.empty() && route.path.back() == '*' && route.path != "*") {
+                    std::string prefix = route.path.substr(0, route.path.size() - 1);
+                    if (path.find(prefix) == 0) {
+                        matchedHandler = route.handler;
+                        found = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        // If no route matched, try static files for non-GET methods (rare but possible)
 
         // Build $req and $res
         auto state = std::make_shared<BantuHttpResponseState>();
@@ -1334,8 +2048,14 @@ private:
 
     Value evalFuncDecl(FuncDeclNode* n) {
         auto fn = std::make_shared<BantuFunction>(n->name, n->params, n->body, env_);
-        env_->define(n->name, Value(std::move(fn)));
-        return Value();
+        Value fnVal(std::move(fn));
+        // Named declarations bind into the current scope; anonymous function
+        // expressions (empty name) just yield the value so `def(...) { }` can be
+        // used inline (as a dict value, argument, etc.).
+        if (!n->name.empty()) {
+            env_->define(n->name, fnVal);
+        }
+        return fnVal;
     }
 
     Value evalReturn(ReturnNode* n) {
@@ -1343,7 +2063,110 @@ private:
         throw ReturnSignal{val};
     }
 
+    // Resolve an assignable slot (variable / list element / dict entry) to a
+    // mutable Value*, or nullptr if the node isn't a valid lvalue. Powers the
+    // in-place list mutators below.
+    Value* resolveLValue(ASTNode* node) {
+        if (auto v = dynamic_cast<VariableNode*>(node)) {
+            if (env_->has(v->name)) return &env_->getRef(v->name);
+            return nullptr;
+        }
+        if (auto idx = dynamic_cast<IndexAccessNode*>(node)) {
+            Value* base = resolveLValue(idx->object.get());
+            if (!base) return nullptr;
+            Value key = evalNode(idx->index);
+            if (base->isList()) {
+                int i = (int)key.numberVal;
+                if (i < 0 || i >= (int)base->listVal.size()) return nullptr;
+                return &base->listVal[i];
+            }
+            if (base->isObject()) return &(*base->objectVal)[key.toString()];
+            return nullptr;
+        }
+        if (auto dot = dynamic_cast<DotAccessNode*>(node)) {
+            Value* base = resolveLValue(dot->object.get());
+            if (base && base->isObject()) return &(*base->objectVal)[dot->property];
+            return nullptr;
+        }
+        return nullptr;
+    }
+
+    // In-place list mutators operating on the resolved list `lst`.
+    //   append(l, x…) · push(l, x…) · pop(l) · insert(l, i, x) · remove(l, i) · extend(l, l2)
+    // `argStart` is where the value arguments begin: 1 for function form
+    // (arg0 is the list), 0 for method form ($l.push(x) — the list is the receiver).
+    Value listMutator(const std::string& op, Value& lst, CallNode* n, size_t argStart = 1) {
+        std::vector<Value> args;
+        for (size_t i = argStart; i < n->args.size(); i++) args.push_back(evalNode(n->args[i]));
+        auto& vec = lst.listVal;
+        if (op == "append") {
+            for (auto& a : args) vec.push_back(a);
+            return Value((double)vec.size());
+        }
+        if (op == "push") {
+            // Same as append, but returns the (mutated) list so the older
+            // `$l = push($l, x)` idiom keeps working correctly.
+            for (auto& a : args) vec.push_back(a);
+            return lst;
+        }
+        if (op == "pop") {
+            if (vec.empty()) return Value();
+            Value last = vec.back(); vec.pop_back(); return last;
+        }
+        if (op == "insert") {
+            if (args.size() < 2) ErrorHandler::throwRuntimeError("insert(list, index, value) needs an index and a value", n->line, n->col);
+            int i = (int)args[0].numberVal;
+            if (i < 0) i = 0;
+            if (i > (int)vec.size()) i = (int)vec.size();
+            vec.insert(vec.begin() + i, args[1]);
+            return Value((double)vec.size());
+        }
+        if (op == "remove") {
+            if (args.empty()) return Value();
+            int i = (int)args[0].numberVal;
+            if (i < 0 || i >= (int)vec.size()) return Value();
+            Value removed = vec[i];
+            vec.erase(vec.begin() + i);
+            return removed;
+        }
+        if (op == "extend") {
+            if (!args.empty() && args[0].isList())
+                for (auto& e : args[0].listVal) vec.push_back(e);
+            return Value((double)vec.size());
+        }
+        return Value();
+    }
+
     Value evalCall(CallNode* n) {
+        // In-place list mutators (append/push/pop/insert/remove/extend). Resolved
+        // here because a native builtin only receives args by value and could not
+        // mutate the caller's list. A user-defined function of the same name wins.
+        if (auto callVar = dynamic_cast<VariableNode*>(n->callee.get())) {
+            const std::string& fname = callVar->name;
+            if (!env_->has(fname) && !n->args.empty() &&
+                (fname == "append" || fname == "push" || fname == "pop" || fname == "insert" ||
+                 fname == "remove" || fname == "extend")) {
+                Value* lv = resolveLValue(n->args[0].get());
+                if (!lv || !lv->isList()) {
+                    ErrorHandler::throwRuntimeError(fname + "() expects a list variable as its first argument", n->line, n->col);
+                }
+                return listMutator(fname, *lv, n, 1);
+            }
+        }
+
+        // Method-style list mutation: $list.push(x) / $list.pop().
+        // evalDotAccess only ever sees a COPY of the list, so these are resolved
+        // against the real storage here. If the receiver isn't an addressable
+        // list (e.g. a literal), we fall through to the value-copy methods.
+        if (auto dot = dynamic_cast<DotAccessNode*>(n->callee.get())) {
+            if (dot->property == "push" || dot->property == "pop") {
+                Value* lv = resolveLValue(dot->object.get());
+                if (lv && lv->isList()) {
+                    return listMutator(dot->property, *lv, n, 0);
+                }
+            }
+        }
+
         // Check for 'new ClassName()' pattern
         if (auto varNode = dynamic_cast<VariableNode*>(n->callee.get())) {
             // Check if it's preceded by 'new' keyword (handled via variable lookup)
@@ -1436,7 +2259,44 @@ private:
         // Object (dict)
         if (obj.isObject()) {
             auto it = obj.objectVal->find(n->property);
-            if (it != obj.objectVal->end()) return it->second;
+            if (it != obj.objectVal->end()) return it->second;   // a real key always wins
+
+            // Dict pseudo-methods (only reachable when no key of that name exists),
+            // returned as callables so `$d.keys()`, `$d.items()`, etc. work:
+            //   .keys()  → list of keys
+            //   .values()→ list of values
+            //   .items() → list of [key, value] pairs (for  for $k,$v in $d.items())
+            //   .size()/.length() → number of entries
+            auto omap = obj.objectVal;
+            if (n->property == "size" || n->property == "length") {
+                return makeNative([omap](std::vector<Value>) -> Value { return Value((double)omap->size()); });
+            }
+            if (n->property == "keys") {
+                return makeNative([omap](std::vector<Value>) -> Value {
+                    std::vector<Value> ks; ks.reserve(omap->size());
+                    for (auto& kv : *omap) ks.push_back(Value(kv.first));
+                    return Value(std::move(ks));
+                });
+            }
+            if (n->property == "values") {
+                return makeNative([omap](std::vector<Value>) -> Value {
+                    std::vector<Value> vs; vs.reserve(omap->size());
+                    for (auto& kv : *omap) vs.push_back(kv.second);
+                    return Value(std::move(vs));
+                });
+            }
+            if (n->property == "items") {
+                return makeNative([omap](std::vector<Value>) -> Value {
+                    std::vector<Value> items; items.reserve(omap->size());
+                    for (auto& kv : *omap) {
+                        std::vector<Value> pair;
+                        pair.push_back(Value(kv.first));
+                        pair.push_back(kv.second);
+                        items.push_back(Value(std::move(pair)));
+                    }
+                    return Value(std::move(items));
+                });
+            }
             // For leniency with $req.body.X access patterns, return null
             // instead of throwing when a key is missing on a plain object.
             // (Class instances still throw — they use the class-instance branch above.)
@@ -1446,6 +2306,11 @@ private:
         // List methods
         if (obj.isList()) {
             if (n->property == "length") return Value((double)obj.listVal.size());
+            // .size() as a callable (parallels dict/string; blogsite uses $list.size())
+            if (n->property == "size") {
+                double count = (double)obj.listVal.size();
+                return makeNative([count](std::vector<Value>) -> Value { return Value(count); });
+            }
             if (n->property == "push") {
                 return makeNative([this, listRef = obj.listVal](std::vector<Value> args) mutable -> Value {
                     for (auto& a : args) listRef.push_back(a);
@@ -1465,6 +2330,10 @@ private:
         // String methods
         if (obj.isString()) {
             if (n->property == "length") return Value((double)obj.stringVal.size());
+            if (n->property == "size") {
+                double count = (double)obj.stringVal.size();
+                return makeNative([count](std::vector<Value>) -> Value { return Value(count); });
+            }
             if (n->property == "upper") return makeNative([s = obj.stringVal](std::vector<Value>) -> Value {
                 std::string upper = s;
                 std::transform(upper.begin(), upper.end(), upper.begin(), ::toupper);
@@ -1590,23 +2459,76 @@ private:
     // ERROR HANDLING
     // ════════════════════════════════════════════════════════════
 
+    // try { ... } catch ($e) { ... }
+    // Binds $e to the thrown value (for `throw`) or a structured error dict
+    // { message, type, line } (for runtime/type errors). Control-flow signals
+    // (break/continue/return) intentionally pass straight through.
     Value evalTryCatch(TryCatchNode* n) {
+        auto prevEnv = env_;
         try {
-            auto prevEnv = env_;
-            env_ = std::make_shared<Environment>(env_);
-            for (auto& stmt : n->tryBody) {
-                evalNode(stmt);
-            }
-            env_ = prevEnv;
-        } catch (const std::exception& e) {
-            auto prevEnv = env_;
-            env_ = std::make_shared<Environment>(env_);
-            env_->define(n->catchVar, Value(std::string(e.what())));
-            for (auto& stmt : n->catchBody) {
-                evalNode(stmt);
-            }
+            env_ = std::make_shared<Environment>(prevEnv);
+            for (auto& stmt : n->tryBody) evalNode(stmt);
             env_ = prevEnv;
         }
+        catch (const BantuThrow& t) {
+            // A Bantu `throw <expr>` — bind the catch var to the thrown value.
+            env_ = std::make_shared<Environment>(prevEnv);
+            env_->define(n->catchVar, t.value);
+            for (auto& stmt : n->catchBody) evalNode(stmt);
+            env_ = prevEnv;
+        }
+        catch (const BantuError& e) {
+            // A runtime/type/reference error — bind a structured error dict.
+            env_ = std::make_shared<Environment>(prevEnv);
+            ObjectMap err;
+            err["message"] = Value(e.message);
+            err["type"]    = Value(e.typeName);
+            err["line"]    = Value((double)e.line);
+            env_->define(n->catchVar, Value(std::move(err)));
+            for (auto& stmt : n->catchBody) evalNode(stmt);
+            env_ = prevEnv;
+        }
+        catch (const std::exception& e) {
+            // Any other C++ exception — bind its message string.
+            env_ = std::make_shared<Environment>(prevEnv);
+            env_->define(n->catchVar, Value(std::string(e.what())));
+            for (auto& stmt : n->catchBody) evalNode(stmt);
+            env_ = prevEnv;
+        }
+        catch (...) {
+            // break/continue/return must not be swallowed by try/catch —
+            // restore scope and let them reach the enclosing loop/function.
+            env_ = prevEnv;
+            throw;
+        }
+        return Value();
+    }
+
+    // throw <expr>; — raise the evaluated value as a catchable BantuThrow.
+    Value evalThrow(ThrowNode* n) {
+        throw BantuThrow(evalNode(n->value));
+    }
+
+    // switch ($subject) { case <v> { … } … default { … } }
+    // First case whose value `equals` the subject runs (no fallthrough); else
+    // the default block, if present. Each block runs in its own child scope.
+    Value evalSwitch(SwitchNode* n) {
+        Value subject = evalNode(n->subject);
+        auto runBlock = [&](std::vector<std::shared_ptr<ASTNode>>& body) {
+            auto prevEnv = env_;
+            env_ = std::make_shared<Environment>(prevEnv);
+            try {
+                for (auto& stmt : body) evalNode(stmt);
+            } catch (...) { env_ = prevEnv; throw; }
+            env_ = prevEnv;
+        };
+        for (auto& c : n->cases) {
+            if (subject.equals(evalNode(c.value))) {
+                runBlock(c.body);
+                return Value();
+            }
+        }
+        if (n->hasDefault) runBlock(n->defaultBody);
         return Value();
     }
 
@@ -1937,13 +2859,145 @@ private:
             return Value(std::string(1, (char)code));
         }));
 
-        env_->define("push", makeNative([](std::vector<Value> args) -> Value {
-            // push(list, item) - adds item to list
-            if (args.size() >= 2 && args[0].isList()) {
-                args[0].listVal.push_back(args[1]);
+        // NOTE: `push` is intentionally NOT registered as a builtin. A native fn
+        // receives its args by value and so could never mutate the caller's list
+        // (the old registration here silently did nothing). It is handled in
+        // evalCall's lvalue intercept instead, alongside append/pop/insert/
+        // remove/extend, so that it mutates in place for real.
+
+        // ─── Dict introspection (v1.3.0) ───
+        // keys($d) → list of keys, values($d) → list of values,
+        // entries($d) → list of [key, value] pairs. (each/for can also iterate
+        // dicts directly; these builtins are handy for one-off use.)
+        env_->define("keys", makeNative([](std::vector<Value> args) -> Value {
+            std::vector<Value> out;
+            if (!args.empty() && args[0].isObject()) {
+                for (auto& kv : *args[0].objectVal) out.push_back(Value(kv.first));
             }
-            return Value();
+            return Value(std::move(out));
         }));
+        env_->define("values", makeNative([](std::vector<Value> args) -> Value {
+            std::vector<Value> out;
+            if (!args.empty() && args[0].isObject()) {
+                for (auto& kv : *args[0].objectVal) out.push_back(kv.second);
+            }
+            return Value(std::move(out));
+        }));
+        env_->define("entries", makeNative([](std::vector<Value> args) -> Value {
+            std::vector<Value> out;
+            if (!args.empty() && args[0].isObject()) {
+                for (auto& kv : *args[0].objectVal) {
+                    std::vector<Value> pair;
+                    pair.push_back(Value(kv.first));
+                    pair.push_back(kv.second);
+                    out.push_back(Value(std::move(pair)));
+                }
+            }
+            return Value(std::move(out));
+        }));
+
+        // ─── Python-style file I/O (v1.3.0) ───
+        // $f = open(path, mode)   modes: "r" read, "w" truncate-write, "a" append
+        // read($f) whole file · readline($f) one line · readlines($f) list of lines
+        // write($f, text) · close($f) · plus one-shot readfile/writefile/appendfile.
+        env_->define("open", makeNative([](std::vector<Value> args) -> Value {
+            if (args.empty()) ErrorHandler::throwError("open() needs a path", 0, 0, ErrorHandler::FILE_ERROR);
+            std::string path = args[0].toString();
+            std::string mode = args.size() > 1 ? args[1].toString() : "r";
+            std::ios_base::openmode m;
+            if (mode == "w")      m = std::ios::out | std::ios::trunc;
+            else if (mode == "a") m = std::ios::out | std::ios::app;
+            else                  m = std::ios::in;   // default "r"
+            std::fstream fs(path, m);
+            if (!fs.is_open()) {
+                ErrorHandler::throwError("Cannot open file '" + path + "' (mode " + mode + ")",
+                                         0, 0, ErrorHandler::FILE_ERROR);
+            }
+            int id = bantuNextFileId++;
+            bantuFileTable()[id] = std::move(fs);
+            ObjectMap handle;
+            handle["__file"] = Value((double)id);
+            handle["path"] = Value(path);
+            handle["mode"] = Value(mode);
+            return Value(std::move(handle));
+        }));
+        auto fileIdOf = [](const Value& h) -> int {
+            if (h.isObject()) {
+                auto it = h.objectVal->find("__file");
+                if (it != h.objectVal->end()) return (int)it->second.numberVal;
+            }
+            return -1;
+        };
+        env_->define("read", makeNative([fileIdOf](std::vector<Value> args) -> Value {
+            if (args.empty()) return Value(std::string(""));
+            int id = fileIdOf(args[0]);
+            auto it = bantuFileTable().find(id);
+            if (it == bantuFileTable().end()) ErrorHandler::throwError("read(): not an open file", 0, 0, ErrorHandler::FILE_ERROR);
+            std::stringstream ss; ss << it->second.rdbuf();
+            return Value(ss.str());
+        }));
+        env_->define("readline", makeNative([fileIdOf](std::vector<Value> args) -> Value {
+            if (args.empty()) return Value();
+            int id = fileIdOf(args[0]);
+            auto it = bantuFileTable().find(id);
+            if (it == bantuFileTable().end()) ErrorHandler::throwError("readline(): not an open file", 0, 0, ErrorHandler::FILE_ERROR);
+            std::string line;
+            if (!std::getline(it->second, line)) return Value();   // null at EOF
+            return Value(line);
+        }));
+        env_->define("readlines", makeNative([fileIdOf](std::vector<Value> args) -> Value {
+            std::vector<Value> lines;
+            if (args.empty()) return Value(std::move(lines));
+            int id = fileIdOf(args[0]);
+            auto it = bantuFileTable().find(id);
+            if (it == bantuFileTable().end()) ErrorHandler::throwError("readlines(): not an open file", 0, 0, ErrorHandler::FILE_ERROR);
+            std::string line;
+            while (std::getline(it->second, line)) lines.push_back(Value(line));
+            return Value(std::move(lines));
+        }));
+        env_->define("write", makeNative([fileIdOf](std::vector<Value> args) -> Value {
+            if (args.size() < 2) return Value(false);
+            int id = fileIdOf(args[0]);
+            auto it = bantuFileTable().find(id);
+            if (it == bantuFileTable().end()) ErrorHandler::throwError("write(): not an open file", 0, 0, ErrorHandler::FILE_ERROR);
+            std::string data = args[1].toString();
+            it->second << data;
+            return Value((double)data.size());
+        }));
+        env_->define("close", makeNative([fileIdOf](std::vector<Value> args) -> Value {
+            if (args.empty()) return Value(false);
+            int id = fileIdOf(args[0]);
+            auto it = bantuFileTable().find(id);
+            if (it == bantuFileTable().end()) return Value(false);
+            it->second.close();
+            bantuFileTable().erase(it);
+            return Value(true);
+        }));
+        env_->define("readfile", makeNative([](std::vector<Value> args) -> Value {
+            if (args.empty()) return Value(std::string(""));
+            std::ifstream fs(args[0].toString());
+            if (!fs.is_open()) ErrorHandler::throwError("Cannot read file '" + args[0].toString() + "'", 0, 0, ErrorHandler::FILE_ERROR);
+            std::stringstream ss; ss << fs.rdbuf();
+            return Value(ss.str());
+        }));
+        env_->define("writefile", makeNative([](std::vector<Value> args) -> Value {
+            if (args.size() < 2) return Value(false);
+            std::ofstream fs(args[0].toString(), std::ios::trunc);
+            if (!fs.is_open()) ErrorHandler::throwError("Cannot write file '" + args[0].toString() + "'", 0, 0, ErrorHandler::FILE_ERROR);
+            fs << args[1].toString();
+            return Value(true);
+        }));
+        env_->define("appendfile", makeNative([](std::vector<Value> args) -> Value {
+            if (args.size() < 2) return Value(false);
+            std::ofstream fs(args[0].toString(), std::ios::app);
+            if (!fs.is_open()) ErrorHandler::throwError("Cannot append file '" + args[0].toString() + "'", 0, 0, ErrorHandler::FILE_ERROR);
+            fs << args[1].toString();
+            return Value(true);
+        }));
+
+        // ─── FFI (v1.3.0): call C functions in shared libraries via libffi ───
+        env_->define("loadlib", makeNative(&bantuFfiLoadLib));
+        env_->define("func", makeNative(&bantuFfiFunc));
 
         env_->define("range", makeNative([](std::vector<Value> args) -> Value {
             double start = args.size() > 0 ? args[0].numberVal : 0;
@@ -2619,6 +3673,30 @@ private:
                 std::cout << "  [SQLITE] Auto-opened: :memory:\n";
             }
 
+            // Parameterized path: exec(sql, [params]) binds `?` placeholders
+            // via a prepared statement (safe against SQL injection).
+            if (args.size() > 1 && args[1].isList()) {
+                sqlite3_stmt* stmt = nullptr;
+                if (sqlite3_prepare_v2(bantuSqliteDb, sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK) {
+                    ObjectMap e; e["error"] = Value(std::string(sqlite3_errmsg(bantuSqliteDb))); e["success"] = Value(false);
+                    return Value(std::move(e));
+                }
+                bantuSqliteBindParams(stmt, args[1].listVal);
+                int rc = sqlite3_step(stmt);
+                if (rc != SQLITE_DONE && rc != SQLITE_ROW) {
+                    std::string err = sqlite3_errmsg(bantuSqliteDb);
+                    sqlite3_finalize(stmt);
+                    ObjectMap e; e["error"] = Value(err); e["success"] = Value(false);
+                    return Value(std::move(e));
+                }
+                sqlite3_finalize(stmt);
+                ObjectMap info;
+                info["changes"] = Value((double)sqlite3_changes(bantuSqliteDb));
+                info["lastInsertId"] = Value((double)sqlite3_last_insert_rowid(bantuSqliteDb));
+                info["success"] = Value(true);
+                return Value(std::move(info));
+            }
+
             char* errMsg = nullptr;
             int rc = sqlite3_exec(bantuSqliteDb, sql.c_str(), nullptr, nullptr, &errMsg);
 
@@ -2644,7 +3722,7 @@ private:
             return Value(std::move(execInfo));
         });
 
-        // sua.sqlite.query(sql)
+        // sua.sqlite.query(sql [, params])
         sqliteObj["query"] = makeNative([](std::vector<Value> args) -> Value {
             std::string sql = args.size() > 0 ? args[0].toString() : "SELECT 1";
 
@@ -2652,6 +3730,29 @@ private:
                 sqlite3_open(":memory:", &bantuSqliteDb);
                 bantuSqlitePath = ":memory:";
                 std::cout << "  [SQLITE] Auto-opened: :memory:\n";
+            }
+
+            // Parameterized path: query(sql, [params]) binds `?` placeholders
+            // via a prepared statement, then collects rows.
+            if (args.size() > 1 && args[1].isList()) {
+                sqlite3_stmt* stmt = nullptr;
+                if (sqlite3_prepare_v2(bantuSqliteDb, sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK) {
+                    ObjectMap e; e["error"] = Value(std::string(sqlite3_errmsg(bantuSqliteDb))); e["success"] = Value(false);
+                    return Value(std::move(e));
+                }
+                bantuSqliteBindParams(stmt, args[1].listVal);
+                std::vector<Value> prows;
+                int cols = sqlite3_column_count(stmt);
+                while (sqlite3_step(stmt) == SQLITE_ROW) {
+                    ObjectMap row;
+                    for (int c = 0; c < cols; c++) {
+                        row[sqlite3_column_name(stmt, c)] =
+                            bantuSqliteCellToValue(reinterpret_cast<const char*>(sqlite3_column_text(stmt, c)));
+                    }
+                    prows.push_back(Value(std::move(row)));
+                }
+                sqlite3_finalize(stmt);
+                return Value(std::move(prows));
             }
 
             std::vector<Value> rows;
@@ -2832,7 +3933,18 @@ private:
             }
             std::cout << "  [POSTGRES] Query: " << sql.substr(0, 80)
                       << (sql.length() > 80 ? "..." : "") << "\n";
-            PGresult* res = PQexec(bantuPgConn, sql.c_str());
+            // Parameterized path: query(sql, [params]) binds $1..$n via
+            // PQexecParams (injection-safe); otherwise a plain PQexec.
+            PGresult* res = nullptr;
+            if (args.size() > 1 && args[1].isList()) {
+                std::vector<std::string> storage;
+                std::vector<const char*> vals;
+                bantuPgBuildParams(args[1].listVal, storage, vals);
+                res = PQexecParams(bantuPgConn, sql.c_str(), (int)vals.size(), nullptr,
+                                   vals.empty() ? nullptr : vals.data(), nullptr, nullptr, 0);
+            } else {
+                res = PQexec(bantuPgConn, sql.c_str());
+            }
             if (res == nullptr) {
                 ObjectMap errInfo;
                 errInfo["error"] = Value(std::string("PQexec returned null"));
@@ -2966,7 +4078,18 @@ private:
             }
                 std::cout << "  [POSTGRES] Exec: " << sql.substr(0, 80)
                           << (sql.length() > 80 ? "..." : "") << "\n";
-            PGresult* res = PQexec(bantuPgConn, sql.c_str());
+            // Parameterized path: exec(sql, [params]) binds $1..$n via
+            // PQexecParams (injection-safe); otherwise a plain PQexec.
+            PGresult* res = nullptr;
+            if (args.size() > 1 && args[1].isList()) {
+                std::vector<std::string> storage;
+                std::vector<const char*> vals;
+                bantuPgBuildParams(args[1].listVal, storage, vals);
+                res = PQexecParams(bantuPgConn, sql.c_str(), (int)vals.size(), nullptr,
+                                   vals.empty() ? nullptr : vals.data(), nullptr, nullptr, 0);
+            } else {
+                res = PQexec(bantuPgConn, sql.c_str());
+            }
             if (res == nullptr) {
                 ObjectMap errInfo;
                 errInfo["error"] = Value(std::string("PQexec returned null"));
@@ -3316,6 +4439,359 @@ private:
         });
 
         suaObj["webrtc"] = Value(std::move(webrtcObj));
+
+        // ════════════════════════════════════════════════════════════
+        // sua.udp — native UDP networking (v1.4.0)
+        // ════════════════════════════════════════════════════════════
+        //
+        //   $sock = sua.udp.socket({"family": "ipv4"})
+        //   sua.udp.bind($sock, "0.0.0.0:3478")
+        //   sua.udp.send_to($sock, "8.8.8.8:53", bytes([0xAA, 0xAB, 0xAC]))
+        //   $pkt = sua.udp.recvfrom($sock, {"timeoutMs": 2000})
+        //   // $pkt = {"from": "8.8.8.8:53", "data": [...], "timeout": false}
+        //   sua.udp.close($sock)
+        //
+        // Also a high-level one-shot:
+        //   $r = sua.udp.send("8.8.8.8:53", $queryBytes, {"timeoutMs": 2000})
+        //   // $r = {"from": "8.8.8.8:53", "data": [...]}
+        //
+        ObjectMap udpObj;
+
+        // sua.udp.socket(opts?) → handle dict
+        //   opts.family: "ipv4" (default) | "ipv6"
+        //   opts.nonblocking: bool (default false)
+        udpObj["socket"] = makeNative([](std::vector<Value> args) -> Value {
+            std::string familyStr = "ipv4";
+            bool nonblocking = false;
+            if (!args.empty() && args[0].isObject()) {
+                auto& o = *args[0].objectVal;
+                auto fit = o.find("family");
+                if (fit != o.end()) familyStr = fit->second.toString();
+                auto nit = o.find("nonblocking");
+                if (nit != o.end()) nonblocking = (bool)nit->second.numberVal;
+            }
+            int family = (familyStr == "ipv6") ? AF_INET6 : AF_INET;
+            int fd = (int)socket(family, SOCK_DGRAM, 0);
+            if (fd < 0) {
+                ErrorHandler::throwError(std::string("sua.udp.socket: socket() failed: ") + bantuUdpErrStr(),
+                                         0, 0, ErrorHandler::RUNTIME_ERROR);
+            }
+            if (nonblocking) {
+                bantuUdpSetNonblocking(fd);
+            }
+            int id = bantuNextUdpId++;
+            bantuUdpSocketTable()[id] = BantuUdpSocket{fd, family, false};
+            ObjectMap handle;
+            handle["__udp"]   = Value((double)id);
+            handle["family"]  = Value(familyStr);
+            handle["bound"]   = Value(false);
+            return Value(std::move(handle));
+        });
+
+        // Helper: extract the socket fd + entry from a handle dict.
+        auto udpIdOf = [](const Value& h, BantuUdpSocket** outEntry) -> int {
+            if (!h.isObject()) return -1;
+            auto it = h.objectVal->find("__udp");
+            if (it == h.objectVal->end()) return -1;
+            int id = (int)it->second.numberVal;
+            auto& table = bantuUdpSocketTable();
+            auto tit = table.find(id);
+            if (tit == table.end()) return -1;
+            if (outEntry) *outEntry = &tit->second;
+            return id;
+        };
+
+        // sua.udp.bind($sock, "host:port") → true on success, throws on error.
+        // Special: port 0 means "OS-assigned" (use getsockname to find out).
+        udpObj["bind"] = makeNative([udpIdOf](std::vector<Value> args) -> Value {
+            if (args.size() < 2)
+                ErrorHandler::throwError("sua.udp.bind(sock, addr) needs 2 args", 0, 0, ErrorHandler::RUNTIME_ERROR);
+            BantuUdpSocket* entry = nullptr;
+            int id = udpIdOf(args[0], &entry);
+            if (id < 0 || !entry || entry->fd < 0)
+                ErrorHandler::throwError("sua.udp.bind: not a valid socket handle", 0, 0, ErrorHandler::RUNTIME_ERROR);
+            auto [host, port] = bantuUdpParseAddr(args[1].toString());
+            if (port == 0 && args[1].toString().find(":0") == std::string::npos) {
+                // port missing entirely
+                if (args[1].toString().find(":") == std::string::npos) {
+                    ErrorHandler::throwError("sua.udp.bind: address must be 'host:port'", 0, 0, ErrorHandler::RUNTIME_ERROR);
+                }
+            }
+            struct sockaddr_storage ss;
+            socklen_t sslen = 0;
+            std::string err;
+            if (bantuUdpResolve(host, port, &ss, &sslen, entry->family, &err) != 0) {
+                ErrorHandler::throwError("sua.udp.bind: " + err, 0, 0, ErrorHandler::RUNTIME_ERROR);
+            }
+            // Allow address reuse (common for servers restarting)
+            int yes = 1;
+            setsockopt(entry->fd, SOL_SOCKET, SO_REUSEADDR, (const char*)&yes, sizeof(yes));
+            if (::bind(entry->fd, (struct sockaddr*)&ss, sslen) < 0) {
+                ErrorHandler::throwError(std::string("sua.udp.bind: bind() failed: ") + bantuUdpErrStr(),
+                                         0, 0, ErrorHandler::RUNTIME_ERROR);
+            }
+            entry->bound = true;
+            return Value(true);
+        });
+
+        // sua.udp.send_to($sock, "host:port", dataBytes) → number of bytes sent.
+        // `dataBytes` is a list of integers 0-255 (matching Bantu's existing byte
+        // representation used by the hash/crypto/uuid modules).
+        udpObj["send_to"] = makeNative([udpIdOf](std::vector<Value> args) -> Value {
+            if (args.size() < 3)
+                ErrorHandler::throwError("sua.udp.send_to(sock, addr, data) needs 3 args", 0, 0, ErrorHandler::RUNTIME_ERROR);
+            BantuUdpSocket* entry = nullptr;
+            int id = udpIdOf(args[0], &entry);
+            if (id < 0 || !entry || entry->fd < 0)
+                ErrorHandler::throwError("sua.udp.send_to: not a valid socket handle", 0, 0, ErrorHandler::RUNTIME_ERROR);
+            auto [host, port] = bantuUdpParseAddr(args[1].toString());
+            struct sockaddr_storage ss;
+            socklen_t sslen = 0;
+            std::string err;
+            if (bantuUdpResolve(host, port, &ss, &sslen, entry->family, &err) != 0) {
+                ErrorHandler::throwError("sua.udp.send_to: " + err, 0, 0, ErrorHandler::RUNTIME_ERROR);
+            }
+            std::vector<uint8_t> buf = bantuValueToBytes(args[2]);
+            if (buf.empty()) return Value((double)0);
+            ssize_t n = sendto(entry->fd, (const char*)buf.data(), (int)buf.size(), 0,
+                               (struct sockaddr*)&ss, sslen);
+            if (n < 0) {
+                ErrorHandler::throwError(std::string("sua.udp.send_to: sendto() failed: ") + bantuUdpErrStr(),
+                                         0, 0, ErrorHandler::RUNTIME_ERROR);
+            }
+            return Value((double)n);
+        });
+
+        // sua.udp.recvfrom($sock, opts?) → {from, data, timeout}
+        //   opts.timeoutMs: int (default 0 = blocking forever)
+        //   opts.maxBytes:  int (default 4096)
+        // Returns {"timeout": true} on timeout. Throws on hard error.
+        udpObj["recvfrom"] = makeNative([udpIdOf](std::vector<Value> args) -> Value {
+            if (args.empty())
+                ErrorHandler::throwError("sua.udp.recvfrom(sock, [opts]) needs at least 1 arg", 0, 0, ErrorHandler::RUNTIME_ERROR);
+            BantuUdpSocket* entry = nullptr;
+            int id = udpIdOf(args[0], &entry);
+            if (id < 0 || !entry || entry->fd < 0)
+                ErrorHandler::throwError("sua.udp.recvfrom: not a valid socket handle", 0, 0, ErrorHandler::RUNTIME_ERROR);
+            int timeoutMs = 0;
+            size_t maxBytes = 4096;
+            if (args.size() > 1 && args[1].isObject()) {
+                auto& o = *args[1].objectVal;
+                auto tit = o.find("timeoutMs");
+                if (tit != o.end()) timeoutMs = (int)tit->second.numberVal;
+                auto mit = o.find("maxBytes");
+                if (mit != o.end()) maxBytes = (size_t)mit->second.numberVal;
+            }
+            // Wait for data with optional timeout via poll()
+            if (timeoutMs > 0) {
+                int rc = bantuUdpPoll(entry->fd, timeoutMs);
+                if (rc == 0) {
+                    ObjectMap r;
+                    r["timeout"] = Value(true);
+                    r["from"]    = Value(std::string(""));
+                    r["data"]    = Value(std::vector<Value>{});
+                    return Value(std::move(r));
+                }
+                if (rc < 0) {
+                    ErrorHandler::throwError(std::string("sua.udp.recvfrom: poll() failed: ") + bantuUdpErrStr(),
+                                             0, 0, ErrorHandler::RUNTIME_ERROR);
+                }
+            }
+            std::vector<uint8_t> buf(maxBytes);
+            struct sockaddr_storage peer;
+            socklen_t peerLen = sizeof(peer);
+            ssize_t n = recvfrom(entry->fd, (char*)buf.data(), (int)buf.size(), 0,
+                                 (struct sockaddr*)&peer, &peerLen);
+            if (n < 0) {
+                ErrorHandler::throwError(std::string("sua.udp.recvfrom: recvfrom() failed: ") + bantuUdpErrStr(),
+                                         0, 0, ErrorHandler::RUNTIME_ERROR);
+            }
+            buf.resize(n);
+            ObjectMap r;
+            r["timeout"] = Value(false);
+            r["from"]    = Value(bantuUdpFormatAddr(&peer));
+            r["data"]    = bantuBytesToValue(buf);
+            return Value(std::move(r));
+        });
+
+        // sua.udp.send("host:port", data, opts?) → {from, data} or {timeout: true}
+        // High-level one-shot: creates a socket, sends, waits for reply, closes.
+        udpObj["send"] = makeNative([](std::vector<Value> args) -> Value {
+            if (args.size() < 2)
+                ErrorHandler::throwError("sua.udp.send(addr, data, [opts]) needs at least 2 args", 0, 0, ErrorHandler::RUNTIME_ERROR);
+            std::string addrStr = args[0].toString();
+            auto [host, port] = bantuUdpParseAddr(addrStr);
+            int timeoutMs = 2000;
+            size_t maxBytes = 4096;
+            std::string familyStr = "ipv4";
+            if (host.find(':') != std::string::npos) familyStr = "ipv6";  // looks like IPv6
+            if (args.size() > 2 && args[2].isObject()) {
+                auto& o = *args[2].objectVal;
+                auto tit = o.find("timeoutMs");
+                if (tit != o.end()) timeoutMs = (int)tit->second.numberVal;
+                auto mit = o.find("maxBytes");
+                if (mit != o.end()) maxBytes = (size_t)mit->second.numberVal;
+                auto fit = o.find("family");
+                if (fit != o.end()) familyStr = fit->second.toString();
+            }
+            int family = (familyStr == "ipv6") ? AF_INET6 : AF_INET;
+            int fd = (int)socket(family, SOCK_DGRAM, 0);
+            if (fd < 0) {
+                ErrorHandler::throwError(std::string("sua.udp.send: socket() failed: ") + bantuUdpErrStr(),
+                                         0, 0, ErrorHandler::RUNTIME_ERROR);
+            }
+            struct sockaddr_storage ss;
+            socklen_t sslen = 0;
+            std::string err;
+            if (bantuUdpResolve(host, port, &ss, &sslen, family, &err) != 0) {
+                BANTU_CLOSE_SOCKET(fd);
+                ErrorHandler::throwError("sua.udp.send: " + err, 0, 0, ErrorHandler::RUNTIME_ERROR);
+            }
+            std::vector<uint8_t> buf = bantuValueToBytes(args[1]);
+            ssize_t sent = sendto(fd, (const char*)buf.data(), (int)buf.size(), 0,
+                                  (struct sockaddr*)&ss, sslen);
+            if (sent < 0) {
+                BANTU_CLOSE_SOCKET(fd);
+                ErrorHandler::throwError(std::string("sua.udp.send: sendto() failed: ") + bantuUdpErrStr(),
+                                         0, 0, ErrorHandler::RUNTIME_ERROR);
+            }
+            // Wait for response
+            int rc = bantuUdpPoll(fd, timeoutMs);
+            ObjectMap r;
+            if (rc == 0) {
+                BANTU_CLOSE_SOCKET(fd);
+                r["timeout"] = Value(true);
+                r["from"]    = Value(std::string(""));
+                r["data"]    = Value(std::vector<Value>{});
+                return Value(std::move(r));
+            }
+            if (rc < 0) {
+                BANTU_CLOSE_SOCKET(fd);
+                ErrorHandler::throwError(std::string("sua.udp.send: poll() failed: ") + bantuUdpErrStr(),
+                                         0, 0, ErrorHandler::RUNTIME_ERROR);
+            }
+            std::vector<uint8_t> rbuf(maxBytes);
+            struct sockaddr_storage peer;
+            socklen_t peerLen = sizeof(peer);
+            ssize_t n = recvfrom(fd, (char*)rbuf.data(), (int)rbuf.size(), 0,
+                                 (struct sockaddr*)&peer, &peerLen);
+            BANTU_CLOSE_SOCKET(fd);
+            if (n < 0) {
+                ErrorHandler::throwError(std::string("sua.udp.send: recvfrom() failed: ") + bantuUdpErrStr(),
+                                         0, 0, ErrorHandler::RUNTIME_ERROR);
+            }
+            rbuf.resize(n);
+            r["timeout"] = Value(false);
+            r["from"]    = Value(bantuUdpFormatAddr(&peer));
+            r["data"]    = bantuBytesToValue(rbuf);
+            return Value(std::move(r));
+        });
+
+        // sua.udp.close($sock) → true. Safe to call multiple times.
+        udpObj["close"] = makeNative([udpIdOf](std::vector<Value> args) -> Value {
+            BantuUdpSocket* entry = nullptr;
+            int id = udpIdOf(args.empty() ? Value() : args[0], &entry);
+            if (id < 0 || !entry) return Value(false);
+            if (entry->fd >= 0) {
+                BANTU_CLOSE_SOCKET(entry->fd);
+                entry->fd = -1;
+            }
+            bantuUdpSocketTable().erase(id);
+            return Value(true);
+        });
+
+        // sua.udp.getsockname($sock) → "host:port" (the locally-bound address).
+        // Useful after binding to port 0 to discover the OS-assigned port.
+        udpObj["getsockname"] = makeNative([udpIdOf](std::vector<Value> args) -> Value {
+            BantuUdpSocket* entry = nullptr;
+            int id = udpIdOf(args.empty() ? Value() : args[0], &entry);
+            if (id < 0 || !entry || entry->fd < 0)
+                ErrorHandler::throwError("sua.udp.getsockname: not a valid socket handle", 0, 0, ErrorHandler::RUNTIME_ERROR);
+            struct sockaddr_storage ss;
+            socklen_t sslen = sizeof(ss);
+            if (getsockname(entry->fd, (struct sockaddr*)&ss, &sslen) < 0) {
+                ErrorHandler::throwError(std::string("sua.udp.getsockname: ") + bantuUdpErrStr(),
+                                         0, 0, ErrorHandler::RUNTIME_ERROR);
+            }
+            return Value(bantuUdpFormatAddr(&ss));
+        });
+
+        suaObj["udp"] = Value(std::move(udpObj));
+
+        // ════════════════════════════════════════════════════════════
+        // sua.ws — WebSocket support (RFC 6455, v1.4.0)
+        // ════════════════════════════════════════════════════════════
+        //
+        //   sua.ws.on("connect", def($client) { ... });
+        //   sua.ws.on("message", def($msg) { ... });
+        //   sua.ws.on("disconnect", def($client) { ... });
+        //   sua.ws.send($clientId, "hello");
+        //   sua.ws.broadcast("hello everyone");
+        //   sua.ws.clients() → list of connected client IDs
+        //
+        ObjectMap wsObj;
+
+        // sua.ws.on(event, handler) — register a WS event handler
+        wsObj["on"] = makeNative([](std::vector<Value> args) -> Value {
+            if (args.size() < 2) return Value(false);
+            std::string event = args[0].toString();
+            Value handler = args[1];
+            if (event == "connect") {
+                bantuWsOnConnect = handler;
+                std::cout << "  [WS] on(connect) registered\n";
+            } else if (event == "message") {
+                bantuWsOnMessage = handler;
+                std::cout << "  [WS] on(message) registered\n";
+            } else if (event == "disconnect") {
+                bantuWsOnDisconnect = handler;
+                std::cout << "  [WS] on(disconnect) registered\n";
+            } else {
+                return Value(false);
+            }
+            return Value(true);
+        });
+
+        // sua.ws.send(clientId, data) → send a text message to one client
+        wsObj["send"] = makeNative([](std::vector<Value> args) -> Value {
+            if (args.size() < 2) return Value(false);
+            std::string clientId = args[0].toString();
+            std::string data = args[1].toString();
+            // Find the client by ID
+            for (auto& [id, client] : bantuWsTable()) {
+                if (client.id == clientId && client.fd >= 0) {
+                    bantuWsSend(client.fd, data);
+                    return Value(true);
+                }
+            }
+            return Value(false);
+        });
+
+        // sua.ws.broadcast(data) → send to ALL connected clients
+        wsObj["broadcast"] = makeNative([](std::vector<Value> args) -> Value {
+            if (args.empty()) return Value((double)0);
+            std::string data = args[0].toString();
+            int count = 0;
+            for (auto& [id, client] : bantuWsTable()) {
+                if (client.fd >= 0 && client.alive) {
+                    bantuWsSend(client.fd, data);
+                    count++;
+                }
+            }
+            return Value((double)count);
+        });
+
+        // sua.ws.clients() → list of connected client IDs
+        wsObj["clients"] = makeNative([](std::vector<Value> args) -> Value {
+            std::vector<Value> out;
+            for (auto& [id, client] : bantuWsTable()) {
+                if (client.fd >= 0) {
+                    out.push_back(Value(client.id));
+                }
+            }
+            return Value(std::move(out));
+        });
+
+        suaObj["ws"] = Value(std::move(wsObj));
 
         // ════════════════════════════════════════════════════════
         // Register sua as a global variable

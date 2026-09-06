@@ -73,12 +73,15 @@ CPP_FLAGS=(
     -O2
     -I src
     -I"$BREW_PREFIX/include"
+    -DBANTU_FFI          # enable the FFI builtins (loadlib/func)
 )
 
 LINK_LIBS=(
     -L"$BREW_PREFIX/lib"
     -lsqlite3
     -lcurl
+    -lffi                # libffi — foreign function interface
+    -ldl                 # dlopen/dlsym
 )
 
 # ═══════════════════════════════════════════════════════════════════════

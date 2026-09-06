@@ -86,6 +86,7 @@ CPP_FLAGS=(
     -fno-plt
     -pthread
     -I src
+    -DBANTU_FFI          # enable the FFI builtins (loadlib/func)
 )
 
 # Use -l:libcurl.so.4 (explicit filename) instead of -lcurl.
@@ -96,7 +97,7 @@ CPP_FLAGS=(
 # Forcing the exact soname `libcurl.so.4` makes the binary depend on the
 # library that IS universally shipped as `libcurl4` on both Debian and
 # Ubuntu, matching what the Dockerfile installs at runtime.
-LINK_LIBS=( -lsqlite3 -l:libcurl.so.4 -ldl -lpthread )
+LINK_LIBS=( -lsqlite3 -l:libcurl.so.4 -lffi -ldl -lpthread )
 
 OBJECTS=()
 for src in "${SOURCES[@]}"; do

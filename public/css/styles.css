@@ -469,6 +469,36 @@ code { background: var(--surface-2); padding: 2px 6px; border-radius: 4px; font-
 }
 @keyframes slideUp { from { transform: translateY(20px); opacity: 0; } to { transform: translateY(0); opacity: 1; } }
 
+/* ─── Incoming-call banner ─── */
+.incoming-call-banner {
+  position: fixed; top: 20px; right: 20px;
+  display: flex; align-items: center; gap: 12px;
+  background: var(--surface); color: var(--text);
+  border: 1px solid var(--border);
+  padding: 14px 16px; border-radius: var(--radius);
+  box-shadow: 0 12px 32px rgba(80,50,30,0.18);
+  z-index: 2000; max-width: 380px;
+  animation: slideDown 0.3s ease-out;
+}
+@keyframes slideDown { from { transform: translateY(-20px); opacity: 0; } to { transform: translateY(0); opacity: 1; } }
+.incoming-call-banner .ic-avatar {
+  width: 44px; height: 44px; flex: 0 0 44px;
+  border-radius: 50%; background: var(--primary); color: #fff;
+  display: flex; align-items: center; justify-content: center;
+  font-weight: 700; font-size: 18px;
+}
+.incoming-call-banner .ic-body { flex: 1 1 auto; min-width: 0; }
+.incoming-call-banner .ic-name { font-weight: 600; }
+.incoming-call-banner .ic-sub { font-size: 13px; color: var(--text-mute); }
+.incoming-call-banner .ic-btn {
+  border: none; border-radius: var(--radius-sm);
+  padding: 8px 14px; font-weight: 600; cursor: pointer; color: #fff;
+}
+.incoming-call-banner .ic-btn.accept { background: var(--ok); }
+.incoming-call-banner .ic-btn.accept:hover { background: #1e874b; }
+.incoming-call-banner .ic-btn.decline { background: var(--danger); }
+.incoming-call-banner .ic-btn.decline:hover { background: #a93226; }
+
 /* ─── Responsive ─── */
 @media (max-width: 768px) {
   .app-shell { grid-template-columns: 1fr; }
