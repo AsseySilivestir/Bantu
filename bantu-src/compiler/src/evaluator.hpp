@@ -2237,7 +2237,9 @@ private:
         // Store the class definition as a global variable
         env_->define(n->name, Value(classDef));
 
-        std::cout << "  [class] Defined: " << n->name << "\n";
+        // Informational only — respect quiet mode (like the [INCLUDE] logs), so
+        // libraries that define classes don't spam stdout on every include.
+        if (!quietMode_) std::cout << "  [class] Defined: " << n->name << "\n";
         return Value(classDef);
     }
 

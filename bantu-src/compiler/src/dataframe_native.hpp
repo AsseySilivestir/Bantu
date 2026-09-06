@@ -780,13 +780,10 @@ inline Value groupAgg(const std::vector<ColumnPtr>& keys, const Column& val, Agg
     std::vector<int64_t> gid; std::vector<size_t> firstRow;
     groupRows(keys, n, gid, firstRow);            // typed single-key / string multi-key
     size_t g = firstRow.size();
-    std::vector<std::vector<double>> buckets(g);   // values per group (for the aggregation)
-    for (size_t i=0;i<n;i++) {
-        if (val.valid[i]) {
-            double x = val.dtype==DType::F64?val.f64[i]:(val.dtype==DType::I64?(double)val.i64[i]:(val.b[i]?1:0));
-            buckets[gid[i]].push_back(x);
-        }
-    }
+    // Row indices per group, so we can aggregate any dtype/op correctly (a utf8
+    // value column supports count/nunique/any/all; numeric supports all ops).
+    std::vector<std::vector<int64_t>> rows(g);
+    for (size_t i=0;i<n;i++) rows[gid[i]].push_back((int64_t)i);
     // build output key columns (same dtypes as inputs) from representative rows
     std::vector<Value> keyCols;
     for (auto& kc : keys) {
@@ -801,13 +798,28 @@ inline Value groupAgg(const std::vector<ColumnPtr>& keys, const Column& val, Agg
         }
         keyCols.push_back(wrap(oc));
     }
-    // aggregate each bucket
+    // aggregate each group by gathering the value column for its rows, then
+    // reusing aggOp (handles nulls, and utf8 count/nunique/any/all correctly).
     auto out = std::make_shared<Column>(); out->dtype = DType::F64; out->n = g; out->valid.assign(g,1); out->f64.resize(g);
     for (size_t j=0;j<g;j++) {
-        // reuse aggOp by wrapping the bucket as a tiny column
-        Column tmp; tmp.dtype = DType::F64; tmp.n = buckets[j].size(); tmp.f64 = buckets[j]; tmp.valid.assign(tmp.n,1);
-        Value r = aggOp(tmp, op);
-        if (r.isNull()) out->valid[j] = 0; else out->f64[j] = r.numberVal;
+        const std::vector<int64_t>& rs = rows[j];
+        Column sub; sub.dtype = val.dtype; sub.n = rs.size(); sub.valid.resize(sub.n);
+        switch (val.dtype) { case DType::F64:sub.f64.resize(sub.n);break; case DType::I64:sub.i64.resize(sub.n);break;
+                             case DType::BOOL:sub.b.resize(sub.n);break; case DType::UTF8:sub.s.resize(sub.n);break; }
+        for (size_t k=0;k<rs.size();k++) {
+            size_t r = (size_t)rs[k];
+            sub.valid[k] = val.valid[r];
+            switch (val.dtype) {
+                case DType::F64:  sub.f64[k] = val.f64[r]; break;
+                case DType::I64:  sub.i64[k] = val.i64[r]; break;
+                case DType::BOOL: sub.b[k]   = val.b[r]; break;
+                case DType::UTF8: sub.s[k]   = val.s[r]; break;
+            }
+        }
+        Value r = aggOp(sub, op);
+        if (r.isNull()) out->valid[j] = 0;
+        else if (r.isBool()) out->f64[j] = r.boolVal ? 1.0 : 0.0;
+        else out->f64[j] = r.numberVal;
     }
     ObjectMap res;
     res["keys"] = Value(std::move(keyCols));
