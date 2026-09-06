@@ -460,6 +460,30 @@ static void bantuWsSend(int fd, const std::string& message) {
     send(fd, (const char*)frame.data(), (int)frame.size(), 0);
 }
 
+// ─── Send a WebSocket BINARY frame to a client (for voice/audio) ───
+// Same as above but opcode = 0x82 (binary) instead of 0x81 (text).
+// Accepts raw bytes as a Bantu list of numbers 0-255.
+static void bantuWsSendBinary(int fd, const std::vector<uint8_t>& data) {
+    std::vector<uint8_t> frame;
+    frame.push_back(0x82);  // FIN + binary opcode
+
+    size_t len = data.size();
+    if (len <= 125) {
+        frame.push_back((uint8_t)len);
+    } else if (len <= 65535) {
+        frame.push_back(126);
+        frame.push_back((len >> 8) & 0xFF);
+        frame.push_back(len & 0xFF);
+    } else {
+        frame.push_back(127);
+        for (int i = 7; i >= 0; i--) {
+            frame.push_back((len >> (i * 8)) & 0xFF);
+        }
+    }
+    frame.insert(frame.end(), data.begin(), data.end());
+    send(fd, (const char*)frame.data(), (int)frame.size(), 0);
+}
+
 // ─── Handle a WebSocket connection (after upgrade) ─────────────────
 // Runs in the same thread that accepted the HTTP connection — blocks
 // until the WS client disconnects.
@@ -546,6 +570,23 @@ static void bantuHandleWebSocket(int sock, const std::string& wsKey) {
         }
         if (opcode == 0xA) {  // Pong — ignore
             continue;
+        }
+        if (opcode == 0x2) {  // Binary message (voice/audio data)
+            // Call the onMessage handler with isBinary=true and raw bytes
+            if (bantuWsOnMessage.isFunction() || bantuWsOnMessage.isNativeFn()) {
+                ObjectMap msgObj;
+                msgObj["data"] = Value(payload);   // raw string (may contain nulls)
+                msgObj["client"] = Value(client.id);
+                msgObj["binary"] = Value(true);
+                // Also pass as a byte list for Bantu-side processing
+                std::vector<Value> byteList;
+                for (char c : payload) byteList.push_back(Value((double)(uint8_t)c));
+                msgObj["bytes"] = Value(std::move(byteList));
+                if (bantuWsCallback) {
+                    try { bantuWsCallback(bantuWsOnMessage, {Value(std::move(msgObj))}); }
+                    catch (const std::exception& e) { std::cerr << "  [WS] onMessage(binary) error: " << e.what() << "\n"; }
+                }
+            }
         }
         if (opcode == 0x1) {  // Text message
             std::cout << "  [WS] Message from " << client.id << ": " << payload << "\n";
@@ -1101,7 +1142,14 @@ class Evaluator {
 public:
     Evaluator() : env_(std::make_shared<Environment>()), globalEnv_(env_) {
         bantuWsCallback = [this](Value callee, std::vector<Value> args) -> Value {
-            return this->bantuCallFunction(callee, std::move(args));
+            // Switch to the global environment so the handler can access
+            // 'sua' and other globals. The WS handler may be called from
+            // a different call stack than a normal HTTP request.
+            auto savedEnv = this->env_;
+            this->env_ = this->globalEnv_;
+            auto result = this->bantuCallFunction(callee, std::move(args));
+            this->env_ = savedEnv;
+            return result;
         };
         curl_global_init(CURL_GLOBAL_DEFAULT);
         registerBuiltins();
@@ -4789,6 +4837,55 @@ private:
                 }
             }
             return Value(std::move(out));
+        });
+
+        // sua.ws.send_binary(clientId, byteList) → send binary frame (for voice/audio)
+        // byteList is a list of integers 0-255
+        wsObj["send_binary"] = makeNative([](std::vector<Value> args) -> Value {
+            if (args.size() < 2) return Value(false);
+            std::string clientId = args[0].toString();
+            std::vector<uint8_t> data = bantuValueToBytes(args[1]);
+            for (auto& [id, client] : bantuWsTable()) {
+                if (client.id == clientId && client.fd >= 0) {
+                    bantuWsSendBinary(client.fd, data);
+                    return Value(true);
+                }
+            }
+            return Value(false);
+        });
+
+        // sua.ws.broadcast_binary(byteList) → send binary to ALL clients
+        wsObj["broadcast_binary"] = makeNative([](std::vector<Value> args) -> Value {
+            if (args.empty()) return Value((double)0);
+            std::vector<uint8_t> data = bantuValueToBytes(args[0]);
+            int count = 0;
+            for (auto& [id, client] : bantuWsTable()) {
+                if (client.fd >= 0 && client.alive) {
+                    bantuWsSendBinary(client.fd, data);
+                    count++;
+                }
+            }
+            return Value((double)count);
+        });
+
+        // sua.ws.send_to(clientId, data, isBinary) — convenience: send text OR binary
+        // If isBinary is true, sends as binary frame; otherwise text.
+        wsObj["send_to"] = makeNative([](std::vector<Value> args) -> Value {
+            if (args.size() < 2) return Value(false);
+            std::string clientId = args[0].toString();
+            bool isBinary = args.size() > 2 && args[2].numberVal != 0;
+            for (auto& [id, client] : bantuWsTable()) {
+                if (client.id == clientId && client.fd >= 0) {
+                    if (isBinary) {
+                        std::vector<uint8_t> data = bantuValueToBytes(args[1]);
+                        bantuWsSendBinary(client.fd, data);
+                    } else {
+                        bantuWsSend(client.fd, args[1].toString());
+                    }
+                    return Value(true);
+                }
+            }
+            return Value(false);
         });
 
         suaObj["ws"] = Value(std::move(wsObj));

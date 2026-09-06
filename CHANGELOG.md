@@ -5,6 +5,36 @@ All notable changes to the Bantu programming language are documented in this fil
 > **Searchable tags:** every entry below is prefixed with `[feature]`, `[bug fix]`, or
 > `[patch]` so you can grep the log, e.g. `grep '\[bug fix\]' CHANGELOG.md`.
 
+## [1.3.2] — 2026-09-06
+
+WebSocket + voice release: real-time bidirectional communication via
+`sua.ws` namespace with binary frame support for voice/audio data.
+Also includes a collaborative IDE demo with chat, voice, and live code
+editing.
+
+### Added
+
+- **[feature] WebSocket support (`sua.ws` namespace)** — Bantu now has
+  true real-time bidirectional communication via WebSockets (RFC 6455).
+  No more HTTP long-polling — this is Socket.IO-speed (sub-50ms latency).
+  New builtins: `sua.ws.on`, `sua.ws.send`, `sua.ws.broadcast`,
+  `sua.ws.clients`, `sua.ws.send_binary`, `sua.ws.broadcast_binary`,
+  `sua.ws.send_to`.
+- **[feature] Binary WebSocket frames** — voice/audio data can be
+  transmitted as binary frames (opcode 0x02). The on(message) handler
+  receives `{data, bytes, binary, client, json}` where `bytes` is
+  a list of 0-255 integers and `binary` is true.
+- **[feature] Collaborative IDE** — chat + voice + real-time code
+  editing demo using CodeMirror, all powered by Bantu WebSocket.
+- **[feature] SHA-1 + Base64** — inline implementations for the
+  RFC 6455 WebSocket handshake.
+- **[feature] Wildcard /* route matching** — enables SPA fallback
+  for `bantu-auto-frontend`.
+
+### Changed
+
+- Bumped version constant in `main.cpp`: `1.3.1` → `1.3.2`.
+
 ## [1.3.1] — 2026-09-06
 
 Installer + tooling release: real Windows installer with brand icon, live linting in
