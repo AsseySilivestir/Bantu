@@ -2084,9 +2084,11 @@ private:
                 std::cerr << "  [SERVER] accept() failed: " << strerror(errno) << "\n";
                 continue;
             }
-            // Handle synchronously (single-threaded — simple but reliable)
-            // For higher throughput, spawn a thread here.
-            bantuHandleHttpRequest(clientSock);
+            // Handle each connection in its own thread so WebSocket
+            // clients don't block new connections.
+            std::thread([this, clientSock]() {
+                bantuHandleHttpRequest(clientSock);
+            }).detach();
         }
     }
 
