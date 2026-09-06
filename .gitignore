@@ -37,3 +37,9 @@ vscode-extension/package-lock.json
 bantu-src/compiler/build_pg/
 samples
 samples/webrtc-chat/server.b
+
+# Code signing secrets — DO NOT COMMIT
+*.key
+*.pfx
+*.crt
+bantu-codesign.*
