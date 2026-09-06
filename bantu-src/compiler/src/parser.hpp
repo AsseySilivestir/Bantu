@@ -174,7 +174,17 @@ private:
 
         std::vector<std::shared_ptr<ASTNode>> elseBody;
         if (match(BantuTokenType::ELSE)) {
-            elseBody = parseBlock();
+            // First-class `else if`: when `if` follows `else`, parse it as a
+            // nested if that becomes this if's else-branch — so
+            //     if (a) {..} else if (b) {..} else {..}
+            // works directly, instead of forcing `else { if (b) {..} else {..} }`.
+            // Backward compatible: a plain `else { .. }` still parses as a block,
+            // and evalIf already executes whatever statements are in elseBody.
+            if (check(BantuTokenType::IF)) {
+                elseBody.push_back(parseIf());   // recurse: chains any depth of else-if
+            } else {
+                elseBody = parseBlock();
+            }
         }
 
         return std::make_shared<IfNode>(std::move(condition), std::move(body), std::move(elseBody), line, col);

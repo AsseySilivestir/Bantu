@@ -15,6 +15,7 @@
 #include "module_resolver.hpp"
 #include "crypto_native.hpp"   // native (C++) accelerators for the hash/crypto/uuid suite
 #include "crypto_sodium.hpp"    // optional libsodium AEAD + argon2id (feature-gated)
+#include "dataframe_native.hpp" // native column primitives for the arctic data-science suite
 #include <iostream>
 #include <fstream>
 #include <sstream>
@@ -214,7 +215,8 @@ inline std::string bantuJsonStringify(const Value& v) {
         case Value::FUNCTION:
         case Value::NATIVE_FN:
         case Value::CLASS_DEF:
-        case Value::CLASS_INSTANCE: return "null";
+        case Value::CLASS_INSTANCE:
+        case Value::NATIVE_HANDLE: return "null";   // not JSON-serializable
         case Value::OBJECT: {
             std::ostringstream oss;
             oss << "{";
@@ -2402,6 +2404,9 @@ private:
                 case Value::LIST: return Value(std::string("list"));
                 case Value::CLASS_INSTANCE: return Value(std::string("instance"));
                 case Value::CLASS_DEF: return Value(std::string("class"));
+                // A native handle reports its tag (e.g. "column"), so
+                // type($c) == "column" works for arctic columns.
+                case Value::NATIVE_HANDLE: return Value(args[0].handleTag());
             }
             return Value(std::string("unknown"));
         }));
@@ -2677,7 +2682,8 @@ private:
                 if (a.empty() || !a[0].isString()) return Value(false);
                 static const std::set<std::string> kNatives = {
                     "md5","sha1","sha224","sha256","sha384","sha512",
-                    "hmac_sha256","hash_file"
+                    "hmac_sha256","hash_file",
+                    "col"   // arctic native column primitives + kernels
                 };
                 return Value(kNatives.count(a[0].stringVal) > 0);
             }));
@@ -2759,6 +2765,365 @@ private:
                 if (a.size() < 2 || !a[0].isString()) return Value(false);
                 std::string pw = a[1].isString() ? a[1].stringVal : a[1].toString();
                 return Value(bantu_sodium::pwhashVerify(a[0].stringVal, pw));
+            }));
+
+            // ════════════════════════════════════════════════════════════
+            // ARCTIC COLUMN PRIMITIVES (data-science foundations, `col_*`)
+            // ------------------------------------------------------------
+            // A native typed column (f64/i64/bool/utf8 + null mask) held by a
+            // shared_ptr handle (auto-freed). These are the atoms the pure-Bantu
+            // `arctic` library composes. See dataframe_native.hpp. Phase 2 =
+            // construction + introspection; kernels arrive in Phase 3.
+            // Errors from the native layer become plain-language Bantu errors.
+            // ════════════════════════════════════════════════════════════
+
+            // Run a column op, translating any std::exception into a Bantu error.
+            auto colGuard = [](const char* where, std::function<Value()> body) -> Value {
+                try { return body(); }
+                catch (const std::exception& e) {
+                    ErrorHandler::throwError(std::string(where) + ": " + e.what(), 0, 0,
+                                             ErrorHandler::RUNTIME_ERROR);
+                }
+                return Value();
+            };
+
+            // col(list, dtype) -> column. dtype ∈ f64/i64/bool/utf8.
+            env_->define("col", makeNative([colGuard](std::vector<Value> a) -> Value {
+                return colGuard("col", [&]() -> Value {
+                    if (a.size() < 2 || !a[0].isList() || !a[1].isString())
+                        throw std::runtime_error("usage: col(list, dtype)");
+                    auto dt = arctic::dtypeFromName(a[1].stringVal);
+                    return arctic::wrap(arctic::makeColumn(a[0].listVal, dt));
+                });
+            }));
+
+            // col_len(c) -> number of elements.
+            env_->define("col_len", makeNative([colGuard](std::vector<Value> a) -> Value {
+                return colGuard("col_len", [&]() -> Value {
+                    return Value((double)arctic::asColumn(a[0])->n);
+                });
+            }));
+
+            // col_dtype(c) -> "f64"|"i64"|"bool"|"utf8".
+            env_->define("col_dtype", makeNative([colGuard](std::vector<Value> a) -> Value {
+                return colGuard("col_dtype", [&]() -> Value {
+                    return Value(arctic::dtypeName(arctic::asColumn(a[0])->dtype));
+                });
+            }));
+
+            // col_get(c, i) -> element value, or null if that element is null.
+            env_->define("col_get", makeNative([colGuard](std::vector<Value> a) -> Value {
+                return colGuard("col_get", [&]() -> Value {
+                    if (a.size() < 2 || !a[1].isNumber())
+                        throw std::runtime_error("usage: col_get(column, index)");
+                    auto c = arctic::asColumn(a[0]);
+                    long long i = (long long)a[1].numberVal;
+                    if (i < 0 || (size_t)i >= c->n)
+                        throw std::runtime_error("index " + std::to_string(i) +
+                                                 " out of range (len " + std::to_string(c->n) + ")");
+                    return arctic::elemToValue(*c, (size_t)i);
+                });
+            }));
+
+            // col_to_list(c) -> Bantu list (nulls become Bantu null).
+            env_->define("col_to_list", makeNative([colGuard](std::vector<Value> a) -> Value {
+                return colGuard("col_to_list", [&]() -> Value {
+                    return arctic::columnToList(*arctic::asColumn(a[0]));
+                });
+            }));
+
+            // col_slice(c, start, len) -> a new column of that contiguous range.
+            env_->define("col_slice", makeNative([colGuard](std::vector<Value> a) -> Value {
+                return colGuard("col_slice", [&]() -> Value {
+                    if (a.size() < 3 || !a[1].isNumber() || !a[2].isNumber())
+                        throw std::runtime_error("usage: col_slice(column, start, len)");
+                    auto c = arctic::asColumn(a[0]);
+                    long long start = (long long)a[1].numberVal, len = (long long)a[2].numberVal;
+                    if (start < 0) start = 0;
+                    if (len < 0) len = 0;
+                    return arctic::wrap(arctic::sliceColumn(*c, (size_t)start, (size_t)len));
+                });
+            }));
+
+            // col_cast(c, dtype) -> a new column converted to dtype.
+            env_->define("col_cast", makeNative([colGuard](std::vector<Value> a) -> Value {
+                return colGuard("col_cast", [&]() -> Value {
+                    if (a.size() < 2 || !a[1].isString())
+                        throw std::runtime_error("usage: col_cast(column, dtype)");
+                    auto c = arctic::asColumn(a[0]);
+                    return arctic::wrap(arctic::castColumn(*c, arctic::dtypeFromName(a[1].stringVal)));
+                });
+            }));
+
+            // col_is_null(c) -> bool column, 1 where the element is null.
+            env_->define("col_is_null", makeNative([colGuard](std::vector<Value> a) -> Value {
+                return colGuard("col_is_null", [&]() -> Value {
+                    return arctic::wrap(arctic::isNullMask(*arctic::asColumn(a[0])));
+                });
+            }));
+
+            // col_null_count(c) -> number of null elements.
+            env_->define("col_null_count", makeNative([colGuard](std::vector<Value> a) -> Value {
+                return colGuard("col_null_count", [&]() -> Value {
+                    return Value((double)arctic::nullCount(*arctic::asColumn(a[0])));
+                });
+            }));
+
+            // col_fill_null(c, value) -> a new column with nulls replaced.
+            env_->define("col_fill_null", makeNative([colGuard](std::vector<Value> a) -> Value {
+                return colGuard("col_fill_null", [&]() -> Value {
+                    if (a.size() < 2) throw std::runtime_error("usage: col_fill_null(column, value)");
+                    return arctic::wrap(arctic::fillNull(*arctic::asColumn(a[0]), a[1]));
+                });
+            }));
+
+            // ── Kernels (Phase 3) — each operand may be a column OR a scalar ──
+
+            // Arithmetic: col_add/sub/mul/div/mod/pow(a, b) -> column.
+            auto defArith = [&](const char* name, arctic::Arith op) {
+                env_->define(name, makeNative([colGuard, name, op](std::vector<Value> a) -> Value {
+                    return colGuard(name, [&]() -> Value {
+                        if (a.size() < 2) throw std::runtime_error("needs two operands");
+                        return arctic::wrap(arctic::arithOp(a[0], a[1], op));
+                    });
+                }));
+            };
+            defArith("col_add", arctic::Arith::ADD);
+            defArith("col_sub", arctic::Arith::SUB);
+            defArith("col_mul", arctic::Arith::MUL);
+            defArith("col_div", arctic::Arith::DIV);
+            defArith("col_mod", arctic::Arith::MOD);
+            defArith("col_pow", arctic::Arith::POW);
+            env_->define("col_neg", makeNative([colGuard](std::vector<Value> a) -> Value {
+                return colGuard("col_neg", [&]() -> Value { return arctic::wrap(arctic::unaryOp(a[0], false)); });
+            }));
+            env_->define("col_abs", makeNative([colGuard](std::vector<Value> a) -> Value {
+                return colGuard("col_abs", [&]() -> Value { return arctic::wrap(arctic::unaryOp(a[0], true)); });
+            }));
+
+            // Comparisons -> boolean mask column.
+            auto defCmp = [&](const char* name, arctic::Cmp op) {
+                env_->define(name, makeNative([colGuard, name, op](std::vector<Value> a) -> Value {
+                    return colGuard(name, [&]() -> Value {
+                        if (a.size() < 2) throw std::runtime_error("needs two operands");
+                        return arctic::wrap(arctic::compareOp(a[0], a[1], op));
+                    });
+                }));
+            };
+            defCmp("col_gt", arctic::Cmp::GT); defCmp("col_ge", arctic::Cmp::GE);
+            defCmp("col_lt", arctic::Cmp::LT); defCmp("col_le", arctic::Cmp::LE);
+            defCmp("col_eq", arctic::Cmp::EQ); defCmp("col_ne", arctic::Cmp::NE);
+
+            // Mask logic.
+            env_->define("col_and", makeNative([colGuard](std::vector<Value> a) -> Value {
+                return colGuard("col_and", [&]() -> Value { return arctic::wrap(arctic::maskBin(a[0], a[1], true)); });
+            }));
+            env_->define("col_or", makeNative([colGuard](std::vector<Value> a) -> Value {
+                return colGuard("col_or", [&]() -> Value { return arctic::wrap(arctic::maskBin(a[0], a[1], false)); });
+            }));
+            env_->define("col_not", makeNative([colGuard](std::vector<Value> a) -> Value {
+                return colGuard("col_not", [&]() -> Value { return arctic::wrap(arctic::maskNot(a[0])); });
+            }));
+
+            // Conditional (if/else and if-elif-else over a column).
+            env_->define("col_where", makeNative([colGuard](std::vector<Value> a) -> Value {
+                return colGuard("col_where", [&]() -> Value {
+                    if (a.size() < 3) throw std::runtime_error("usage: col_where(mask, ifTrue, ifFalse)");
+                    return arctic::wrap(arctic::whereOp(a[0], a[1], a[2]));
+                });
+            }));
+            env_->define("col_case", makeNative([colGuard](std::vector<Value> a) -> Value {
+                return colGuard("col_case", [&]() -> Value {
+                    if (a.size() < 2 || !a[0].isList())
+                        throw std::runtime_error("usage: col_case([mask, value, ...], default)");
+                    return arctic::wrap(arctic::caseOp(a[0].listVal, a[1]));
+                });
+            }));
+
+            // Selection.
+            env_->define("col_filter", makeNative([colGuard](std::vector<Value> a) -> Value {
+                return colGuard("col_filter", [&]() -> Value {
+                    if (a.size() < 2) throw std::runtime_error("usage: col_filter(column, mask)");
+                    return arctic::wrap(arctic::filterOp(a[0], a[1]));
+                });
+            }));
+            env_->define("col_take", makeNative([colGuard](std::vector<Value> a) -> Value {
+                return colGuard("col_take", [&]() -> Value {
+                    if (a.size() < 2) throw std::runtime_error("usage: col_take(column, indexColumn)");
+                    return arctic::wrap(arctic::takeOp(a[0], a[1]));
+                });
+            }));
+            env_->define("col_head", makeNative([colGuard](std::vector<Value> a) -> Value {
+                return colGuard("col_head", [&]() -> Value {
+                    auto c = arctic::asColumn(a[0]);
+                    long long n = (a.size() > 1 && a[1].isNumber()) ? (long long)a[1].numberVal : 5;
+                    if (n < 0) n = 0;
+                    return arctic::wrap(arctic::sliceColumn(*c, 0, (size_t)n));
+                });
+            }));
+            env_->define("col_tail", makeNative([colGuard](std::vector<Value> a) -> Value {
+                return colGuard("col_tail", [&]() -> Value {
+                    auto c = arctic::asColumn(a[0]);
+                    long long n = (a.size() > 1 && a[1].isNumber()) ? (long long)a[1].numberVal : 5;
+                    if (n < 0) n = 0;
+                    size_t start = ((size_t)n >= c->n) ? 0 : (c->n - (size_t)n);
+                    return arctic::wrap(arctic::sliceColumn(*c, start, (size_t)n));
+                });
+            }));
+
+            // Aggregations -> scalar value.
+            auto defAgg = [&](const char* name, arctic::Agg op) {
+                env_->define(name, makeNative([colGuard, name, op](std::vector<Value> a) -> Value {
+                    return colGuard(name, [&]() -> Value { return arctic::aggOp(*arctic::asColumn(a[0]), op); });
+                }));
+            };
+            defAgg("col_sum", arctic::Agg::SUM);   defAgg("col_mean", arctic::Agg::MEAN);
+            defAgg("col_min", arctic::Agg::MIN);   defAgg("col_max", arctic::Agg::MAX);
+            defAgg("col_std", arctic::Agg::STD);   defAgg("col_var", arctic::Agg::VAR);
+            defAgg("col_median", arctic::Agg::MEDIAN); defAgg("col_count", arctic::Agg::COUNT);
+            defAgg("col_nunique", arctic::Agg::NUNIQUE);
+            defAgg("col_any", arctic::Agg::ANY);   defAgg("col_all", arctic::Agg::ALL);
+
+            // Ordering.
+            env_->define("col_argsort", makeNative([colGuard](std::vector<Value> a) -> Value {
+                return colGuard("col_argsort", [&]() -> Value {
+                    bool desc = (a.size() > 1) && a[1].isTruthy();
+                    return arctic::wrap(arctic::argsortOp(*arctic::asColumn(a[0]), desc));
+                });
+            }));
+
+            // Grouping & join (accept one column or a list of key columns).
+            env_->define("col_group_ids", makeNative([colGuard](std::vector<Value> a) -> Value {
+                return colGuard("col_group_ids", [&]() -> Value {
+                    return arctic::wrap(arctic::groupIds(arctic::asColumnList(a[0])));
+                });
+            }));
+            env_->define("col_group_agg", makeNative([colGuard](std::vector<Value> a) -> Value {
+                return colGuard("col_group_agg", [&]() -> Value {
+                    if (a.size() < 3 || !a[2].isString())
+                        throw std::runtime_error("usage: col_group_agg(keyCols, valueCol, op)");
+                    static const std::unordered_map<std::string, arctic::Agg> M = {
+                        {"sum",arctic::Agg::SUM},{"mean",arctic::Agg::MEAN},{"min",arctic::Agg::MIN},
+                        {"max",arctic::Agg::MAX},{"std",arctic::Agg::STD},{"var",arctic::Agg::VAR},
+                        {"median",arctic::Agg::MEDIAN},{"count",arctic::Agg::COUNT},
+                        {"nunique",arctic::Agg::NUNIQUE},{"any",arctic::Agg::ANY},{"all",arctic::Agg::ALL}};
+                    auto it = M.find(a[2].stringVal);
+                    if (it == M.end()) throw std::runtime_error("unknown agg '" + a[2].stringVal + "'");
+                    return arctic::groupAgg(arctic::asColumnList(a[0]), *arctic::asColumn(a[1]), it->second);
+                });
+            }));
+            env_->define("col_join", makeNative([colGuard](std::vector<Value> a) -> Value {
+                return colGuard("col_join", [&]() -> Value {
+                    if (a.size() < 2) throw std::runtime_error("usage: col_join(leftKeys, rightKeys, how)");
+                    std::string how = (a.size() > 2 && a[2].isString()) ? a[2].stringVal : "inner";
+                    arctic::Join j = arctic::Join::INNER;
+                    if (how == "left") j = arctic::Join::LEFT;
+                    else if (how == "right") j = arctic::Join::RIGHT;
+                    else if (how == "outer") j = arctic::Join::OUTER;
+                    else if (how != "inner") throw std::runtime_error("how must be inner/left/right/outer");
+                    return arctic::joinIdx(arctic::asColumnList(a[0]), arctic::asColumnList(a[1]), j);
+                });
+            }));
+
+            // ── Typed I/O (Phase 4) ──────────────────────────────────────
+            // read_csv(path, options?) -> { names:[...], cols:{name:column}, shape:[r,c] }
+            // options (dict, optional): { "delim": ",", "header": true }
+            env_->define("read_csv", makeNative([colGuard](std::vector<Value> a) -> Value {
+                return colGuard("read_csv", [&]() -> Value {
+                    if (a.empty() || !a[0].isString()) throw std::runtime_error("usage: read_csv(path, options?)");
+                    char delim = ','; bool header = true;
+                    if (a.size() > 1 && a[1].isObject()) {
+                        auto& o = *a[1].objectVal;
+                        auto d = o.find("delim");  if (d != o.end() && d->second.isString() && !d->second.stringVal.empty()) delim = d->second.stringVal[0];
+                        auto h = o.find("header"); if (h != o.end()) header = h->second.isTruthy();
+                    }
+                    std::ifstream f(a[0].stringVal, std::ios::binary);
+                    if (!f) throw std::runtime_error("cannot open '" + a[0].stringVal + "'");
+                    std::string text((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+                    return arctic::readCsvText(text, delim, header);
+                });
+            }));
+
+            // write_csv(frame, path) OR write_csv(names, cols, path).
+            //   frame = { "names":[...], "cols":{name:column} }
+            env_->define("write_csv", makeNative([colGuard](std::vector<Value> a) -> Value {
+                return colGuard("write_csv", [&]() -> Value {
+                    std::vector<std::string> names;
+                    std::vector<arctic::ColumnPtr> cols;
+                    std::string path;
+                    const Value* colsDict = nullptr; const Value* namesList = nullptr;
+                    if (a.size() >= 2 && a[0].isObject() && a[0].objectVal->count("cols") && a[0].objectVal->count("names")) {
+                        namesList = &a[0].objectVal->at("names");
+                        colsDict  = &a[0].objectVal->at("cols");
+                        if (a.size() < 2 || !a[1].isString()) throw std::runtime_error("usage: write_csv(frame, path)");
+                        path = a[1].stringVal;
+                    } else if (a.size() >= 3 && a[0].isList() && a[1].isObject() && a[2].isString()) {
+                        namesList = &a[0]; colsDict = &a[1]; path = a[2].stringVal;
+                    } else {
+                        throw std::runtime_error("usage: write_csv(frame, path) or write_csv(names, cols, path)");
+                    }
+                    for (auto& nv : namesList->listVal) {
+                        std::string nm = nv.toString();
+                        auto it = colsDict->objectVal->find(nm);
+                        if (it == colsDict->objectVal->end()) throw std::runtime_error("column '" + nm + "' not found");
+                        names.push_back(nm);
+                        cols.push_back(arctic::asColumn(it->second));
+                    }
+                    std::string csv = arctic::writeCsvText(names, cols, ',');
+                    std::ofstream of(path, std::ios::binary);
+                    if (!of) throw std::runtime_error("cannot write '" + path + "'");
+                    of << csv;
+                    return Value(true);
+                });
+            }));
+
+            // read_sqlite(path, query) -> { names:[...], cols:{name:column}, shape:[r,c] }
+            // Runs the query via the already-linked SQLite and infers column types.
+            env_->define("read_sqlite", makeNative([colGuard](std::vector<Value> a) -> Value {
+                return colGuard("read_sqlite", [&]() -> Value {
+                    if (a.size() < 2 || !a[0].isString() || !a[1].isString())
+                        throw std::runtime_error("usage: read_sqlite(path, query)");
+                    sqlite3* db = nullptr;
+                    if (sqlite3_open(a[0].stringVal.c_str(), &db) != SQLITE_OK) {
+                        std::string e = db ? sqlite3_errmsg(db) : "cannot open database";
+                        if (db) sqlite3_close(db);
+                        throw std::runtime_error(e);
+                    }
+                    sqlite3_stmt* st = nullptr;
+                    if (sqlite3_prepare_v2(db, a[1].stringVal.c_str(), -1, &st, nullptr) != SQLITE_OK) {
+                        std::string e = sqlite3_errmsg(db); sqlite3_close(db);
+                        throw std::runtime_error(e);
+                    }
+                    int ncol = sqlite3_column_count(st);
+                    std::vector<std::string> colNames(ncol);
+                    std::vector<std::vector<Value>> colData(ncol);
+                    for (int j=0;j<ncol;j++) colNames[j] = sqlite3_column_name(st, j) ? sqlite3_column_name(st, j) : ("col"+std::to_string(j));
+                    while (sqlite3_step(st) == SQLITE_ROW) {
+                        for (int j=0;j<ncol;j++) {
+                            switch (sqlite3_column_type(st, j)) {
+                                case SQLITE_INTEGER: colData[j].push_back(Value((double)sqlite3_column_int64(st, j))); break;
+                                case SQLITE_FLOAT:   colData[j].push_back(Value(sqlite3_column_double(st, j))); break;
+                                case SQLITE_NULL:    colData[j].push_back(Value()); break;
+                                default: {
+                                    const unsigned char* txt = sqlite3_column_text(st, j);
+                                    colData[j].push_back(Value(std::string(txt ? (const char*)txt : "")));
+                                }
+                            }
+                        }
+                    }
+                    sqlite3_finalize(st);
+                    sqlite3_close(db);
+                    ObjectMap out; std::vector<Value> names; ObjectMap cols;
+                    size_t nrows = ncol ? colData[0].size() : 0;
+                    for (int j=0;j<ncol;j++) {
+                        names.push_back(Value(colNames[j]));
+                        cols[colNames[j]] = arctic::wrap(arctic::makeColumnInferred(colData[j]));
+                    }
+                    out["names"] = Value(std::move(names));
+                    out["cols"]  = Value(std::move(cols));
+                    out["shape"] = Value(std::vector<Value>{ Value((double)nrows), Value((double)ncol) });
+                    return Value(std::move(out));
+                });
             }));
         }
 
