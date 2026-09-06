@@ -5,6 +5,42 @@ All notable changes to the Bantu programming language are documented in this fil
 > **Searchable tags:** every entry below is prefixed with `[feature]`, `[bug fix]`, or
 > `[patch]` so you can grep the log, e.g. `grep '\[bug fix\]' CHANGELOG.md`.
 
+## [1.3.1] — 2026-09-06
+
+Installer + tooling release: real Windows installer with brand icon, live linting in
+VS Code that shows red squiggles on syntax errors as you type, and a new `sua.udp`
+namespace for native UDP networking. **No language semantics changed** — every v1.3.0
+program runs unchanged.
+
+### Added
+
+- **[feature] Native UDP networking (`sua.udp` namespace)** — Bantu can now open raw UDP
+  sockets and speak UDP-only protocols directly. Seven new builtins:
+  `sua.udp.socket`, `sua.udp.bind`, `sua.udp.send_to`, `sua.udp.recvfrom`,
+  `sua.udp.send` (one-shot), `sua.udp.close`, `sua.udp.getsockname`. Verified against
+  real DNS (8.8.8.8), STUN (stun.l.google.com), and self-echo. Enables STUN/TURN servers,
+  DNS clients, IoT relays, real-time games, all in pure Bantu.
+- **[feature] Windows installer with brand icon** — the NSIS installer now embeds the
+  official Bantu icon (multi-resolution .ico, 16/32/48/64/128/256 px). Shows in the
+  installer wizard, Add/Remove Programs, file associations, and Start Menu shortcuts.
+- **[feature] Live linting in VS Code** — the Bantu VS Code extension's
+  `diagnosticsProvider.ts` runs `bantu lint --json` on the current buffer every
+  300 ms (debounced). Syntax errors show as red squiggles as you type, not only on save.
+  The interpreter's compile gate refuses to `run`/`build` files that still contain
+  errors, so the editor and the toolchain agree.
+- **[feature] VS Code extension icon** — replaced the placeholder blue-B with the
+  official Bantu icon at 256×256 px (extension-icon.png) and 64×64 px (file icons).
+
+### Changed
+
+- Bumped version constant in `main.cpp`: `1.3.0` → `1.3.1`.
+- VS Code extension package version: `1.3.0` → `1.3.1`.
+
+### Compatibility
+
+- v1.3.1 is a drop-in replacement for v1.3.0. No language changes, no breaking API
+  changes. All v1.3.0 programs run unchanged.
+
 ## [1.3.0] — 2026-07-10
 
 Core-language correctness release: the features that were advertised via keywords but silently

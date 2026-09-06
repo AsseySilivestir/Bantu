@@ -1,0 +1,9 @@
+{
+  "name": "uuid",
+  "version": "1.0.0",
+  "main": "uuid.b",
+  "description": "RFC 4122 / RFC 9562 UUIDs for Bantu — uuid4 (random, CSPRNG-backed), uuid7 (time-ordered/sortable), and uuid3/uuid5 (deterministic name-based, MD5/SHA-1), with namespaces and parse/format/is_valid/version_of. Pure Bantu on native primitives; bit-exact to the RFC name-based vectors.",
+  "dependencies": {
+    "hash": "1.0.0"
+  }
+}

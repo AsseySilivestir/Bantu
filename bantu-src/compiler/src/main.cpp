@@ -56,7 +56,7 @@
     #include <unistd.h>
 #endif
 
-const std::string BANTU_VERSION = "1.3.0";
+const std::string BANTU_VERSION = "1.3.1";
 const std::string BANTU_LANG = "Bantu";
 
 // ─── Helpers ──────────────────────────────────────────────────────────

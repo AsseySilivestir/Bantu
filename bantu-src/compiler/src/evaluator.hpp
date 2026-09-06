@@ -307,13 +307,26 @@ static int bantuNextFileId = 1;
 // Each entry holds the OS socket fd, family (AF_INET / AF_INET6), and a
 // flag indicating whether it's been bound. Lifecycle: socket() → bind() →
 // recvfrom()/send_to() → close().
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <netdb.h>
-#include <poll.h>
-#include <unistd.h>
-#include <fcntl.h>
+//
+// Platform includes — POSIX vs Windows are wrapped in #ifdef.
+#ifdef _WIN32
+    // Winsock2 — needs to be initialized via WSAStartup before any socket call.
+    #include <winsock2.h>
+    #include <ws2tcpip.h>
+    #pragma comment(lib, "ws2_32.lib")
+    #define BANTU_CLOSE_SOCKET closesocket
+    #define BANTU_SOCKET_ERRNO WSAGetLastError()
+#else
+    #include <sys/socket.h>
+    #include <netinet/in.h>
+    #include <arpa/inet.h>
+    #include <netdb.h>
+    #include <poll.h>
+    #include <unistd.h>
+    #include <fcntl.h>
+    #define BANTU_CLOSE_SOCKET close
+    #define BANTU_SOCKET_ERRNO errno
+#endif
 struct BantuUdpSocket {
     int fd = -1;
     int family = AF_INET;
@@ -436,6 +449,43 @@ static std::string bantuUdpFormatAddr(const struct sockaddr_storage* ss) {
     }
     return "unknown";
 }
+
+// Helper: cross-platform poll() wrapper.
+#ifdef _WIN32
+static int bantuUdpPoll(SOCKET fd, int timeoutMs) {
+    WSAPOLLFD pfd;
+    pfd.fd = fd;
+    pfd.events = POLLIN;
+    pfd.revents = 0;
+    return WSAPoll(&pfd, 1, timeoutMs);
+}
+static std::string bantuUdpErrStr() {
+    int e = WSAGetLastError();
+    char buf[256];
+    FormatMessageA(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+                   nullptr, e, 0, buf, sizeof(buf), nullptr);
+    return std::string(buf);
+}
+static void bantuUdpSetNonblocking(SOCKET fd) {
+    u_long mode = 1;
+    ioctlsocket(fd, FIONBIO, &mode);
+}
+#else
+static int bantuUdpPoll(int fd, int timeoutMs) {
+    struct pollfd pfd;
+    pfd.fd = fd;
+    pfd.events = POLLIN;
+    pfd.revents = 0;
+    return poll(&pfd, 1, timeoutMs);
+}
+static std::string bantuUdpErrStr() {
+    return std::string(strerror(errno));
+}
+static void bantuUdpSetNonblocking(int fd) {
+    int flags = fcntl(fd, F_GETFL, 0);
+    fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+}
+#endif
 
 // ─── FFI: call arbitrary C functions in shared libraries (via libffi) ───
 //   $m    = loadlib("libm.dylib")                 // dlopen a shared library
@@ -4132,14 +4182,13 @@ private:
                 if (nit != o.end()) nonblocking = (bool)nit->second.numberVal;
             }
             int family = (familyStr == "ipv6") ? AF_INET6 : AF_INET;
-            int fd = socket(family, SOCK_DGRAM, 0);
+            int fd = (int)socket(family, SOCK_DGRAM, 0);
             if (fd < 0) {
-                ErrorHandler::throwError(std::string("sua.udp.socket: socket() failed: ") + strerror(errno),
+                ErrorHandler::throwError(std::string("sua.udp.socket: socket() failed: ") + bantuUdpErrStr(),
                                          0, 0, ErrorHandler::RUNTIME_ERROR);
             }
             if (nonblocking) {
-                int flags = fcntl(fd, F_GETFL, 0);
-                fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+                bantuUdpSetNonblocking(fd);
             }
             int id = bantuNextUdpId++;
             bantuUdpSocketTable()[id] = BantuUdpSocket{fd, family, false};
@@ -4187,9 +4236,9 @@ private:
             }
             // Allow address reuse (common for servers restarting)
             int yes = 1;
-            setsockopt(entry->fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+            setsockopt(entry->fd, SOL_SOCKET, SO_REUSEADDR, (const char*)&yes, sizeof(yes));
             if (::bind(entry->fd, (struct sockaddr*)&ss, sslen) < 0) {
-                ErrorHandler::throwError(std::string("sua.udp.bind: bind() failed: ") + strerror(errno),
+                ErrorHandler::throwError(std::string("sua.udp.bind: bind() failed: ") + bantuUdpErrStr(),
                                          0, 0, ErrorHandler::RUNTIME_ERROR);
             }
             entry->bound = true;
@@ -4215,10 +4264,10 @@ private:
             }
             std::vector<uint8_t> buf = bantuValueToBytes(args[2]);
             if (buf.empty()) return Value((double)0);
-            ssize_t n = sendto(entry->fd, buf.data(), buf.size(), 0,
+            ssize_t n = sendto(entry->fd, (const char*)buf.data(), (int)buf.size(), 0,
                                (struct sockaddr*)&ss, sslen);
             if (n < 0) {
-                ErrorHandler::throwError(std::string("sua.udp.send_to: sendto() failed: ") + strerror(errno),
+                ErrorHandler::throwError(std::string("sua.udp.send_to: sendto() failed: ") + bantuUdpErrStr(),
                                          0, 0, ErrorHandler::RUNTIME_ERROR);
             }
             return Value((double)n);
@@ -4246,11 +4295,7 @@ private:
             }
             // Wait for data with optional timeout via poll()
             if (timeoutMs > 0) {
-                struct pollfd pfd;
-                pfd.fd = entry->fd;
-                pfd.events = POLLIN;
-                pfd.revents = 0;
-                int rc = poll(&pfd, 1, timeoutMs);
+                int rc = bantuUdpPoll(entry->fd, timeoutMs);
                 if (rc == 0) {
                     ObjectMap r;
                     r["timeout"] = Value(true);
@@ -4259,17 +4304,17 @@ private:
                     return Value(std::move(r));
                 }
                 if (rc < 0) {
-                    ErrorHandler::throwError(std::string("sua.udp.recvfrom: poll() failed: ") + strerror(errno),
+                    ErrorHandler::throwError(std::string("sua.udp.recvfrom: poll() failed: ") + bantuUdpErrStr(),
                                              0, 0, ErrorHandler::RUNTIME_ERROR);
                 }
             }
             std::vector<uint8_t> buf(maxBytes);
             struct sockaddr_storage peer;
             socklen_t peerLen = sizeof(peer);
-            ssize_t n = recvfrom(entry->fd, buf.data(), buf.size(), 0,
+            ssize_t n = recvfrom(entry->fd, (char*)buf.data(), (int)buf.size(), 0,
                                  (struct sockaddr*)&peer, &peerLen);
             if (n < 0) {
-                ErrorHandler::throwError(std::string("sua.udp.recvfrom: recvfrom() failed: ") + strerror(errno),
+                ErrorHandler::throwError(std::string("sua.udp.recvfrom: recvfrom() failed: ") + bantuUdpErrStr(),
                                          0, 0, ErrorHandler::RUNTIME_ERROR);
             }
             buf.resize(n);
@@ -4301,53 +4346,49 @@ private:
                 if (fit != o.end()) familyStr = fit->second.toString();
             }
             int family = (familyStr == "ipv6") ? AF_INET6 : AF_INET;
-            int fd = socket(family, SOCK_DGRAM, 0);
+            int fd = (int)socket(family, SOCK_DGRAM, 0);
             if (fd < 0) {
-                ErrorHandler::throwError(std::string("sua.udp.send: socket() failed: ") + strerror(errno),
+                ErrorHandler::throwError(std::string("sua.udp.send: socket() failed: ") + bantuUdpErrStr(),
                                          0, 0, ErrorHandler::RUNTIME_ERROR);
             }
             struct sockaddr_storage ss;
             socklen_t sslen = 0;
             std::string err;
             if (bantuUdpResolve(host, port, &ss, &sslen, family, &err) != 0) {
-                close(fd);
+                BANTU_CLOSE_SOCKET(fd);
                 ErrorHandler::throwError("sua.udp.send: " + err, 0, 0, ErrorHandler::RUNTIME_ERROR);
             }
             std::vector<uint8_t> buf = bantuValueToBytes(args[1]);
-            ssize_t sent = sendto(fd, buf.data(), buf.size(), 0,
+            ssize_t sent = sendto(fd, (const char*)buf.data(), (int)buf.size(), 0,
                                   (struct sockaddr*)&ss, sslen);
             if (sent < 0) {
-                close(fd);
-                ErrorHandler::throwError(std::string("sua.udp.send: sendto() failed: ") + strerror(errno),
+                BANTU_CLOSE_SOCKET(fd);
+                ErrorHandler::throwError(std::string("sua.udp.send: sendto() failed: ") + bantuUdpErrStr(),
                                          0, 0, ErrorHandler::RUNTIME_ERROR);
             }
             // Wait for response
-            struct pollfd pfd;
-            pfd.fd = fd;
-            pfd.events = POLLIN;
-            pfd.revents = 0;
-            int rc = poll(&pfd, 1, timeoutMs);
+            int rc = bantuUdpPoll(fd, timeoutMs);
             ObjectMap r;
             if (rc == 0) {
-                close(fd);
+                BANTU_CLOSE_SOCKET(fd);
                 r["timeout"] = Value(true);
                 r["from"]    = Value(std::string(""));
                 r["data"]    = Value(std::vector<Value>{});
                 return Value(std::move(r));
             }
             if (rc < 0) {
-                close(fd);
-                ErrorHandler::throwError(std::string("sua.udp.send: poll() failed: ") + strerror(errno),
+                BANTU_CLOSE_SOCKET(fd);
+                ErrorHandler::throwError(std::string("sua.udp.send: poll() failed: ") + bantuUdpErrStr(),
                                          0, 0, ErrorHandler::RUNTIME_ERROR);
             }
             std::vector<uint8_t> rbuf(maxBytes);
             struct sockaddr_storage peer;
             socklen_t peerLen = sizeof(peer);
-            ssize_t n = recvfrom(fd, rbuf.data(), rbuf.size(), 0,
+            ssize_t n = recvfrom(fd, (char*)rbuf.data(), (int)rbuf.size(), 0,
                                  (struct sockaddr*)&peer, &peerLen);
-            close(fd);
+            BANTU_CLOSE_SOCKET(fd);
             if (n < 0) {
-                ErrorHandler::throwError(std::string("sua.udp.send: recvfrom() failed: ") + strerror(errno),
+                ErrorHandler::throwError(std::string("sua.udp.send: recvfrom() failed: ") + bantuUdpErrStr(),
                                          0, 0, ErrorHandler::RUNTIME_ERROR);
             }
             rbuf.resize(n);
@@ -4363,7 +4404,7 @@ private:
             int id = udpIdOf(args.empty() ? Value() : args[0], &entry);
             if (id < 0 || !entry) return Value(false);
             if (entry->fd >= 0) {
-                close(entry->fd);
+                BANTU_CLOSE_SOCKET(entry->fd);
                 entry->fd = -1;
             }
             bantuUdpSocketTable().erase(id);
@@ -4380,7 +4421,7 @@ private:
             struct sockaddr_storage ss;
             socklen_t sslen = sizeof(ss);
             if (getsockname(entry->fd, (struct sockaddr*)&ss, &sslen) < 0) {
-                ErrorHandler::throwError(std::string("sua.udp.getsockname: ") + strerror(errno),
+                ErrorHandler::throwError(std::string("sua.udp.getsockname: ") + bantuUdpErrStr(),
                                          0, 0, ErrorHandler::RUNTIME_ERROR);
             }
             return Value(bantuUdpFormatAddr(&ss));

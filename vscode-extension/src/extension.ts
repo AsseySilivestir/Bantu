@@ -1,5 +1,5 @@
 /**
- * Bantu VSCode Extension v1.2.2
+ * Bantu VSCode Extension v1.3.1
  * Entry point — registers commands, completion provider, hover provider,
  * and the file icon (declared in package.json).
  */
@@ -123,7 +123,7 @@ export function activate(context: vscode.ExtensionContext) {
         })
     );
 
-    console.log('[Bantu] Extension activated (v1.2.2).');
+    console.log('[Bantu] Extension activated (v1.3.1).');
 }
 
 export function deactivate() {

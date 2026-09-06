@@ -1,0 +1,6 @@
+{
+  "name": "hash",
+  "version": "1.0.0",
+  "main": "hash.b",
+  "description": "Hashing for Bantu — MD5, SHA-1, SHA-224, SHA-256 and HMAC-SHA256, written in pure Bantu on native 32-bit primitives and bit-exact to the RFC/NIST test vectors. Includes fast non-cryptographic hashes (djb2, fnv1a) and hash_file. MD5/SHA-1 are provided for checksums/interop only and are documented as non-secure."
+}
