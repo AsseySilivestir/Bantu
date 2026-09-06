@@ -6,6 +6,21 @@ tracks granular per-phase progress, including feature- and stress-test results.
 
 ## [Unreleased]
 
+### 2026-08-28 — arctic package (pure Bantu) + two interpreter fixes
+- **[feature]** `arctic/arctic.b` — the DataFrame library, written in **pure Bantu** on the `col_*`
+  atoms: `Series` and `DataFrame` classes with method chaining, a `GroupBy` with `agg`, a
+  plain-English `query()` filter DSL (tokenizer + evaluator in Bantu), `join` (inner/left/right/
+  outer), `sort`, `select/drop/rename/with_column`, `describe`, `to_csv`, and `show()` pretty-print.
+  Readers `read_csv`/`read_sqlite`/`dataframe`/`series`. Docs: `docs/arctic.md`. Package published to
+  the local registry. Tests: `arctic/arctic_test.b` 37/37; end-to-end on a 1M-row CSV
+  (load ~1.3 s, grouped agg + sort sub-second).
+- **[bug fix]** `col_group_agg` segfaulted when the value column was `utf8` (e.g. `groupby.count`
+  on a text column) — it read the value as numeric, indexing an empty buffer. Now aggregates each
+  group via a gathered sub-column through the generic `aggOp`, correct for every dtype/op
+  (count/nunique/any/all on utf8; all ops on numeric). group_agg 5M/1000-groups ~540 ms.
+- **[patch]** The informational `[class] Defined:` log now respects quiet mode (`-q`), like
+  `[INCLUDE]`, so libraries that define classes don't spam stdout on include.
+
 ### 2026-08-28 — Phase 5: consolidate & document (FOUNDATIONS COMPLETE)
 - **[feature]** `docs/arctic-foundations.md` — a newcomer-readable reference for every `col_*` builtin
   with tiny examples and an end-to-end walkthrough (verified to run). The `else if` note is included.
