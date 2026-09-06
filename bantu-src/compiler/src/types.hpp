@@ -49,7 +49,12 @@ using NativeFn = std::function<Value(std::vector<Value>)>;
 
 class Value {
 public:
-    enum Type { NUMBER, STRING, BOOL, NULL_VAL, FUNCTION, CLASS_INSTANCE, CLASS_DEF, OBJECT, NATIVE_FN, LIST };
+    enum Type { NUMBER, STRING, BOOL, NULL_VAL, FUNCTION, CLASS_INSTANCE, CLASS_DEF, OBJECT, NATIVE_FN, LIST,
+                // An opaque native object (e.g. an arctic Column) owned by a
+                // shared_ptr so C++ RAII frees it when the last Bantu reference
+                // drops — no manual free, no leak. `stringVal` doubles as the
+                // type tag (e.g. "column"); `handle` holds the object.
+                NATIVE_HANDLE };
 
     Type type;
 
@@ -66,6 +71,9 @@ public:
     std::shared_ptr<ObjectMap> objectVal;
     std::vector<Value> listVal;
     std::function<Value(std::vector<Value>)> nativeFn;
+    // Opaque native object for NATIVE_HANDLE values (the type tag lives in
+    // stringVal). shared_ptr<void> gives automatic, refcounted lifetime.
+    std::shared_ptr<void> handle;
 
     Value() : type(NULL_VAL) {}
     explicit Value(double n) : type(NUMBER), numberVal(n) {}
@@ -86,6 +94,10 @@ public:
     explicit Value(const ObjectMap& obj) : type(OBJECT), objectVal(std::make_shared<ObjectMap>(obj)) {}
     explicit Value(std::vector<Value> lst) : type(LIST), listVal(std::move(lst)) {}
     explicit Value(NativeFn fn) : type(NATIVE_FN), nativeFn(std::move(fn)) {}
+    // NATIVE_HANDLE: wrap an opaque native object with a type tag. The two-arg
+    // signature keeps it unambiguous from the constructors above.
+    Value(std::shared_ptr<void> h, const std::string& tag)
+        : type(NATIVE_HANDLE), stringVal(tag), handle(std::move(h)) {}
 
     bool isNumber() const { return type == NUMBER; }
     bool isString() const { return type == STRING; }
@@ -97,6 +109,9 @@ public:
     bool isObject() const { return type == OBJECT; }
     bool isList() const { return type == LIST; }
     bool isNativeFn() const { return type == NATIVE_FN; }
+    bool isNativeHandle() const { return type == NATIVE_HANDLE; }
+    // The type tag of a NATIVE_HANDLE (e.g. "column"); empty otherwise.
+    const std::string& handleTag() const { return stringVal; }
 
     bool isTruthy() const {
         switch (type) {
@@ -108,6 +123,7 @@ public:
             case CLASS_INSTANCE: case CLASS_DEF: return true;
             case OBJECT: return objectVal && !objectVal->empty();
             case LIST: return !listVal.empty();
+            case NATIVE_HANDLE: return (bool)handle;   // a live handle is truthy
         }
         return false;
     }
@@ -153,6 +169,7 @@ public:
                 oss << "]";
                 return oss.str();
             }
+            case NATIVE_HANDLE: return "<" + stringVal + ">";   // e.g. "<column>"
         }
         return "null";
     }
@@ -168,6 +185,7 @@ public:
             case STRING: return stringVal == other.stringVal;
             case BOOL: return boolVal == other.boolVal;
             case NULL_VAL: return true;
+            case NATIVE_HANDLE: return handle == other.handle;   // identity
             default: return false;
         }
     }
