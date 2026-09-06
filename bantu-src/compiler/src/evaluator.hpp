@@ -338,6 +338,254 @@ static std::unordered_map<int, BantuUdpSocket>& bantuUdpSocketTable() {
 }
 static int bantuNextUdpId = 1;
 
+// ─── SHA-1 (for WebSocket handshake, RFC 6455) ────────────────────
+// We need SHA1(key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11") → base64
+// for the Sec-WebSocket-Accept header. ~50 lines of inline SHA1.
+struct BantuSha1 {
+    uint32_t h0=0x67452301, h1=0xEFCDAB89, h2=0x98BADCFE, h3=0x10325476, h4=0xC3D2E1F0;
+    uint8_t msg[64]; int msgLen=0; uint64_t totalLen=0;
+
+    void update(const uint8_t* data, size_t len) {
+        totalLen += len;
+        for (size_t i = 0; i < len; i++) {
+            msg[msgLen++] = data[i];
+            if (msgLen == 64) { process(); msgLen = 0; }
+        }
+    }
+    void update(const std::string& s) { update((const uint8_t*)s.data(), s.size()); }
+
+    void process() {
+        uint32_t w[80];
+        for (int i = 0; i < 16; i++) {
+            w[i] = (msg[i*4]<<24) | (msg[i*4+1]<<16) | (msg[i*4+2]<<8) | msg[i*4+3];
+        }
+        for (int i = 16; i < 80; i++) {
+            uint32_t t = w[i-3] ^ w[i-8] ^ w[i-14] ^ w[i-16];
+            w[i] = (t << 1) | (t >> 31);
+        }
+        uint32_t a=h0, b=h1, c=h2, d=h3, e=h4;
+        for (int i = 0; i < 80; i++) {
+            uint32_t f, k;
+            if (i<20)      { f=(b&c)|((~b)&d); k=0x5A827999; }
+            else if (i<40) { f=b^c^d;          k=0x6ED9EBA1; }
+            else if (i<60) { f=(b&c)|(b&d)|(c&d); k=0x8F1BBCDC; }
+            else           { f=b^c^d;          k=0xCA62C1D6; }
+            uint32_t temp = ((a<<5)|(a>>27)) + f + e + k + w[i];
+            e=d; d=c; c=(b<<30)|(b>>2); b=a; a=temp;
+        }
+        h0+=a; h1+=b; h2+=c; h3+=d; h4+=e;
+    }
+
+    std::string final_() {
+        uint64_t bits = totalLen * 8;
+        msg[msgLen++] = 0x80;
+        while (msgLen != 56) { if (msgLen==64) { process(); msgLen=0; } msg[msgLen++]=0; }
+        for (int i = 7; i >= 0; i--) msg[msgLen++] = (bits >> (i*8)) & 0xFF;
+        process();
+        std::string out(20, '\0');
+        uint32_t hs[5] = {h0,h1,h2,h3,h4};
+        for (int i = 0; i < 5; i++) {
+            out[i*4]   = (hs[i]>>24)&0xFF;
+            out[i*4+1] = (hs[i]>>16)&0xFF;
+            out[i*4+2] = (hs[i]>>8)&0xFF;
+            out[i*4+3] = hs[i]&0xFF;
+        }
+        return out;
+    }
+};
+
+// ─── Base64 encoder (for WebSocket handshake) ──────────────────────
+static std::string bantuBase64Encode(const std::string& input) {
+    static const char tbl[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string out;
+    int val = 0, valb = -6;
+    for (uint8_t c : input) {
+        val = (val << 8) | c;
+        valb += 8;
+        while (valb >= 0) {
+            out.push_back(tbl[(val >> valb) & 0x3F]);
+            valb -= 6;
+        }
+    }
+    if (valb > -6) out.push_back(tbl[((val << 8) >> (valb + 8)) & 0x3F]);
+    while (out.size() % 4) out.push_back('=');
+    return out;
+}
+
+// ─── WebSocket connection table ────────────────────────────────────
+struct BantuWsClient {
+    int fd = -1;
+    std::string id;       // client ID (for sua.ws.send/broadcast)
+    bool alive = true;
+};
+static std::unordered_map<int, BantuWsClient>& bantuWsTable() {
+    static std::unordered_map<int, BantuWsClient> table;
+    return table;
+}
+static int bantuNextWsId = 1;
+
+// Bantu-level WS event handlers (set by sua.ws.on)
+static Value bantuWsOnConnect = Value();
+static Value bantuWsOnMessage = Value();
+static Value bantuWsOnDisconnect = Value();
+
+// Callback function — set by Evaluator constructor, used by
+// the free-function WebSocket handler to call Bantu callbacks.
+#include <functional>
+static std::function<Value(Value, std::vector<Value>)> bantuWsCallback;
+
+// Forward declaration — the real definition is inside Evaluator class
+// (at line ~1550). The WS handler calls through this function pointer.
+
+// ─── Send a WebSocket text frame to a client ───────────────────────
+// Server→client frames are NOT masked (per RFC 6455).
+static void bantuWsSend(int fd, const std::string& message) {
+    std::vector<uint8_t> frame;
+    frame.push_back(0x81);  // FIN + text opcode
+
+    size_t len = message.size();
+    if (len <= 125) {
+        frame.push_back((uint8_t)len);
+    } else if (len <= 65535) {
+        frame.push_back(126);
+        frame.push_back((len >> 8) & 0xFF);
+        frame.push_back(len & 0xFF);
+    } else {
+        frame.push_back(127);
+        for (int i = 7; i >= 0; i--) {
+            frame.push_back((len >> (i * 8)) & 0xFF);
+        }
+    }
+    frame.insert(frame.end(), message.begin(), message.end());
+    send(fd, (const char*)frame.data(), (int)frame.size(), 0);
+}
+
+// ─── Handle a WebSocket connection (after upgrade) ─────────────────
+// Runs in the same thread that accepted the HTTP connection — blocks
+// until the WS client disconnects.
+static void bantuHandleWebSocket(int sock, const std::string& wsKey) {
+    // Compute the accept value: SHA1(key + GUID) → base64
+    BantuSha1 sha;
+    sha.update(wsKey);
+    sha.update(std::string("258EAFA5-E914-47DA-95CA-C5AB0DC85B11"));
+    std::string acceptVal = bantuBase64Encode(sha.final_());
+
+    // Send 101 Switching Protocols
+    std::string resp = "HTTP/1.1 101 Switching Protocols\r\n"
+                       "Upgrade: websocket\r\n"
+                       "Connection: Upgrade\r\n"
+                       "Sec-WebSocket-Accept: " + acceptVal + "\r\n"
+                       "\r\n";
+    send(sock, resp.c_str(), (int)resp.size(), 0);
+
+    // Register the client
+    int wsId = bantuNextWsId++;
+    BantuWsClient client;
+    client.fd = sock;
+    client.id = "ws-" + std::to_string(wsId);
+    bantuWsTable()[wsId] = client;
+    std::cout << "  [WS] Client connected: " << client.id << " (fd=" << sock << ")\n";
+
+    // Call the Bantu-level onConnect handler if registered
+    if (bantuWsOnConnect.isFunction() || bantuWsOnConnect.isNativeFn()) {
+        ObjectMap cliObj;
+        cliObj["id"] = Value(client.id);
+        cliObj["fd"] = Value((double)sock);
+        if (bantuWsCallback) {
+            try { bantuWsCallback(bantuWsOnConnect, {Value(std::move(cliObj))}); }
+            catch (const std::exception& e) { std::cerr << "  [WS] onConnect error: " << e.what() << "\n"; }
+        }
+    }
+
+    // WebSocket message loop
+    uint8_t buffer[65536];
+    bool running = true;
+    while (running) {
+        ssize_t n = recv(sock, (char*)buffer, sizeof(buffer), 0);
+        if (n <= 0) break;
+
+        if (n < 2) continue;
+        uint8_t opcode = buffer[0] & 0x0F;
+        bool masked = (buffer[1] & 0x80) != 0;
+        uint64_t payloadLen = buffer[1] & 0x7F;
+        size_t offset = 2;
+
+        if (payloadLen == 126) {
+            if (n < 4) continue;
+            payloadLen = (buffer[2] << 8) | buffer[3];
+            offset = 4;
+        } else if (payloadLen == 127) {
+            if (n < 10) continue;
+            payloadLen = 0;
+            for (int i = 0; i < 8; i++) {
+                payloadLen = (payloadLen << 8) | buffer[offset + i];
+            }
+            offset = 10;
+        }
+
+        uint8_t mask[4] = {0};
+        if (masked && offset + 4 <= (size_t)n) {
+            memcpy(mask, buffer + offset, 4);
+            offset += 4;
+        }
+
+        std::string payload;
+        for (uint64_t i = 0; i < payloadLen && offset + i < (size_t)n; i++) {
+            char c = buffer[offset + i];
+            if (masked) c ^= mask[i % 4];
+            payload += c;
+        }
+
+        if (opcode == 0x8) {  // Close
+            break;
+        }
+        if (opcode == 0x9) {  // Ping → respond with Pong
+            uint8_t pong[2] = {0x8A, 0x00};
+            send(sock, (const char*)pong, 2, 0);
+            continue;
+        }
+        if (opcode == 0xA) {  // Pong — ignore
+            continue;
+        }
+        if (opcode == 0x1) {  // Text message
+            std::cout << "  [WS] Message from " << client.id << ": " << payload << "\n";
+
+            // Call the Bantu-level onMessage handler if registered
+            if (bantuWsOnMessage.isFunction() || bantuWsOnMessage.isNativeFn()) {
+                ObjectMap msgObj;
+                msgObj["data"] = Value(payload);
+                msgObj["client"] = Value(client.id);
+                // Also try to parse as JSON — if it succeeds, pass the parsed value
+                Value parsed = Value();
+                if (!payload.empty() && (payload[0] == '{' || payload[0] == '[')) {
+                    try {
+                        size_t pos = 0;
+                        parsed = bantuJsonParse(payload, pos);
+                        msgObj["json"] = parsed;
+                    } catch (...) {}
+                }
+                if (bantuWsCallback) {
+                    try { bantuWsCallback(bantuWsOnMessage, {Value(std::move(msgObj))}); }
+                    catch (const std::exception& e) { std::cerr << "  [WS] onMessage error: " << e.what() << "\n"; }
+                }
+            }
+        }
+    }
+
+    // Cleanup
+    std::cout << "  [WS] Client disconnected: " << client.id << "\n";
+    if (bantuWsOnDisconnect.isFunction() || bantuWsOnDisconnect.isNativeFn()) {
+        ObjectMap cliObj;
+        cliObj["id"] = Value(client.id);
+        if (bantuWsCallback) {
+            try { bantuWsCallback(bantuWsOnDisconnect, {Value(std::move(cliObj))}); }
+            catch (...) {}
+        }
+    }
+    bantuWsTable().erase(wsId);
+    CLOSE_SOCKET(sock);
+}
+
 // Helper: parse "host:port" → (host, port). Supports IPv6 brackets [::1]:53.
 static std::pair<std::string, int> bantuUdpParseAddr(const std::string& addr) {
     // IPv6 form: [::1]:53
@@ -852,6 +1100,9 @@ struct ReturnSignal { Value value; };
 class Evaluator {
 public:
     Evaluator() : env_(std::make_shared<Environment>()), globalEnv_(env_) {
+        bantuWsCallback = [this](Value callee, std::vector<Value> args) -> Value {
+            return this->bantuCallFunction(callee, std::move(args));
+        };
         curl_global_init(CURL_GLOBAL_DEFAULT);
         registerBuiltins();
     }
@@ -1568,6 +1819,19 @@ private:
             }
         }
 
+        // ─── WebSocket upgrade detection (RFC 6455) ────────────────
+        // If the request has Upgrade: websocket, handle it as a WS
+        // connection instead of a normal HTTP request.
+        if (headers.count("upgrade") &&
+            headers["upgrade"].toString().find("websocket") != std::string::npos) {
+            std::string wsKey = headers.count("sec-websocket-key")
+                ? headers["sec-websocket-key"].toString() : "";
+            if (!wsKey.empty()) {
+                bantuHandleWebSocket(sock, wsKey);
+                return;
+            }
+        }
+
         // Match route (exact first, then :param patterns)
         Value matchedHandler;
         ObjectMap params;
@@ -1616,14 +1880,39 @@ private:
                 }
             }
         }
-
-        // If no route matched, try static files (GET only)
+        // Third pass: wildcard match (route ends with *)
+        // Enables SPA fallback: sua.server.get("/*", handler)
+        // NOTE: This runs AFTER static file serving, so /style.css etc.
+        // are served as static files, not as SPA fallback.
         if (!found && method == "GET") {
+            // Try static files first — if served, we're done.
             if (bantuServeStaticFile(sock, path)) {
                 CLOSE_SOCKET(sock);
                 return;
             }
         }
+        if (!found) {
+            for (auto& route : bantuServerRoutes) {
+                if (route.method != method) continue;
+                if (route.path.size() >= 2 && route.path.substr(route.path.size() - 2) == "/*") {
+                    std::string prefix = route.path.substr(0, route.path.size() - 1);
+                    if (path.find(prefix) == 0 || path == route.path.substr(0, route.path.size() - 2)) {
+                        matchedHandler = route.handler;
+                        found = true;
+                        break;
+                    }
+                } else if (!route.path.empty() && route.path.back() == '*' && route.path != "*") {
+                    std::string prefix = route.path.substr(0, route.path.size() - 1);
+                    if (path.find(prefix) == 0) {
+                        matchedHandler = route.handler;
+                        found = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        // If no route matched, try static files for non-GET methods (rare but possible)
 
         // Build $req and $res
         auto state = std::make_shared<BantuHttpResponseState>();
@@ -4428,6 +4717,81 @@ private:
         });
 
         suaObj["udp"] = Value(std::move(udpObj));
+
+        // ════════════════════════════════════════════════════════════
+        // sua.ws — WebSocket support (RFC 6455, v1.4.0)
+        // ════════════════════════════════════════════════════════════
+        //
+        //   sua.ws.on("connect", def($client) { ... });
+        //   sua.ws.on("message", def($msg) { ... });
+        //   sua.ws.on("disconnect", def($client) { ... });
+        //   sua.ws.send($clientId, "hello");
+        //   sua.ws.broadcast("hello everyone");
+        //   sua.ws.clients() → list of connected client IDs
+        //
+        ObjectMap wsObj;
+
+        // sua.ws.on(event, handler) — register a WS event handler
+        wsObj["on"] = makeNative([](std::vector<Value> args) -> Value {
+            if (args.size() < 2) return Value(false);
+            std::string event = args[0].toString();
+            Value handler = args[1];
+            if (event == "connect") {
+                bantuWsOnConnect = handler;
+                std::cout << "  [WS] on(connect) registered\n";
+            } else if (event == "message") {
+                bantuWsOnMessage = handler;
+                std::cout << "  [WS] on(message) registered\n";
+            } else if (event == "disconnect") {
+                bantuWsOnDisconnect = handler;
+                std::cout << "  [WS] on(disconnect) registered\n";
+            } else {
+                return Value(false);
+            }
+            return Value(true);
+        });
+
+        // sua.ws.send(clientId, data) → send a text message to one client
+        wsObj["send"] = makeNative([](std::vector<Value> args) -> Value {
+            if (args.size() < 2) return Value(false);
+            std::string clientId = args[0].toString();
+            std::string data = args[1].toString();
+            // Find the client by ID
+            for (auto& [id, client] : bantuWsTable()) {
+                if (client.id == clientId && client.fd >= 0) {
+                    bantuWsSend(client.fd, data);
+                    return Value(true);
+                }
+            }
+            return Value(false);
+        });
+
+        // sua.ws.broadcast(data) → send to ALL connected clients
+        wsObj["broadcast"] = makeNative([](std::vector<Value> args) -> Value {
+            if (args.empty()) return Value((double)0);
+            std::string data = args[0].toString();
+            int count = 0;
+            for (auto& [id, client] : bantuWsTable()) {
+                if (client.fd >= 0 && client.alive) {
+                    bantuWsSend(client.fd, data);
+                    count++;
+                }
+            }
+            return Value((double)count);
+        });
+
+        // sua.ws.clients() → list of connected client IDs
+        wsObj["clients"] = makeNative([](std::vector<Value> args) -> Value {
+            std::vector<Value> out;
+            for (auto& [id, client] : bantuWsTable()) {
+                if (client.fd >= 0) {
+                    out.push_back(Value(client.id));
+                }
+            }
+            return Value(std::move(out));
+        });
+
+        suaObj["ws"] = Value(std::move(wsObj));
 
         // ════════════════════════════════════════════════════════
         // Register sua as a global variable
