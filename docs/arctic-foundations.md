@@ -158,11 +158,42 @@ while ($i < $g.ngroups) {
 }
 ```
 
+## Datetime, date & categorical atoms
+These are **logical overlays** on the `i64` buffer (physical storage stays i64), so every numeric
+kernel keeps working; only rendering and these builtins are overlay-aware. `col_dtype` reports
+`datetime` / `date` / `cat`.
+
+| Builtin | What it does |
+|---|---|
+| `col_to_datetime(c)` | utf8 (ISO-8601 `YYYY-MM-DD[ T]HH:MM:SS[.fff][Z]`) or numeric epoch-ms → **datetime**; bad/blank → null |
+| `col_to_date(c)` | like above → **date** (days since epoch) |
+| `col_strftime(c, fmt)` | datetime/date → utf8; specifiers `%Y %y %m %d %H %M %S %j %%` |
+| `col_dt_year/month/day/hour/minute/second/weekday(c)` | → i64 component column (weekday 0=Sunday) |
+| `col_to_categorical(c)` | any column → **cat** (dictionary codes + category strings) |
+| `col_categories(c)` | → utf8 column of the categories (index = code) |
+| `col_codes(c)` | → i64 column of the raw dictionary codes |
+
+Comparisons are overlay-aware: a datetime/date column vs an ISO **string** parses the string to the
+same epoch unit; a categorical compares as its category text. `sort`/`filter`/`take`/`head`/group
+keys keep the overlay so results still render as timestamps / categories.
+
+## Fast & columnar I/O atoms
+| Builtin | What it does |
+|---|---|
+| `read_csv(path, {delim,header,columns,engine})` | two-pass native parser; `columns` = projection (skip unused columns); `engine:"slow"` = reference parser |
+| `write_csv(frame\|names,cols, path)` | write CSV |
+| `read_sqlite(path, query)` | typed columns from a SQL query |
+| `read_parquet(path, {columns})` · `write_parquet(...,{compression})` | Parquet (opt-in Arrow build; `has_native("arrow")`) |
+| `read_feather(path, {columns})` · `write_feather(...)` | Arrow IPC/Feather (opt-in Arrow build) |
+
+The Arrow builtins exist only in a `BANTU_ARROW=1` build; feature-detect with `has_native("arrow")`.
+
 ## Notes
 - **Performance.** Column operations are vectorized in native C++: on a few million rows, arithmetic,
   comparisons, filters and aggregations run in well under a second; grouping and joins use hash
-  tables. Reading a 1M-row CSV takes ~1.5 s. This is what makes real data work practical in Bantu
-  (a pure-Bantu loop over the same data would be thousands of times slower).
+  tables. Reading a 1M-row CSV takes **under a second** (two-pass parser: index spans, then write
+  straight into typed buffers). Parquet reads the same in ~0.5 s. This is what makes real data work
+  practical in Bantu (a pure-Bantu loop over the same data would be thousands of times slower).
 - **Exactness.** `i64` columns hold true 64-bit integers internally; when you read a very large
   integer back into a Bantu number it becomes a float64 (exact up to 2^53), so keep large-integer
   work inside columns where possible.

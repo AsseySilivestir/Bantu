@@ -16,6 +16,7 @@
 #include "crypto_native.hpp"   // native (C++) accelerators for the hash/crypto/uuid suite
 #include "crypto_sodium.hpp"    // optional libsodium AEAD + argon2id (feature-gated)
 #include "dataframe_native.hpp" // native column primitives for the arctic data-science suite
+#include "dataframe_arrow.hpp"  // Parquet + Feather/Arrow-IPC I/O (opt-in: -DBANTU_ARROW)
 #include <iostream>
 #include <fstream>
 #include <sstream>
@@ -1833,8 +1834,15 @@ private:
             auto callEnv = std::make_shared<Environment>(fn->closure);
             callEnv->functionScope = true;   // function-local assignment boundary
 
-            // If 'this' exists in current scope, pass it along
-            if (env_->has("this")) {
+            // Propagate the caller's `this` into free functions (dynamic `this`),
+            // but NOT into a bound method — a method accessed via obj.method already
+            // carries its own receiver in its closure (see evalDotAccess), and
+            // overwriting it here would make an instance's method run with the
+            // *caller's* `this` (breaks obj-A calling obj-B.method()). Only inherit
+            // when the callee's closure has no real instance `this` of its own.
+            bool calleeHasOwnThis = fn->closure && fn->closure->has("this") &&
+                                    fn->closure->get("this").isClassInstance();
+            if (!calleeHasOwnThis && env_->has("this")) {
                 callEnv->define("this", env_->get("this"));
                 callEnv->define("self", env_->get("this"));
             }
@@ -2686,6 +2694,9 @@ private:
                     "md5","sha1","sha224","sha256","sha384","sha512",
                     "hmac_sha256","hash_file",
                     "col"   // arctic native column primitives + kernels
+#ifdef BANTU_ARROW
+                    ,"arrow"  // Parquet + Feather/Arrow-IPC I/O (opt-in build)
+#endif
                 };
                 return Value(kNatives.count(a[0].stringVal) > 0);
             }));
@@ -2806,10 +2817,10 @@ private:
                 });
             }));
 
-            // col_dtype(c) -> "f64"|"i64"|"bool"|"utf8".
+            // col_dtype(c) -> "f64"|"i64"|"bool"|"utf8"|"date"|"datetime"|"cat".
             env_->define("col_dtype", makeNative([colGuard](std::vector<Value> a) -> Value {
                 return colGuard("col_dtype", [&]() -> Value {
-                    return Value(arctic::dtypeName(arctic::asColumn(a[0])->dtype));
+                    return Value(arctic::columnTypeName(*arctic::asColumn(a[0])));
                 });
             }));
 
@@ -2876,6 +2887,58 @@ private:
                 return colGuard("col_fill_null", [&]() -> Value {
                     if (a.size() < 2) throw std::runtime_error("usage: col_fill_null(column, value)");
                     return arctic::wrap(arctic::fillNull(*arctic::asColumn(a[0]), a[1]));
+                });
+            }));
+
+            // ── Datetime / date / categorical (logical overlays) ──────────────
+            // col_to_datetime(c) parses utf8 (ISO-8601) or takes numeric epoch ms.
+            env_->define("col_to_datetime", makeNative([colGuard](std::vector<Value> a) -> Value {
+                return colGuard("col_to_datetime", [&]() -> Value {
+                    return arctic::wrap(arctic::toDatetime(*arctic::asColumn(a[0]), false));
+                });
+            }));
+            // col_to_date(c) → date (days since epoch); utf8 ISO or numeric days.
+            env_->define("col_to_date", makeNative([colGuard](std::vector<Value> a) -> Value {
+                return colGuard("col_to_date", [&]() -> Value {
+                    return arctic::wrap(arctic::toDatetime(*arctic::asColumn(a[0]), true));
+                });
+            }));
+            // col_strftime(c, fmt) → utf8 (specifiers %Y %y %m %d %H %M %S %j %%).
+            env_->define("col_strftime", makeNative([colGuard](std::vector<Value> a) -> Value {
+                return colGuard("col_strftime", [&]() -> Value {
+                    if (a.size() < 2 || !a[1].isString()) throw std::runtime_error("usage: col_strftime(column, format)");
+                    return arctic::wrap(arctic::strftimeCol(*arctic::asColumn(a[0]), a[1].stringVal));
+                });
+            }));
+            // Calendar components → i64 columns.
+            auto defDtPart = [&](const char* name, arctic::DtPart part) {
+                env_->define(name, makeNative([colGuard, name, part](std::vector<Value> a) -> Value {
+                    return colGuard(name, [&]() -> Value {
+                        return arctic::wrap(arctic::dtComponent(*arctic::asColumn(a[0]), part));
+                    });
+                }));
+            };
+            defDtPart("col_dt_year",    arctic::DtPart::YEAR);
+            defDtPart("col_dt_month",   arctic::DtPart::MONTH);
+            defDtPart("col_dt_day",     arctic::DtPart::DAY);
+            defDtPart("col_dt_hour",    arctic::DtPart::HOUR);
+            defDtPart("col_dt_minute",  arctic::DtPart::MINUTE);
+            defDtPart("col_dt_second",  arctic::DtPart::SECOND);
+            defDtPart("col_dt_weekday", arctic::DtPart::WEEKDAY);
+            // Categoricals: encode, list categories, extract raw codes.
+            env_->define("col_to_categorical", makeNative([colGuard](std::vector<Value> a) -> Value {
+                return colGuard("col_to_categorical", [&]() -> Value {
+                    return arctic::wrap(arctic::toCategorical(*arctic::asColumn(a[0])));
+                });
+            }));
+            env_->define("col_categories", makeNative([colGuard](std::vector<Value> a) -> Value {
+                return colGuard("col_categories", [&]() -> Value {
+                    return arctic::wrap(arctic::categoriesOf(*arctic::asColumn(a[0])));
+                });
+            }));
+            env_->define("col_codes", makeNative([colGuard](std::vector<Value> a) -> Value {
+                return colGuard("col_codes", [&]() -> Value {
+                    return arctic::wrap(arctic::codesOf(*arctic::asColumn(a[0])));
                 });
             }));
 
@@ -3033,16 +3096,25 @@ private:
             env_->define("read_csv", makeNative([colGuard](std::vector<Value> a) -> Value {
                 return colGuard("read_csv", [&]() -> Value {
                     if (a.empty() || !a[0].isString()) throw std::runtime_error("usage: read_csv(path, options?)");
-                    char delim = ','; bool header = true;
+                    char delim = ','; bool header = true; bool slow = false;
+                    std::vector<std::string> usecols;      // projection: only these columns
                     if (a.size() > 1 && a[1].isObject()) {
                         auto& o = *a[1].objectVal;
                         auto d = o.find("delim");  if (d != o.end() && d->second.isString() && !d->second.stringVal.empty()) delim = d->second.stringVal[0];
                         auto h = o.find("header"); if (h != o.end()) header = h->second.isTruthy();
+                        auto e = o.find("engine"); if (e != o.end() && e->second.isString()) slow = (e->second.stringVal == "slow");
+                        auto c = o.find("columns"); // projection pushdown target
+                        if (c != o.end() && c->second.isList())
+                            for (auto& cv : c->second.listVal) usecols.push_back(cv.toString());
                     }
-                    std::ifstream f(a[0].stringVal, std::ios::binary);
+                    // Fast slurp: size the file and read it in one block (the
+                    // istreambuf_iterator form is char-by-char and far slower).
+                    std::ifstream f(a[0].stringVal, std::ios::binary | std::ios::ate);
                     if (!f) throw std::runtime_error("cannot open '" + a[0].stringVal + "'");
-                    std::string text((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
-                    return arctic::readCsvText(text, delim, header);
+                    std::streamsize sz = f.tellg();
+                    std::string text;
+                    if (sz > 0) { text.resize((size_t)sz); f.seekg(0); f.read(&text[0], sz); }
+                    return arctic::readCsvText(text, delim, header, usecols, slow);
                 });
             }));
 
@@ -3127,6 +3199,78 @@ private:
                     return Value(std::move(out));
                 });
             }));
+
+#ifdef BANTU_ARROW
+            // ── Parquet + Feather/Arrow-IPC (opt-in build: -DBANTU_ARROW) ─────
+            // read_parquet(path, {columns?}) / read_feather(path, {columns?})
+            //   -> { names, cols, shape }   (projection pushed down to the reader)
+            // write_parquet(frame, path, {compression?}) | write_parquet(names, cols, path, {compression?})
+            // write_feather(frame, path)     | write_feather(names, cols, path)
+            //
+            // Extract (names, cols) from either a {names,cols} frame or separate
+            // names-list + cols-dict, mirroring write_csv.
+            auto arrowCollect = [](const Value* namesList, const Value* colsDict,
+                                   std::vector<std::string>& names, std::vector<arctic::ColumnPtr>& cols) {
+                for (auto& nv : namesList->listVal) {
+                    std::string nm = nv.toString();
+                    auto it = colsDict->objectVal->find(nm);
+                    if (it == colsDict->objectVal->end()) throw std::runtime_error("column '" + nm + "' not found");
+                    names.push_back(nm);
+                    cols.push_back(arctic::asColumn(it->second));
+                }
+            };
+            auto readColsOpt = [](const std::vector<Value>& a, size_t optIdx) {
+                std::vector<std::string> usecols;
+                if (a.size() > optIdx && a[optIdx].isObject()) {
+                    auto c = a[optIdx].objectVal->find("columns");
+                    if (c != a[optIdx].objectVal->end() && c->second.isList())
+                        for (auto& cv : c->second.listVal) usecols.push_back(cv.toString());
+                }
+                return usecols;
+            };
+
+            env_->define("read_parquet", makeNative([colGuard, readColsOpt](std::vector<Value> a) -> Value {
+                return colGuard("read_parquet", [&]() -> Value {
+                    if (a.empty() || !a[0].isString()) throw std::runtime_error("usage: read_parquet(path, options?)");
+                    return arctic::arrowio::readParquet(a[0].stringVal, readColsOpt(a, 1));
+                });
+            }));
+            env_->define("read_feather", makeNative([colGuard, readColsOpt](std::vector<Value> a) -> Value {
+                return colGuard("read_feather", [&]() -> Value {
+                    if (a.empty() || !a[0].isString()) throw std::runtime_error("usage: read_feather(path, options?)");
+                    return arctic::arrowio::readFeather(a[0].stringVal, readColsOpt(a, 1));
+                });
+            }));
+            env_->define("write_parquet", makeNative([colGuard, arrowCollect](std::vector<Value> a) -> Value {
+                return colGuard("write_parquet", [&]() -> Value {
+                    std::vector<std::string> names; std::vector<arctic::ColumnPtr> cols;
+                    std::string path, compression = "snappy"; const Value* opts = nullptr;
+                    if (a.size() >= 2 && a[0].isObject() && a[0].objectVal->count("cols") && a[0].objectVal->count("names")) {
+                        if (!a[1].isString()) throw std::runtime_error("usage: write_parquet(frame, path, options?)");
+                        arrowCollect(&a[0].objectVal->at("names"), &a[0].objectVal->at("cols"), names, cols);
+                        path = a[1].stringVal; if (a.size() > 2) opts = &a[2];
+                    } else if (a.size() >= 3 && a[0].isList() && a[1].isObject() && a[2].isString()) {
+                        arrowCollect(&a[0], &a[1], names, cols); path = a[2].stringVal; if (a.size() > 3) opts = &a[3];
+                    } else throw std::runtime_error("usage: write_parquet(frame, path, options?) or write_parquet(names, cols, path, options?)");
+                    if (opts && opts->isObject()) { auto c = opts->objectVal->find("compression"); if (c != opts->objectVal->end() && c->second.isString()) compression = c->second.stringVal; }
+                    arctic::arrowio::writeParquet(names, cols, path, compression);
+                    return Value(true);
+                });
+            }));
+            env_->define("write_feather", makeNative([colGuard, arrowCollect](std::vector<Value> a) -> Value {
+                return colGuard("write_feather", [&]() -> Value {
+                    std::vector<std::string> names; std::vector<arctic::ColumnPtr> cols; std::string path;
+                    if (a.size() >= 2 && a[0].isObject() && a[0].objectVal->count("cols") && a[0].objectVal->count("names")) {
+                        if (!a[1].isString()) throw std::runtime_error("usage: write_feather(frame, path)");
+                        arrowCollect(&a[0].objectVal->at("names"), &a[0].objectVal->at("cols"), names, cols); path = a[1].stringVal;
+                    } else if (a.size() >= 3 && a[0].isList() && a[1].isObject() && a[2].isString()) {
+                        arrowCollect(&a[0], &a[1], names, cols); path = a[2].stringVal;
+                    } else throw std::runtime_error("usage: write_feather(frame, path) or write_feather(names, cols, path)");
+                    arctic::arrowio::writeFeather(names, cols, path);
+                    return Value(true);
+                });
+            }));
+#endif // BANTU_ARROW
         }
 
         // NOTE: `push` is intentionally NOT registered as a builtin. A native fn

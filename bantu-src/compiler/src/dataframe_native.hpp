@@ -44,6 +44,8 @@
 #include <cstring>
 #include <cstdlib>
 #include <cerrno>
+#include <charconv>
+#include <cstdio>
 
 namespace arctic {
 
@@ -70,6 +72,12 @@ inline DType dtypeFromName(const std::string& s) {
     throw std::runtime_error("unknown dtype '" + s + "' (use f64, i64, bool, or utf8)");
 }
 
+// A "logical" type layered over the physical storage (DECISIONS: keeps every
+// numeric kernel working unchanged on a production interpreter). DATETIME/DATE
+// ride on the i64 buffer (epoch ms / days-since-epoch, UTC); CAT rides on the
+// i64 buffer as dictionary codes with the strings in `cats`.
+enum class Logical { NONE, DATE, DATETIME, CAT };
+
 // A typed column. Only the buffer matching `dtype` is populated; `valid[i]==0`
 // marks element i as null (the buffer still holds a harmless default there).
 struct Column {
@@ -80,8 +88,96 @@ struct Column {
     std::vector<uint8_t>     b;     // 0/1
     std::vector<std::string> s;
     std::vector<uint8_t>     valid; // 1 = present, 0 = null
+    Logical logical = Logical::NONE; // semantic overlay (see above)
+    std::vector<std::string> cats;   // CAT dictionary: code -> category string
 };
 using ColumnPtr = std::shared_ptr<Column>;
+
+// The user-facing type name: the logical name when set, else the physical dtype.
+inline std::string columnTypeName(const Column& c) {
+    switch (c.logical) {
+        case Logical::DATE:     return "date";
+        case Logical::DATETIME: return "datetime";
+        case Logical::CAT:      return "cat";
+        default:                return dtypeName(c.dtype);
+    }
+}
+// Copy the semantic overlay from src to dst (used by value-preserving ops like
+// slice/filter/take/head/tail and group-key reconstruction).
+inline void carryMeta(Column& dst, const Column& src) { dst.logical = src.logical; dst.cats = src.cats; }
+
+// ── Calendar math (Howard Hinnant's public-domain civil algorithms) ──────────
+// Fast, locale-free, no struct tm: correct for the full proleptic Gregorian range.
+inline int64_t daysFromCivil(int64_t y, unsigned m, unsigned d) {
+    y -= m <= 2;
+    const int64_t era = (y >= 0 ? y : y - 399) / 400;
+    const unsigned yoe = (unsigned)(y - era * 400);
+    const unsigned doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+    const unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    return era * 146097 + (int64_t)doe - 719468;
+}
+inline void civilFromDays(int64_t z, int64_t& y, unsigned& m, unsigned& d) {
+    z += 719468;
+    const int64_t era = (z >= 0 ? z : z - 146096) / 146097;
+    const unsigned doe = (unsigned)(z - era * 146097);
+    const unsigned yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    y = (int64_t)yoe + era * 400;
+    const unsigned doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    const unsigned mp = (5 * doy + 2) / 153;
+    d = doy - (153 * mp + 2) / 5 + 1;
+    m = mp + (mp < 10 ? 3 : -9);
+    y += (m <= 2);
+}
+// 0=Sunday..6=Saturday for a days-since-epoch count.
+inline unsigned weekdayFromDays(int64_t z) { return (unsigned)((z >= -4 ? (z + 4) % 7 : (z + 5) % 7 + 6)); }
+
+// Parse "YYYY-MM-DD", "YYYY-MM-DD[ T]HH:MM:SS[.fff]" (optional trailing 'Z').
+// Returns epoch milliseconds (UTC) on success; sets hasTime for datetime-vs-date.
+inline bool parseIsoMs(const std::string& s, int64_t& outMs, bool& hasTime) {
+    const char* p = s.c_str(); const char* e = p + s.size();
+    auto num = [&](int digits, int& out) -> bool {
+        out = 0; if (p + digits > e) return false;
+        for (int k = 0; k < digits; k++) { char c = p[k]; if (c < '0' || c > '9') return false; out = out * 10 + (c - '0'); }
+        p += digits; return true;
+    };
+    int y, mo, da, h = 0, mi = 0, se = 0, ms = 0; hasTime = false;
+    if (!num(4, y)) return false;
+    if (p >= e || *p++ != '-') return false;
+    if (!num(2, mo)) return false;
+    if (p >= e || *p++ != '-') return false;
+    if (!num(2, da)) return false;
+    if (mo < 1 || mo > 12 || da < 1 || da > 31) return false;
+    if (p < e && (*p == ' ' || *p == 'T')) {
+        p++; hasTime = true;
+        if (!num(2, h)) return false;
+        if (p >= e || *p++ != ':') return false;
+        if (!num(2, mi)) return false;
+        if (p < e && *p == ':') { p++; if (!num(2, se)) return false; }
+        if (p < e && *p == '.') { p++; int mult = 100; while (p < e && *p >= '0' && *p <= '9') { ms += (*p - '0') * mult; mult /= 10; p++; } }
+        if (h > 23 || mi > 59 || se > 60) return false;
+    }
+    if (p < e && *p == 'Z') p++;
+    if (p != e) return false;   // trailing junk → not a clean timestamp
+    int64_t days = daysFromCivil(y, (unsigned)mo, (unsigned)da);
+    outMs = days * 86400000LL + (int64_t)h * 3600000LL + (int64_t)mi * 60000LL + (int64_t)se * 1000LL + ms;
+    return true;
+}
+
+// Format epoch ms as ISO-8601 ("YYYY-MM-DD" for a date, "YYYY-MM-DD HH:MM:SS" for
+// a datetime; a non-zero ms fraction is appended as ".fff").
+inline std::string isoFromMs(int64_t ms, bool dateOnly) {
+    int64_t days = ms / 86400000LL; int64_t rem = ms % 86400000LL;
+    if (rem < 0) { rem += 86400000LL; days -= 1; }
+    int64_t y; unsigned mo, da; civilFromDays(days, y, mo, da);
+    char buf[40];
+    if (dateOnly) { std::snprintf(buf, sizeof(buf), "%04lld-%02u-%02u", (long long)y, mo, da); return buf; }
+    int h = (int)(rem / 3600000); rem %= 3600000;
+    int mi = (int)(rem / 60000); rem %= 60000;
+    int se = (int)(rem / 1000); int frac = (int)(rem % 1000);
+    if (frac) std::snprintf(buf, sizeof(buf), "%04lld-%02u-%02u %02d:%02d:%02d.%03d", (long long)y, mo, da, h, mi, se, frac);
+    else      std::snprintf(buf, sizeof(buf), "%04lld-%02u-%02u %02d:%02d:%02d", (long long)y, mo, da, h, mi, se);
+    return buf;
+}
 
 // ── Value <-> Column glue ─────────────────────────────────────────────────────
 
@@ -103,6 +199,13 @@ inline Value wrap(ColumnPtr c) { return Value(std::static_pointer_cast<void>(c),
 inline Value elemToValue(const Column& c, size_t i) {
     if (i >= c.n) throw std::runtime_error("column index out of range");
     if (!c.valid[i]) return Value();  // null
+    // Semantic overlays render as readable values (ISO strings / category text).
+    if (c.logical == Logical::DATETIME) return Value(isoFromMs(c.i64[i], false));
+    if (c.logical == Logical::DATE)     return Value(isoFromMs(c.i64[i] * 86400000LL, true));
+    if (c.logical == Logical::CAT) {
+        int64_t code = c.i64[i];
+        return (code >= 0 && (size_t)code < c.cats.size()) ? Value(c.cats[code]) : Value();
+    }
     switch (c.dtype) {
         case DType::F64:  return Value((double)c.f64[i]);
         case DType::I64:  return Value((double)c.i64[i]);   // materialize (2^53 caveat)
@@ -172,6 +275,18 @@ inline ColumnPtr sliceColumn(const Column& c, size_t start, size_t len) {
         case DType::I64:  o->i64.assign(c.i64.begin() + start, c.i64.begin() + start + len); break;
         case DType::BOOL: o->b.assign(c.b.begin() + start, c.b.begin() + start + len);       break;
         case DType::UTF8: o->s.assign(c.s.begin() + start, c.s.begin() + start + len);       break;
+    }
+    carryMeta(*o, c);
+    return o;
+}
+
+// Materialize a categorical column to a plain utf8 column (code -> category text).
+inline ColumnPtr catToUtf8(const Column& c) {
+    auto o = std::make_shared<Column>(); o->dtype = DType::UTF8; o->n = c.n; o->valid = c.valid; o->s.resize(c.n);
+    for (size_t i = 0; i < c.n; i++) {
+        if (!c.valid[i]) continue;
+        int64_t code = c.i64[i];
+        o->s[i] = (code >= 0 && (size_t)code < c.cats.size()) ? c.cats[code] : "";
     }
     return o;
 }
@@ -247,6 +362,130 @@ inline ColumnPtr fillNull(const Column& c, const Value& fill) {
             case DType::UTF8: o->s[i]   = fill.isString() ? fill.stringVal : fill.toString(); break;
         }
     }
+    return o;
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+//  DATETIME / DATE / CATEGORICAL  (logical overlays on the i64 buffer)
+// ════════════════════════════════════════════════════════════════════════════
+
+// col_to_datetime(c[, asDate]): utf8 → parsed epoch; numeric → taken as epoch
+// (ms for datetime, days for date). Unparseable / null cells become null.
+inline ColumnPtr toDatetime(const Column& c, bool asDate) {
+    auto o = std::make_shared<Column>(); o->dtype = DType::I64; o->n = c.n; o->valid.assign(c.n, 1); o->i64.resize(c.n);
+    o->logical = asDate ? Logical::DATE : Logical::DATETIME;
+    for (size_t i = 0; i < c.n; i++) {
+        if (!c.valid[i]) { o->valid[i] = 0; continue; }
+        if (c.dtype == DType::UTF8) {
+            int64_t ms; bool ht;
+            if (!parseIsoMs(c.s[i], ms, ht)) { o->valid[i] = 0; continue; }
+            o->i64[i] = asDate ? (ms / 86400000LL) : ms;
+        } else if (c.dtype == DType::I64) {
+            o->i64[i] = c.i64[i];
+        } else if (c.dtype == DType::F64) {
+            o->i64[i] = (int64_t)std::llround(c.f64[i]);
+        } else { o->valid[i] = 0; }
+    }
+    return o;
+}
+
+// Break an element into calendar parts (works for DATE and DATETIME).
+inline void dtParts(const Column& c, size_t i, int64_t& y, unsigned& mo, unsigned& da,
+                    int& h, int& mi, int& se, unsigned& wd) {
+    int64_t ms = (c.logical == Logical::DATE) ? c.i64[i] * 86400000LL : c.i64[i];
+    int64_t days = ms / 86400000LL; int64_t rem = ms % 86400000LL;
+    if (rem < 0) { rem += 86400000LL; days -= 1; }
+    civilFromDays(days, y, mo, da); wd = weekdayFromDays(days);
+    h = (int)(rem / 3600000); rem %= 3600000; mi = (int)(rem / 60000); rem %= 60000; se = (int)(rem / 1000);
+}
+
+enum class DtPart { YEAR, MONTH, DAY, HOUR, MINUTE, SECOND, WEEKDAY };
+
+// col_dt_*(c) → i64 column of a calendar component.
+inline ColumnPtr dtComponent(const Column& c, DtPart part) {
+    if (c.logical != Logical::DATE && c.logical != Logical::DATETIME)
+        throw std::runtime_error("expected a datetime/date column (use col_to_datetime first)");
+    auto o = std::make_shared<Column>(); o->dtype = DType::I64; o->n = c.n; o->valid = c.valid; o->i64.resize(c.n);
+    for (size_t i = 0; i < c.n; i++) {
+        if (!c.valid[i]) continue;
+        int64_t y; unsigned mo, da, wd; int h, mi, se; dtParts(c, i, y, mo, da, h, mi, se, wd);
+        switch (part) {
+            case DtPart::YEAR:    o->i64[i] = y; break;
+            case DtPart::MONTH:   o->i64[i] = mo; break;
+            case DtPart::DAY:     o->i64[i] = da; break;
+            case DtPart::HOUR:    o->i64[i] = h; break;
+            case DtPart::MINUTE:  o->i64[i] = mi; break;
+            case DtPart::SECOND:  o->i64[i] = se; break;
+            case DtPart::WEEKDAY: o->i64[i] = wd; break;   // 0=Sunday
+        }
+    }
+    return o;
+}
+
+// col_strftime(c, fmt) → utf8. Supports %Y %y %m %d %H %M %S %j %% (locale-free).
+inline ColumnPtr strftimeCol(const Column& c, const std::string& fmt) {
+    if (c.logical != Logical::DATE && c.logical != Logical::DATETIME)
+        throw std::runtime_error("col_strftime expects a datetime/date column");
+    auto o = std::make_shared<Column>(); o->dtype = DType::UTF8; o->n = c.n; o->valid = c.valid; o->s.resize(c.n);
+    char buf[16];
+    for (size_t i = 0; i < c.n; i++) {
+        if (!c.valid[i]) continue;
+        int64_t y; unsigned mo, da, wd; int h, mi, se; dtParts(c, i, y, mo, da, h, mi, se, wd);
+        std::string out;
+        for (size_t k = 0; k < fmt.size(); k++) {
+            if (fmt[k] == '%' && k + 1 < fmt.size()) {
+                char f = fmt[++k];
+                switch (f) {
+                    case 'Y': std::snprintf(buf, sizeof(buf), "%04lld", (long long)y); out += buf; break;
+                    case 'y': std::snprintf(buf, sizeof(buf), "%02lld", (long long)(((y % 100) + 100) % 100)); out += buf; break;
+                    case 'm': std::snprintf(buf, sizeof(buf), "%02u", mo); out += buf; break;
+                    case 'd': std::snprintf(buf, sizeof(buf), "%02u", da); out += buf; break;
+                    case 'H': std::snprintf(buf, sizeof(buf), "%02d", h); out += buf; break;
+                    case 'M': std::snprintf(buf, sizeof(buf), "%02d", mi); out += buf; break;
+                    case 'S': std::snprintf(buf, sizeof(buf), "%02d", se); out += buf; break;
+                    case 'j': { int64_t doy = daysFromCivil(y, mo, da) - daysFromCivil(y, 1, 1) + 1;
+                                std::snprintf(buf, sizeof(buf), "%03lld", (long long)doy); out += buf; break; }
+                    case '%': out.push_back('%'); break;
+                    default:  out.push_back('%'); out.push_back(f); break;
+                }
+            } else out.push_back(fmt[k]);
+        }
+        o->s[i] = out;
+    }
+    return o;
+}
+
+// col_to_categorical(c): any column → dictionary-encoded CAT (codes + cats).
+// Values are keyed by their string rendering (so utf8/number/bool all work).
+inline ColumnPtr toCategorical(const Column& c) {
+    auto o = std::make_shared<Column>(); o->dtype = DType::I64; o->n = c.n; o->valid.assign(c.n, 1);
+    o->i64.resize(c.n); o->logical = Logical::CAT;
+    std::unordered_map<std::string, int64_t> dict; dict.reserve(c.n / 4 + 8);
+    for (size_t i = 0; i < c.n; i++) {
+        if (!c.valid[i]) { o->valid[i] = 0; continue; }
+        Value v = elemToValue(c, i);
+        std::string key = v.isString() ? v.stringVal : v.toString();
+        auto it = dict.find(key);
+        int64_t code;
+        if (it == dict.end()) { code = (int64_t)o->cats.size(); o->cats.push_back(key); dict.emplace(std::move(key), code); }
+        else code = it->second;
+        o->i64[i] = code;
+    }
+    return o;
+}
+
+// col_categories(c) → utf8 column of the category strings (index = code).
+inline ColumnPtr categoriesOf(const Column& c) {
+    if (c.logical != Logical::CAT) throw std::runtime_error("col_categories expects a categorical column");
+    auto o = std::make_shared<Column>(); o->dtype = DType::UTF8; o->n = c.cats.size();
+    o->valid.assign(o->n, 1); o->s = c.cats;
+    return o;
+}
+
+// col_codes(c) → i64 column of the raw dictionary codes (null preserved).
+inline ColumnPtr codesOf(const Column& c) {
+    if (c.logical != Logical::CAT) throw std::runtime_error("col_codes expects a categorical column");
+    auto o = std::make_shared<Column>(); o->dtype = DType::I64; o->n = c.n; o->valid = c.valid; o->i64 = c.i64;
     return o;
 }
 
@@ -390,7 +629,28 @@ enum class Cmp { GT, GE, LT, LE, EQ, NE };
 
 // Elementwise comparison → bool column (null where either side is null).
 // utf8 columns compare lexicographically; otherwise numeric.
-inline ColumnPtr compareOp(const Value& A, const Value& B, Cmp op) {
+inline ColumnPtr compareOp(const Value& Ain, const Value& Bin, Cmp op) {
+    // Normalize semantic overlays so comparisons "just work":
+    //  • a categorical column compares as its category strings;
+    //  • a datetime/date column compared to an ISO string parses the string to
+    //    the same epoch unit, then compares numerically.
+    auto normalize = [](const Value& X, const Value& other) -> Value {
+        if (isColumn(X)) {
+            ColumnPtr c = asColumn(X);
+            if (c->logical == Logical::CAT) return wrap(catToUtf8(*c));
+            return X;   // datetime/date stay numeric (i64) → numeric path below
+        }
+        if (X.isString() && isColumn(other)) {
+            ColumnPtr oc = asColumn(other);
+            if (oc->logical == Logical::DATETIME || oc->logical == Logical::DATE) {
+                int64_t ms; bool ht;
+                if (parseIsoMs(X.stringVal, ms, ht))
+                    return Value((double)(oc->logical == Logical::DATE ? ms / 86400000LL : ms));
+            }
+        }
+        return X;
+    };
+    Value A = normalize(Ain, Bin), B = normalize(Bin, Ain);
     // string comparison path when either operand is a utf8 column / string scalar
     bool aStrCol = isColumn(A) && asColumn(A)->dtype == DType::UTF8;
     bool bStrCol = isColumn(B) && asColumn(B)->dtype == DType::UTF8;
@@ -571,6 +831,7 @@ inline ColumnPtr filterOp(const Value& C, const Value& M) {
         }
     }
     o->n = o->valid.size();
+    carryMeta(*o, *c);
     return o;
 }
 
@@ -595,6 +856,7 @@ inline ColumnPtr takeOp(const Value& C, const Value& Idx) {
             case DType::UTF8: o->s[i] = c->s[j]; break;
         }
     }
+    carryMeta(*o, *c);
     return o;
 }
 
@@ -673,19 +935,38 @@ inline Value aggOp(const Column& c, Agg op) {
 }
 
 // col_argsort(c, descending) → i64 index column (stable; nulls last).
+// Numeric/datetime/date/bool columns pre-materialize a double key array so the
+// hot comparator is a single branch (no per-compare dtype/null dispatch); utf8
+// (incl. categorical rendered to text) compares by string.
 inline ColumnPtr argsortOp(const Column& c, bool desc) {
     std::vector<int64_t> idx(c.n);
     for (size_t i=0;i<c.n;i++) idx[i] = (int64_t)i;
-    auto less = [&](int64_t a, int64_t b) -> bool {
-        bool na=!c.valid[a], nb=!c.valid[b];
-        if (na || nb) { if (na && nb) return a<b; return nb; }   // nulls last, stable
-        if (c.dtype == DType::UTF8) { int cmp=c.s[a].compare(c.s[b]); if(cmp!=0) return desc? cmp>0 : cmp<0; return a<b; }
-        double x = c.dtype==DType::F64?c.f64[a]:(c.dtype==DType::I64?(double)c.i64[a]:(c.b[a]?1:0));
-        double y = c.dtype==DType::F64?c.f64[b]:(c.dtype==DType::I64?(double)c.i64[b]:(c.b[b]?1:0));
-        if (x != y) return desc? x>y : x<y;
-        return a<b;   // stable
-    };
-    std::sort(idx.begin(), idx.end(), less);
+    ColumnPtr strc;   // holds a temp utf8 column when sorting a categorical
+    const Column* sc = &c;
+    if (c.logical == Logical::CAT) { strc = catToUtf8(c); sc = strc.get(); }
+
+    if (sc->dtype == DType::UTF8) {
+        const Column& s = *sc;
+        auto less = [&](int64_t a, int64_t b) -> bool {
+            bool na=!s.valid[a], nb=!s.valid[b];
+            if (na || nb) { if (na && nb) return a<b; return nb; }
+            int cmp=s.s[a].compare(s.s[b]); if(cmp!=0) return desc? cmp>0 : cmp<0; return a<b;
+        };
+        std::sort(idx.begin(), idx.end(), less);
+    } else {
+        std::vector<double> key(c.n);
+        for (size_t i=0;i<c.n;i++)
+            key[i] = c.dtype==DType::F64?c.f64[i]:(c.dtype==DType::I64?(double)c.i64[i]:(c.b[i]?1:0));
+        const uint8_t* valid = c.valid.data();
+        auto less = [&](int64_t a, int64_t b) -> bool {
+            bool na=!valid[a], nb=!valid[b];
+            if (na || nb) { if (na && nb) return a<b; return nb; }   // nulls last, stable
+            double x=key[a], y=key[b];
+            if (x != y) return desc? x>y : x<y;
+            return a<b;   // stable
+        };
+        std::sort(idx.begin(), idx.end(), less);
+    }
     auto o = std::make_shared<Column>(); o->dtype = DType::I64; o->n = c.n; o->valid.assign(c.n,1); o->i64 = std::move(idx);
     return o;
 }
@@ -796,6 +1077,7 @@ inline Value groupAgg(const std::vector<ColumnPtr>& keys, const Column& val, Agg
             switch (kc->dtype) { case DType::F64:oc->f64[j]=kc->f64[r];break; case DType::I64:oc->i64[j]=kc->i64[r];break;
                                  case DType::BOOL:oc->b[j]=kc->b[r];break; case DType::UTF8:oc->s[j]=kc->s[r];break; }
         }
+        carryMeta(*oc, *kc);   // group keys keep datetime/categorical rendering
         keyCols.push_back(wrap(oc));
     }
     // aggregate each group by gathering the value column for its rows, then
@@ -1015,8 +1297,10 @@ inline ColumnPtr buildColumnFromStrings(const std::vector<std::string>& vals,
         [&](size_t i) { return isNull[i] != 0; });
 }
 
-// read a CSV string → { "names":[...], "cols":{name:column}, "shape":[rows,cols] }.
-inline Value readCsvText(const std::string& text, char delim, bool header) {
+// ── reference (slow) reader: parse to a row/field matrix, then build columns ──
+// Kept for the differential test (fast engine must equal this on well-formed CSV)
+// and as a fallback via read_csv(path, {"engine":"slow"}).
+inline Value readCsvTextSlow(const std::string& text, char delim, bool header) {
     auto rows = parseCsv(text, delim);
     // Drop blank lines (a single empty, unquoted field) so trailing/among-data
     // newlines don't become spurious null rows.
@@ -1063,6 +1347,216 @@ inline Value readCsvText(const std::string& text, char delim, bool header) {
     out["cols"] = Value(std::move(cols));
     out["shape"] = Value(std::vector<Value>{ Value((double)nrows), Value((double)ncols) });
     return Value(std::move(out));
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+//  TWO-PASS FAST CSV READER (perf: 1M rows < 1s)
+//  ---------------------------------------------------------------------------
+//  Pass 1 (index): a single scan records, per field, a raw byte span
+//  [offset,offset+len) into the source buffer plus two flag bits — no per-field
+//  std::string is allocated. Rows are stored CSR-style (rowStart[r]..rowStart[r+1]
+//  are the field indices of row r), which handles ragged rows for free.
+//  Pass 2 (materialize): for each *kept* column we infer its dtype and fill the
+//  typed buffer directly. Clean fields (no quote, no '\r') use the raw span with
+//  zero copying during inference/fill except the final value; only "dirty" fields
+//  (quotes/escapes/'\r') are reprocessed through the RFC-4180 rules to reconstruct
+//  their exact text — identical to the reference parser above.
+//
+//  Flag bits per field:  bit0 = quoted (had a real '"' → empty means "", not null)
+//                        bit1 = dirty  (quote or '\r' → needs reprocessing)
+// ════════════════════════════════════════════════════════════════════════════
+inline Value readCsvFast(const std::string& text, char delim, bool header,
+                         const std::vector<std::string>& usecols) {
+    const char* T = text.data();
+    const size_t N = text.size();
+
+    // ── Pass 1: index field spans (CSR by row) ──────────────────────────────
+    // One packed record per field (12 bytes) → a single push_back per field, and
+    // cache-friendly access in Pass 2.  flag bit0 = quoted, bit1 = dirty.
+    struct Field { uint32_t off; uint32_t len; uint8_t flag; };
+    std::vector<Field>    fields;
+    std::vector<uint32_t> rowStart;        // field-index at the start of each row
+    fields.reserve(N / 8 + 16);            // rough reserve to cut reallocations
+    rowStart.push_back(0);
+
+    size_t i = 0, fStart = 0, fieldsInRow = 0;
+    bool inQ = false; uint8_t flag = 0;
+    auto pushField = [&](size_t endPos) {
+        fields.push_back(Field{ (uint32_t)fStart, (uint32_t)(endPos - fStart), flag });
+        fieldsInRow++;
+    };
+    auto pushRow = [&]() {
+        // Drop a blank line: exactly one empty, unquoted field.
+        if (fieldsInRow == 1 && fields.back().len == 0 && (fields.back().flag & 1) == 0) {
+            fields.pop_back();
+        } else {
+            rowStart.push_back((uint32_t)fields.size());
+        }
+        fieldsInRow = 0;
+    };
+    while (i < N) {
+        char c = T[i];
+        if (inQ) {
+            if (c == '"') {
+                if (i + 1 < N && T[i+1] == '"') { i += 2; continue; }
+                inQ = false; i++; continue;
+            }
+            i++; continue;
+        }
+        if (c == '"')   { inQ = true; flag |= 0b11; i++; continue; }   // quoted + dirty
+        if (c == delim) { pushField(i); i++; fStart = i; flag = 0; continue; }
+        if (c == '\r')  { flag |= 0b10; i++; continue; }               // dirty (stripped later)
+        if (c == '\n')  { pushField(i); pushRow(); i++; fStart = i; flag = 0; continue; }
+        i++;
+    }
+    // Flush a trailing field/row when the file did not end in a newline.
+    if (i > fStart || (flag & 1) || fieldsInRow > 0) { pushField(N); pushRow(); }
+
+    size_t totalRows = rowStart.size() - 1;
+    ObjectMap out; std::vector<Value> names; ObjectMap cols;
+    if (totalRows == 0) {
+        out["names"] = Value(std::move(names));
+        out["cols"] = Value(ObjectMap{});
+        out["shape"] = Value(std::vector<Value>{ Value(0.0), Value(0.0) });
+        return Value(std::move(out));
+    }
+
+    // widest row = column count
+    size_t ncols = 0;
+    for (size_t r = 0; r < totalRows; r++) ncols = std::max(ncols, (size_t)(rowStart[r+1] - rowStart[r]));
+
+    // Reconstruct a field's exact text into `dst` (fast path = raw span copy).
+    auto fieldText = [&](size_t fieldIdx, std::string& dst) {
+        uint32_t off = fields[fieldIdx].off, len = fields[fieldIdx].len;
+        if ((fields[fieldIdx].flag & 0b10) == 0) { dst.assign(T + off, len); return; }
+        dst.clear(); dst.reserve(len);
+        bool q = false; size_t e = off + len;
+        for (size_t k = off; k < e; ) {
+            char c = T[k];
+            if (q) {
+                if (c == '"') { if (k+1 < e && T[k+1] == '"') { dst.push_back('"'); k += 2; continue; } q = false; k++; continue; }
+                dst.push_back(c); k++; continue;
+            }
+            if (c == '"')  { q = true; k++; continue; }
+            if (c == '\r') { k++; continue; }
+            dst.push_back(c); k++;
+        }
+    };
+
+    // column names + header handling
+    std::vector<std::string> colNames(ncols);
+    size_t dataStart = 0;
+    std::string scratch;
+    if (header) {
+        uint32_t hs = rowStart[0], he = rowStart[1];
+        for (size_t j = 0; j < ncols; j++) {
+            if (hs + j < he) { fieldText(hs + j, scratch); colNames[j] = scratch.empty() ? ("col"+std::to_string(j)) : scratch; }
+            else colNames[j] = "col" + std::to_string(j);
+        }
+        dataStart = 1;
+    } else {
+        for (size_t j = 0; j < ncols; j++) colNames[j] = "col" + std::to_string(j);
+    }
+    size_t nrows = totalRows - dataStart;
+
+    // projection: which columns to actually materialize
+    std::vector<char> keep(ncols, 1);
+    if (!usecols.empty()) {
+        std::unordered_set<std::string> want(usecols.begin(), usecols.end());
+        for (size_t j = 0; j < ncols; j++) keep[j] = want.count(colNames[j]) ? 1 : 0;
+    }
+
+    // ── Pass 2: build each kept column directly from the byte spans ──────────
+    // Numbers are parsed in place (from_chars for ints; a small reused buffer +
+    // strtod for floats) so a numeric column allocates no per-cell std::string.
+    std::string recon;   // reused reconstruction buffer for dirty fields
+    std::string numbuf;  // reused, null-terminated, for strtod
+    // Return a pointer/length view of a field's exact text (clean = raw span).
+    auto viewOf = [&](size_t fi, const char*& p, size_t& l) {
+        if ((fields[fi].flag & 0b10) == 0) { p = T + fields[fi].off; l = fields[fi].len; return; }
+        fieldText(fi, recon); p = recon.data(); l = recon.size();
+    };
+    auto isIntSpan = [](const char* p, size_t l) -> bool {
+        if (l == 0) return false;
+        long long v; auto r = std::from_chars(p, p + l, v);
+        return r.ec == std::errc() && r.ptr == p + l;
+    };
+    auto isFloatSpan = [&](const char* p, size_t l) -> bool {
+        if (l == 0) return false;
+        numbuf.assign(p, l);
+        char* end = nullptr; errno = 0;
+        std::strtod(numbuf.c_str(), &end);
+        return end == numbuf.c_str() + l;
+    };
+    auto isBoolSpan = [](const char* p, size_t l) -> bool {
+        return (l == 4 && std::memcmp(p, "true", 4) == 0) ||
+               (l == 5 && std::memcmp(p, "false", 5) == 0);
+    };
+
+    for (size_t j = 0; j < ncols; j++) {
+        if (!keep[j]) continue;
+        auto fieldOf = [&](size_t r) -> long long {   // field index or -1 if missing
+            uint32_t rs = rowStart[dataStart + r], re = rowStart[dataStart + r + 1];
+            return (rs + j < re) ? (long long)(rs + j) : -1;
+        };
+        auto isNullAt = [&](size_t r) -> bool {
+            long long fi = fieldOf(r);
+            if (fi < 0) return true;
+            return fields[fi].len == 0 && (fields[fi].flag & 1) == 0;   // empty & unquoted → null
+        };
+
+        // Pass 2a: infer dtype (short-circuit i64 → f64 → bool → utf8).
+        bool anyVal = false, allInt = true, allFloat = true, allBool = true;
+        for (size_t r = 0; r < nrows; r++) {
+            if (isNullAt(r)) continue;
+            const char* p; size_t l; viewOf((size_t)fieldOf(r), p, l);
+            anyVal = true;
+            if (allInt)        { if (!isIntSpan(p,l))   { allInt=false;   if (!isFloatSpan(p,l)) { allFloat=false; if (!isBoolSpan(p,l)) allBool=false; } } }
+            else if (allFloat) { if (!isFloatSpan(p,l)) { allFloat=false; if (!isBoolSpan(p,l)) allBool=false; } }
+            else if (allBool)  { if (!isBoolSpan(p,l)) allBool=false; }
+            if (!allInt && !allFloat && !allBool) break;
+        }
+        DType dt = DType::UTF8;
+        if (anyVal) { if (allInt) dt=DType::I64; else if (allFloat) dt=DType::F64; else if (allBool) dt=DType::BOOL; }
+
+        // Pass 2b: fill the typed buffer.
+        auto c = std::make_shared<Column>(); c->dtype = dt; c->n = nrows; c->valid.assign(nrows, 1);
+        switch (dt) { case DType::F64:c->f64.resize(nrows);break; case DType::I64:c->i64.resize(nrows);break;
+                      case DType::BOOL:c->b.resize(nrows);break; case DType::UTF8:c->s.resize(nrows);break; }
+        for (size_t r = 0; r < nrows; r++) {
+            if (isNullAt(r)) { c->valid[r] = 0; continue; }
+            long long fi = fieldOf(r);
+            if (dt == DType::UTF8) { fieldText((size_t)fi, c->s[r]); continue; }
+            const char* p; size_t l; viewOf((size_t)fi, p, l);
+            switch (dt) {
+                case DType::I64:  { long long v=0; std::from_chars(p, p+l, v); c->i64[r] = v; break; }
+                case DType::F64:  { numbuf.assign(p, l); c->f64[r] = std::strtod(numbuf.c_str(), nullptr); break; }
+                case DType::BOOL: c->b[r] = (l == 4) ? 1 : 0; break;   // "true" vs "false"
+                default: break;
+            }
+        }
+        names.push_back(Value(colNames[j]));
+        cols[colNames[j]] = wrap(c);
+    }
+    // If projecting, keep the requested order.
+    if (!usecols.empty()) {
+        std::vector<Value> ordered;
+        for (auto& nm : usecols) if (cols.count(nm)) ordered.push_back(Value(nm));
+        names = std::move(ordered);
+    }
+    size_t ncolsFinal = names.size();
+    out["names"] = Value(std::move(names));
+    out["cols"] = Value(std::move(cols));
+    out["shape"] = Value(std::vector<Value>{ Value((double)nrows), Value((double)ncolsFinal) });
+    return Value(std::move(out));
+}
+
+// read a CSV string → { "names":[...], "cols":{name:column}, "shape":[rows,cols] }.
+// Default engine is the fast two-pass reader; `slow` selects the reference parser.
+inline Value readCsvText(const std::string& text, char delim, bool header,
+                         const std::vector<std::string>& usecols = {}, bool slow = false) {
+    if (slow) return readCsvTextSlow(text, delim, header);
+    return readCsvFast(text, delim, header, usecols);
 }
 
 // Escape a CSV field if it contains the delimiter, a quote, or a newline.

@@ -105,6 +105,30 @@ if [ "${BANTU_SODIUM:-0}" = "1" ]; then
     fi
 fi
 
+# ── Optional: Apache Arrow (Parquet + Feather/IPC), OFF by default ────────
+# Enable with:  BANTU_ARROW=1 bash build-mac.sh
+# Kept opt-in so the default binary gains NO new runtime dependency (Arrow is a
+# heavy library). When enabled we link the shared libarrow/libparquet from brew.
+if [ "${BANTU_ARROW:-0}" = "1" ]; then
+    # Arrow 14+ headers need C++20 (std::span/popcount). The last -std wins, so
+    # appending here upgrades the whole (opt-in) build; the default stays C++17.
+    CPP_FLAGS+=( -std=c++20 )
+    if command -v pkg-config >/dev/null 2>&1 && pkg-config --exists arrow parquet; then
+        echo "  Apache Arrow: $(pkg-config --modversion arrow) (Parquet + Feather)"
+        CPP_FLAGS+=( -DBANTU_ARROW $(pkg-config --cflags arrow parquet) )
+        LINK_LIBS+=( $(pkg-config --libs arrow parquet) )
+    else
+        ARROW_PREFIX="$(brew --prefix apache-arrow 2>/dev/null || true)"
+        if [ -z "$ARROW_PREFIX" ] || [ ! -f "$ARROW_PREFIX/include/arrow/api.h" ]; then
+            die "BANTU_ARROW=1 but Apache Arrow not found" \
+                "Install it first:  brew install apache-arrow"
+        fi
+        echo "  Apache Arrow: $ARROW_PREFIX (Parquet + Feather)"
+        CPP_FLAGS+=( -DBANTU_ARROW -I"$ARROW_PREFIX/include" )
+        LINK_LIBS+=( -L"$ARROW_PREFIX/lib" -larrow -lparquet )
+    fi
+fi
+
 # ═══════════════════════════════════════════════════════════════════════
 #  Build
 # ═══════════════════════════════════════════════════════════════════════

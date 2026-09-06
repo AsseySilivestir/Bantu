@@ -71,3 +71,47 @@ green; results logged in CHANGELOG.
 **Why:** stress testing is what surfaced the function-local scoping bug in the crypto work; scale +
 memory-churn + fuzz + malformed inputs catch what unit tests miss. **Implication:** slower per phase,
 but the foundations are trustworthy before `arctic` is built on them.
+
+---
+
+## Performance push (2026-09-07)
+
+### B1 — Two-pass CSV: index spans, then materialize
+**Decision:** The fast reader scans once to record per-field byte spans (packed `Field{off,len,flag}`,
+CSR by row), then builds each column directly — numbers parsed from the span (`from_chars` for i64, a
+reused buffer + `strtod` for f64), only utf8 cells allocate. **Why:** the old reader's per-field
+`std::string` allocation dominated; eliminating it (plus a one-shot file slurp) took 1M rows from
+~1.5 s to **0.89 s**. Quoted/`""`/`\r` fields are "dirty" and reprocessed lazily so output is
+byte-identical to the reference parser (differential-tested).
+
+### B2 — datetime/date/categorical as LOGICAL OVERLAYS, not new DType values
+**Decision:** Add a `Logical{NONE,DATE,DATETIME,CAT}` tag + `cats` dictionary to `Column`; physical
+storage stays `i64` (epoch ms / days / dict codes). **Why:** adding enum values would force new arms
+in every `switch(dtype)` across the kernels — high risk on a production interpreter. Overlays keep
+every numeric kernel (arith/compare/agg/sort/group/join) working unchanged; only `elemToValue`, a few
+overlay-aware spots (compare vs ISO string / category text), and the new builtins consult the tag.
+Value-preserving ops carry the overlay via `carryMeta`. **Implication:** `col_min/max` on a datetime
+returns raw epoch ms (documented); use `col_strftime` to render.
+
+### B3 — Fixed a language-wide OOP `this`-binding bug (interpreter)
+**Decision:** In `evalCall`, stop overwriting a **bound method's** `this` with the caller's; inherit
+the caller's `this` only when the callee's own closure has no instance `this`. **Why:** the old code
+made `a.method()` run any nested `b.other()` with `a` as `this` — any object calling another object's
+method from inside a method was broken. The LazyFrame executor needs cross-instance calls; the fix is
+minimal and backward-compatible (free functions still get dynamic `this`). Verified against
+inheritance/`super`/orm; full regression green. (Pre-existing list-field index-mutation quirk is
+unrelated and left as-is.)
+
+### B4 — Lazy execution routed through free functions
+**Decision:** `LazyFrame.collect()` and `LazyGroupBy.agg()` delegate the actual DataFrame-method calls
+to free functions (`_runLazy`, `_lazyAppend`). **Why:** even with B3, keeping cross-instance calls in
+free functions is the clean seam; the optimizer does predicate + projection pushdown, then reuses the
+eager ops so there is exactly one implementation of each operation.
+
+### B5 — Parquet/Arrow native + feature-gated (BANTU_ARROW), C++20 for that build only
+**Decision:** Parquet/Feather live in `dataframe_arrow.hpp` under `#ifdef BANTU_ARROW`, linked opt-in
+(mirrors `BANTU_SODIUM`); that build is bumped to C++20 (Arrow 14+ headers need `std::span`), the
+default stays C++17 with no new dependency. **Why:** Parquet (Thrift + encodings + codecs) and Arrow
+IPC (flatbuffers) are not sensibly implementable in an interpreter, and the dependency is heavy — so
+it must be strictly opt-in. arctic feature-detects via `has_native("arrow")`. Categoricals are written
+as their category text (round-trip values; re-encode with `col_to_categorical`).

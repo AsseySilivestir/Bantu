@@ -6,6 +6,96 @@ tracks granular per-phase progress, including feature- and stress-test results.
 
 ## [Unreleased]
 
+### 2026-09-07 — Performance push (combined effort): fast CSV · datetime/categorical · lazy · Arrow/Parquet
+
+#### Phase A — two-pass fast CSV reader — ✅ `tests/arctic_csv2_test.b` 34/34
+- **[feature]** New `readCsvFast` (dataframe_native.hpp): a single indexing scan records per-field
+  byte spans (packed 12-byte `Field{off,len,flag}`, CSR by row — handles ragged rows for free) with
+  **no per-field `std::string`**; a second pass infers each column's dtype and fills the typed buffer
+  directly. Numbers parse straight from the span (`std::from_chars` for i64; a reused null-terminated
+  buffer + `strtod` for f64); only genuine `utf8` cells allocate. Quotes/`""`/embedded newlines and
+  `\r` are handled by lazily reprocessing just the "dirty" fields, so output is **byte-identical to
+  the reference parser** on well-formed CSV (differential test).
+- **[feature]** `read_csv(path, {columns:[...]})` — **projection pushdown**: unused columns are never
+  materialized (the scan still runs, but inference/allocation is skipped). Also `{engine:"slow"}`
+  selects the reference parser (kept for the differential test / fallback).
+- **[patch]** `read_csv` now slurps the file in one sized `read()` instead of the char-by-char
+  `istreambuf_iterator` form (that alone was ~600 ms of the old time).
+- **Tests:** feature 34/34 (types/inference, quotes/escapes/embedded delim+newline, missing→null vs
+  quoted-empty→"", header on/off, custom delim, ragged rows, projection, CRLF, empty/unterminated).
+  **Stress:** 1M-row / 27 MB CSV read **894 ms (< 1 s target met)** — down from 1.5 s reference;
+  indexing scan alone 306 ms (was 940 ms); projected 2-of-5-column read 698 ms. Full regression green
+  (lang, scope, else-if, column, kernels, io, csv2, hash, crypto, uuid, random, orm, arctic pkg).
+
+#### Phase B — datetime / date / categorical dtypes — ✅ `arctic_datetime_test.b` 24/24, `arctic_categorical_test.b` 18/18
+- **[decision]** Implemented as **logical overlays on the physical i64 buffer** (a `Logical` tag +
+  `cats` dictionary on `Column`), not new `DType` enum values. This keeps every existing numeric
+  kernel (arith/compare/agg/sort/group/join) working unchanged — the right call for a production
+  interpreter — while `elemToValue` and a handful of new builtins consult the overlay. DATETIME =
+  epoch ms (UTC), DATE = days since epoch, CAT = dictionary codes.
+- **[feature]** New builtins: `col_to_datetime`, `col_to_date`, `col_strftime` (%Y %y %m %d %H %M %S
+  %j %%), `col_dt_year/month/day/hour/minute/second/weekday`, `col_to_categorical`, `col_categories`,
+  `col_codes`. `col_dtype` now reports `date`/`datetime`/`cat`. Calendar math uses Hinnant's
+  locale-free civil-date algorithms (no `struct tm`, correct across the range). ISO-8601 parser
+  handles date-only and `YYYY-MM-DD[ T]HH:MM:SS[.fff][Z]`; unparseable cells → null.
+- **[feature]** Comparisons "just work": a datetime/date column vs an ISO **string** parses the
+  string to the same epoch unit; a **categorical** column compares as its category text. Value-
+  preserving ops (`slice/filter/take/head/tail`, group-key reconstruction) carry the overlay via
+  `carryMeta`, so filtered/grouped datetime & categorical columns still render correctly.
+- **[patch]** `col_argsort` gained a typed key path (pre-materialized double keys / string keys) —
+  one-branch hot comparator instead of per-compare dtype+null dispatch. Speeds `DataFrame.sort`
+  across all dtypes.
+- **Tests:** feature 24 + 18 (round-trip, components hand-verified incl. weekday, strftime, ISO
+  comparison, chronological sort, leap day, null propagation, categories/codes, cat groupby with
+  text-rendered keys, null-through-encoding). **Stress (3M rows):** `col_to_datetime` 231 ms,
+  components 233 ms, sort 1.53 s (down from 2.5 s after the typed key path); categorical groupby
+  correctness verified (grouped sums == full sum, 8 groups); 200k-column build/drop churn kept RSS
+  flat (shared_ptr RAII frees). Full regression green.
+
+#### Phase C — LazyFrame + query optimizer (pure Bantu) — ✅ `tests/arctic_lazy_test.b` 14/14
+- **[feature]** `LazyFrame`/`LazyGroupBy` classes + `arctic.scan_csv(path)` and `DataFrame.lazy()`.
+  A pipeline (`filter`/`query`, `select`, `with_column`, `sort`, `head`/`tail`, `groupby().agg()`) is
+  recorded and nothing runs until `.collect()`. `.explain()` prints the optimized plan. All execution
+  reuses the eager DataFrame ops.
+- **[feature]** Optimizer, two rewrites: **predicate pushdown** hoists filters that reference only
+  base columns ahead of sorts/derivations (filters on a `with_column` output correctly stay put);
+  **projection pushdown** computes the minimal column set the pipeline needs and pushes it into the
+  scan via `read_csv(columns=)`, so unused columns are never parsed (skipped when a `with_column`
+  could touch any column).
+- **[bug fix] (interpreter, OOP `this` binding)** Found and fixed a latent, language-wide bug:
+  `evalCall` overwrote a **bound method's** `this` with the *caller's* `this` on every call, so any
+  object calling another object's method from inside a method ran with the wrong receiver
+  (`a.method()` where the body calls `b.other()` saw `a`, not `b`). The existing suites never hit it
+  (they only call methods on `this` or free functions); the LazyFrame executor did. Fix: inherit the
+  caller's `this` only when the callee's closure has no real instance `this` of its own — free
+  functions still get dynamic `this` (backward compatible), bound methods keep their receiver.
+  Verified with inheritance/`super`/cross-instance tests; **full regression green incl. orm (OOP)**.
+- **Tests:** feature 14/14 (lazy == eager for filter/select/sort, groupby.agg, with_column+derived
+  filter; predicate & projection pushdown via `explain`; scan projection returns only needed cols).
+  **Stress (1M rows):** lazy `scan_csv → filter → groupby.agg` **903 ms vs 1173 ms eager**
+  (projection reads 2 of 5 columns), identical grouped totals. Full regression green.
+
+#### Phase D — Parquet + Feather/Arrow-IPC (native, feature-gated) — ✅ `tests/arctic_arrow_test.b` 19/19
+- **[feature]** New `bantu-src/compiler/src/dataframe_arrow.hpp` (entirely under `#ifdef BANTU_ARROW`):
+  converts arctic `Column` ↔ `arrow::Array` (layouts map ~1:1) for all dtypes incl. datetime
+  (timestamp[ms,UTC]), date (date32), categorical (written as category text), null bitmaps both ways.
+- **[feature]** Builtins (compiled only with Arrow): `read_parquet(path,{columns?})`,
+  `write_parquet(frame|names,cols,path,{compression?})` (snappy/zstd/gzip/none),
+  `read_feather(path,{columns?})`, `write_feather(...)`. `read_parquet`/`read_feather` honor
+  `columns` (projection pushed to the reader). `has_native("arrow")` is true only in this build, so
+  the arctic package feature-detects and errors clearly on a default binary.
+- **[build]** `build-mac.sh` gains an opt-in `BANTU_ARROW=1` branch (mirrors `BANTU_SODIUM`): links
+  libarrow/libparquet via pkg-config/brew and bumps that build to **C++20** (Arrow 14+ headers need
+  `std::span`/`popcount`; last `-std` wins so the **default build stays C++17 with no new dep**).
+- **Tests:** feature 19/19 (round-trip all dtypes + nulls for Parquet & Feather; datetime/date/leap
+  day; categorical→text; column projection). **Stress (1M rows):** write parquet 734 ms; read full
+  **471 ms vs 1081 ms CSV** (2.3×); projected 2-of-5-col read **245 ms**; file **11 MB vs 27 MB CSV**
+  (snappy); parquet sum == csv sum. Default build compiles unchanged with `has_native("arrow")`=false;
+  full regression green on both builds.
+- **[deferred]** Predicate/row-group pushdown into the Parquet reader (skip row-groups by min/max
+  stats) — the reader currently does projection; the lazy optimizer already computes predicates, so
+  this is a wiring follow-up. Values are always correct (filter applied after read).
+
 ### 2026-08-28 — arctic package (pure Bantu) + two interpreter fixes
 - **[feature]** `arctic/arctic.b` — the DataFrame library, written in **pure Bantu** on the `col_*`
   atoms: `Series` and `DataFrame` classes with method chaining, a `GroupBy` with `agg`, a

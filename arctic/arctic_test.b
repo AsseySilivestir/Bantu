@@ -117,6 +117,39 @@ ok(len($table) > 0, "show produced text");
 ok(contains($table, "name"), "show includes a header");
 
 print("");
+print("-- datetime & categorical Series helpers --");
+$dts = arctic.series("ts", ["2020-01-15 10:30:00", "2021-12-31 23:59:59", "2019-07-04"], "utf8").to_datetime();
+eq($dts.dtype(), "datetime", "series.to_datetime()");
+eq($dts.year().get(0), 2020, "series.year()");
+eq($dts.strftime("%Y-%m").get(1), "2021-12", "series.strftime()");
+$catS = arctic.series("region", ["EU", "US", "EU", "AS"], "utf8").to_categorical();
+eq($catS.dtype(), "cat", "series.to_categorical()");
+eq(str($catS.categories().to_list()), "[EU, US, AS]", "series.categories()");
+
+print("");
+print("-- lazy pipeline (scan/eager) --");
+$lz = $df.lazy().filter("amount > 1000").select(["name", "amount"]).sort("amount", true).collect();
+eq(str($lz.get("name").to_list()), "[Eve, Cy, Ada]", "lazy filter/select/sort");
+$lg = $df.lazy().groupby("region").agg([["amount", "sum", "total"]]).collect();
+eq($lg.height(), 2, "lazy groupby");
+
+print("");
+print("-- Parquet / Feather round-trip (if Arrow build) --");
+if (has_native("arrow")) {
+    $df.to_parquet("/tmp/arctic_pkg.parquet");
+    $pq = arctic.read_parquet("/tmp/arctic_pkg.parquet", null);
+    eq($pq.height(), 5, "parquet round-trip rows");
+    eq($pq.get("amount").sum(), 7400, "parquet round-trip amount sum");
+    $lzp = arctic.scan_parquet("/tmp/arctic_pkg.parquet").select(["region", "amount"]).collect();
+    eq(str($lzp.columns()), "[region, amount]", "scan_parquet projection");
+    $df.to_feather("/tmp/arctic_pkg.feather");
+    $ff = arctic.read_feather("/tmp/arctic_pkg.feather", null);
+    eq($ff.height(), 5, "feather round-trip rows");
+} else {
+    print("  (skipped: no Arrow build)");
+}
+
+print("");
 print("========================================");
 print("  PASS: " + str($R.pass) + "   FAIL: " + str($R.fail));
 print("========================================");

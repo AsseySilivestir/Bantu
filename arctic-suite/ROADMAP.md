@@ -59,7 +59,21 @@ write straight into typed buffers) to skip string storage for numeric columns an
 - [x] **FOUNDATIONS COMPLETE** — the `col_*` atoms + first-class `else if` are ready; the `arctic`
   package can now be written in pure Bantu on top of them (next effort)
 
+## Performance push (2026-09-07) — one combined effort ✅
+| Phase | What | Tests | Status |
+|---|---|---|---|
+| A — fast CSV | two-pass reader (index spans → typed buffers), `columns=` projection, one-shot slurp | `arctic_csv2_test.b` 34/34 | [x] |
+| B — datetime/date/categorical | logical overlays on i64 + `col_to_datetime/to_date/strftime/dt_*`, `col_to_categorical/categories/codes`; overlay-aware compare/sort/group | `arctic_datetime_test.b` 24/24, `arctic_categorical_test.b` 18/18 | [x] |
+| C — lazy frame + optimizer | `LazyFrame`/`LazyGroupBy`, `scan_csv`/`scan_parquet`/`.lazy()`, predicate + projection pushdown, `explain()` | `arctic_lazy_test.b` 14/14 | [x] |
+| C — interpreter bug fix | `this` no longer leaks from a bound method's caller (evalCall) — language-wide OOP correctness | full regression incl. orm | [x] |
+| D — Parquet + Feather | native `dataframe_arrow.hpp` (opt-in `BANTU_ARROW=1`), `read/write_parquet`, `read/write_feather`, projection | `arctic_arrow_test.b` 19/19 | [x] |
+| E — package + docs | Series datetime/cat helpers, `to_parquet/to_feather`, `scan_parquet`, `parse_dates`; docs; Windows build branch | `arctic/arctic_test.b` 48/48 | [x] |
+
+Perf: 1M-row CSV read **894 ms** (< 1 s); 3M-row datetime parse 231 ms + components 233 ms; lazy
+projection 903 ms vs 1173 ms eager; Parquet read **471 ms vs 1081 ms CSV** (245 ms projected),
+file 11 MB vs 27 MB. Full regression green on both default and Arrow builds.
+
 ## Deferred (next efforts)
-- The `arctic` package itself (DataFrame/Series/Expr, method chaining, `query()` DSL, describe,
-  pretty-print, tutorial) — pure Bantu on these atoms.
-- Lazy frame + query optimizer; Parquet/Arrow (feature-gated); datetime & categorical dtypes.
+- Predicate/row-group pushdown into the Parquet reader (skip row-groups by min/max stats).
+- Window functions, `pivot`, `unique`; timezone database (currently UTC-only); Arrow Flight;
+  streaming/out-of-core execution.
