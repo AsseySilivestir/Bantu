@@ -44,3 +44,8 @@ vapid.json
 **/vapid.json
 push_subscriptions.db
 subscriptions.db
+# Code signing secrets — DO NOT COMMIT
+*.key
+*.pfx
+*.crt
+bantu-codesign.*

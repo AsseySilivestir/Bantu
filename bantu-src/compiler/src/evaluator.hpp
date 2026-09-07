@@ -413,6 +413,482 @@ static std::unordered_map<int, std::fstream>& bantuFileTable() {
 }
 static int bantuNextFileId = 1;
 
+// ─── UDP socket registry (sua.udp namespace, v1.4.0) ───
+// sua.udp.socket() returns a handle dict {"__udp": id}; the actual fd lives
+// here, keyed by id. Same pattern as bantuFileTable().
+//
+// Each entry holds the OS socket fd, family (AF_INET / AF_INET6), and a
+// flag indicating whether it's been bound. Lifecycle: socket() → bind() →
+// recvfrom()/send_to() → close().
+//
+// Platform includes — POSIX vs Windows are wrapped in #ifdef.
+#ifdef _WIN32
+    // Winsock2 — needs to be initialized via WSAStartup before any socket call.
+    #include <winsock2.h>
+    #include <ws2tcpip.h>
+    #pragma comment(lib, "ws2_32.lib")
+    #define BANTU_CLOSE_SOCKET closesocket
+    #define BANTU_SOCKET_ERRNO WSAGetLastError()
+#else
+    #include <sys/socket.h>
+    #include <netinet/in.h>
+    #include <arpa/inet.h>
+    #include <netdb.h>
+    #include <poll.h>
+    #include <unistd.h>
+    #include <fcntl.h>
+    #define BANTU_CLOSE_SOCKET close
+    #define BANTU_SOCKET_ERRNO errno
+#endif
+struct BantuUdpSocket {
+    int fd = -1;
+    int family = AF_INET;
+    bool bound = false;
+};
+static std::unordered_map<int, BantuUdpSocket>& bantuUdpSocketTable() {
+    static std::unordered_map<int, BantuUdpSocket> table;
+    return table;
+}
+static int bantuNextUdpId = 1;
+
+// ─── SHA-1 (for WebSocket handshake, RFC 6455) ────────────────────
+// We need SHA1(key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11") → base64
+// for the Sec-WebSocket-Accept header. ~50 lines of inline SHA1.
+struct BantuSha1 {
+    uint32_t h0=0x67452301, h1=0xEFCDAB89, h2=0x98BADCFE, h3=0x10325476, h4=0xC3D2E1F0;
+    uint8_t msg[64]; int msgLen=0; uint64_t totalLen=0;
+
+    void update(const uint8_t* data, size_t len) {
+        totalLen += len;
+        for (size_t i = 0; i < len; i++) {
+            msg[msgLen++] = data[i];
+            if (msgLen == 64) { process(); msgLen = 0; }
+        }
+    }
+    void update(const std::string& s) { update((const uint8_t*)s.data(), s.size()); }
+
+    void process() {
+        uint32_t w[80];
+        for (int i = 0; i < 16; i++) {
+            w[i] = (msg[i*4]<<24) | (msg[i*4+1]<<16) | (msg[i*4+2]<<8) | msg[i*4+3];
+        }
+        for (int i = 16; i < 80; i++) {
+            uint32_t t = w[i-3] ^ w[i-8] ^ w[i-14] ^ w[i-16];
+            w[i] = (t << 1) | (t >> 31);
+        }
+        uint32_t a=h0, b=h1, c=h2, d=h3, e=h4;
+        for (int i = 0; i < 80; i++) {
+            uint32_t f, k;
+            if (i<20)      { f=(b&c)|((~b)&d); k=0x5A827999; }
+            else if (i<40) { f=b^c^d;          k=0x6ED9EBA1; }
+            else if (i<60) { f=(b&c)|(b&d)|(c&d); k=0x8F1BBCDC; }
+            else           { f=b^c^d;          k=0xCA62C1D6; }
+            uint32_t temp = ((a<<5)|(a>>27)) + f + e + k + w[i];
+            e=d; d=c; c=(b<<30)|(b>>2); b=a; a=temp;
+        }
+        h0+=a; h1+=b; h2+=c; h3+=d; h4+=e;
+    }
+
+    std::string final_() {
+        uint64_t bits = totalLen * 8;
+        msg[msgLen++] = 0x80;
+        while (msgLen != 56) { if (msgLen==64) { process(); msgLen=0; } msg[msgLen++]=0; }
+        for (int i = 7; i >= 0; i--) msg[msgLen++] = (bits >> (i*8)) & 0xFF;
+        process();
+        std::string out(20, '\0');
+        uint32_t hs[5] = {h0,h1,h2,h3,h4};
+        for (int i = 0; i < 5; i++) {
+            out[i*4]   = (hs[i]>>24)&0xFF;
+            out[i*4+1] = (hs[i]>>16)&0xFF;
+            out[i*4+2] = (hs[i]>>8)&0xFF;
+            out[i*4+3] = hs[i]&0xFF;
+        }
+        return out;
+    }
+};
+
+// ─── Base64 encoder (for WebSocket handshake) ──────────────────────
+static std::string bantuBase64Encode(const std::string& input) {
+    static const char tbl[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string out;
+    int val = 0, valb = -6;
+    for (uint8_t c : input) {
+        val = (val << 8) | c;
+        valb += 8;
+        while (valb >= 0) {
+            out.push_back(tbl[(val >> valb) & 0x3F]);
+            valb -= 6;
+        }
+    }
+    if (valb > -6) out.push_back(tbl[((val << 8) >> (valb + 8)) & 0x3F]);
+    while (out.size() % 4) out.push_back('=');
+    return out;
+}
+
+// ─── WebSocket connection table ────────────────────────────────────
+struct BantuWsClient {
+    int fd = -1;
+    std::string id;       // client ID (for sua.ws.send/broadcast)
+    bool alive = true;
+};
+static std::unordered_map<int, BantuWsClient>& bantuWsTable() {
+    static std::unordered_map<int, BantuWsClient> table;
+    return table;
+}
+static int bantuNextWsId = 1;
+
+// Bantu-level WS event handlers (set by sua.ws.on)
+static Value bantuWsOnConnect = Value();
+static Value bantuWsOnMessage = Value();
+static Value bantuWsOnDisconnect = Value();
+
+// Callback function — set by Evaluator constructor, used by
+// the free-function WebSocket handler to call Bantu callbacks.
+#include <functional>
+static std::function<Value(Value, std::vector<Value>)> bantuWsCallback;
+
+// Forward declaration — the real definition is inside Evaluator class
+// (at line ~1550). The WS handler calls through this function pointer.
+
+// ─── Send a WebSocket text frame to a client ───────────────────────
+// Server→client frames are NOT masked (per RFC 6455).
+static void bantuWsSend(int fd, const std::string& message) {
+    std::vector<uint8_t> frame;
+    frame.push_back(0x81);  // FIN + text opcode
+
+    size_t len = message.size();
+    if (len <= 125) {
+        frame.push_back((uint8_t)len);
+    } else if (len <= 65535) {
+        frame.push_back(126);
+        frame.push_back((len >> 8) & 0xFF);
+        frame.push_back(len & 0xFF);
+    } else {
+        frame.push_back(127);
+        for (int i = 7; i >= 0; i--) {
+            frame.push_back((len >> (i * 8)) & 0xFF);
+        }
+    }
+    frame.insert(frame.end(), message.begin(), message.end());
+    send(fd, (const char*)frame.data(), (int)frame.size(), 0);
+}
+
+// ─── Send a WebSocket BINARY frame to a client (for voice/audio) ───
+// Same as above but opcode = 0x82 (binary) instead of 0x81 (text).
+// Accepts raw bytes as a Bantu list of numbers 0-255.
+static void bantuWsSendBinary(int fd, const std::vector<uint8_t>& data) {
+    std::vector<uint8_t> frame;
+    frame.push_back(0x82);  // FIN + binary opcode
+
+    size_t len = data.size();
+    if (len <= 125) {
+        frame.push_back((uint8_t)len);
+    } else if (len <= 65535) {
+        frame.push_back(126);
+        frame.push_back((len >> 8) & 0xFF);
+        frame.push_back(len & 0xFF);
+    } else {
+        frame.push_back(127);
+        for (int i = 7; i >= 0; i--) {
+            frame.push_back((len >> (i * 8)) & 0xFF);
+        }
+    }
+    frame.insert(frame.end(), data.begin(), data.end());
+    send(fd, (const char*)frame.data(), (int)frame.size(), 0);
+}
+
+// ─── Handle a WebSocket connection (after upgrade) ─────────────────
+// Runs in the same thread that accepted the HTTP connection — blocks
+// until the WS client disconnects.
+static void bantuHandleWebSocket(int sock, const std::string& wsKey) {
+    // Compute the accept value: SHA1(key + GUID) → base64
+    BantuSha1 sha;
+    sha.update(wsKey);
+    sha.update(std::string("258EAFA5-E914-47DA-95CA-C5AB0DC85B11"));
+    std::string acceptVal = bantuBase64Encode(sha.final_());
+
+    // Send 101 Switching Protocols
+    std::string resp = "HTTP/1.1 101 Switching Protocols\r\n"
+                       "Upgrade: websocket\r\n"
+                       "Connection: Upgrade\r\n"
+                       "Sec-WebSocket-Accept: " + acceptVal + "\r\n"
+                       "\r\n";
+    send(sock, resp.c_str(), (int)resp.size(), 0);
+
+    // Register the client
+    int wsId = bantuNextWsId++;
+    BantuWsClient client;
+    client.fd = sock;
+    client.id = "ws-" + std::to_string(wsId);
+    bantuWsTable()[wsId] = client;
+    std::cout << "  [WS] Client connected: " << client.id << " (fd=" << sock << ")\n";
+
+    // Call the Bantu-level onConnect handler if registered
+    if (bantuWsOnConnect.isFunction() || bantuWsOnConnect.isNativeFn()) {
+        ObjectMap cliObj;
+        cliObj["id"] = Value(client.id);
+        cliObj["fd"] = Value((double)sock);
+        if (bantuWsCallback) {
+            try { bantuWsCallback(bantuWsOnConnect, {Value(std::move(cliObj))}); }
+            catch (const std::exception& e) { std::cerr << "  [WS] onConnect error: " << e.what() << "\n"; }
+        }
+    }
+
+    // WebSocket message loop
+    uint8_t buffer[65536];
+    bool running = true;
+    while (running) {
+        ssize_t n = recv(sock, (char*)buffer, sizeof(buffer), 0);
+        if (n <= 0) break;
+
+        if (n < 2) continue;
+        uint8_t opcode = buffer[0] & 0x0F;
+        bool masked = (buffer[1] & 0x80) != 0;
+        uint64_t payloadLen = buffer[1] & 0x7F;
+        size_t offset = 2;
+
+        if (payloadLen == 126) {
+            if (n < 4) continue;
+            payloadLen = (buffer[2] << 8) | buffer[3];
+            offset = 4;
+        } else if (payloadLen == 127) {
+            if (n < 10) continue;
+            payloadLen = 0;
+            for (int i = 0; i < 8; i++) {
+                payloadLen = (payloadLen << 8) | buffer[offset + i];
+            }
+            offset = 10;
+        }
+
+        uint8_t mask[4] = {0};
+        if (masked && offset + 4 <= (size_t)n) {
+            memcpy(mask, buffer + offset, 4);
+            offset += 4;
+        }
+
+        std::string payload;
+        for (uint64_t i = 0; i < payloadLen && offset + i < (size_t)n; i++) {
+            char c = buffer[offset + i];
+            if (masked) c ^= mask[i % 4];
+            payload += c;
+        }
+
+        if (opcode == 0x8) {  // Close
+            break;
+        }
+        if (opcode == 0x9) {  // Ping → respond with Pong
+            uint8_t pong[2] = {0x8A, 0x00};
+            send(sock, (const char*)pong, 2, 0);
+            continue;
+        }
+        if (opcode == 0xA) {  // Pong — ignore
+            continue;
+        }
+        if (opcode == 0x2) {  // Binary message (voice/audio data)
+            // Call the onMessage handler with isBinary=true and raw bytes
+            if (bantuWsOnMessage.isFunction() || bantuWsOnMessage.isNativeFn()) {
+                ObjectMap msgObj;
+                msgObj["data"] = Value(payload);   // raw string (may contain nulls)
+                msgObj["client"] = Value(client.id);
+                msgObj["binary"] = Value(true);
+                // Also pass as a byte list for Bantu-side processing
+                std::vector<Value> byteList;
+                for (char c : payload) byteList.push_back(Value((double)(uint8_t)c));
+                msgObj["bytes"] = Value(std::move(byteList));
+                if (bantuWsCallback) {
+                    try { bantuWsCallback(bantuWsOnMessage, {Value(std::move(msgObj))}); }
+                    catch (const std::exception& e) { std::cerr << "  [WS] onMessage(binary) error: " << e.what() << "\n"; }
+                }
+            }
+        }
+        if (opcode == 0x1) {  // Text message
+            std::cout << "  [WS] Message from " << client.id << ": " << payload << "\n";
+
+            // Call the Bantu-level onMessage handler if registered
+            if (bantuWsOnMessage.isFunction() || bantuWsOnMessage.isNativeFn()) {
+                ObjectMap msgObj;
+                msgObj["data"] = Value(payload);
+                msgObj["client"] = Value(client.id);
+                // Also try to parse as JSON — if it succeeds, pass the parsed value
+                Value parsed = Value();
+                if (!payload.empty() && (payload[0] == '{' || payload[0] == '[')) {
+                    try {
+                        size_t pos = 0;
+                        parsed = bantuJsonParse(payload, pos);
+                        msgObj["json"] = parsed;
+                    } catch (...) {}
+                }
+                if (bantuWsCallback) {
+                    try { bantuWsCallback(bantuWsOnMessage, {Value(std::move(msgObj))}); }
+                    catch (const std::exception& e) { std::cerr << "  [WS] onMessage error: " << e.what() << "\n"; }
+                }
+            }
+        }
+    }
+
+    // Cleanup
+    std::cout << "  [WS] Client disconnected: " << client.id << "\n";
+    if (bantuWsOnDisconnect.isFunction() || bantuWsOnDisconnect.isNativeFn()) {
+        ObjectMap cliObj;
+        cliObj["id"] = Value(client.id);
+        if (bantuWsCallback) {
+            try { bantuWsCallback(bantuWsOnDisconnect, {Value(std::move(cliObj))}); }
+            catch (...) {}
+        }
+    }
+    bantuWsTable().erase(wsId);
+    CLOSE_SOCKET(sock);
+}
+
+// Helper: parse "host:port" → (host, port). Supports IPv6 brackets [::1]:53.
+static std::pair<std::string, int> bantuUdpParseAddr(const std::string& addr) {
+    // IPv6 form: [::1]:53
+    if (!addr.empty() && addr[0] == '[') {
+        auto end = addr.find(']');
+        if (end != std::string::npos && end + 2 <= addr.size() && addr[end + 1] == ':') {
+            std::string host = addr.substr(1, end - 1);
+            int port = std::atoi(addr.c_str() + end + 2);
+            return {host, port};
+        }
+    }
+    // IPv4 form: 127.0.0.1:53
+    auto colon = addr.rfind(':');
+    if (colon == std::string::npos) return {"", 0};
+    return {addr.substr(0, colon), std::atoi(addr.c_str() + colon + 1)};
+}
+
+// Helper: convert a Bantu list-of-bytes (numbers 0-255) into a std::vector<uint8_t>.
+static std::vector<uint8_t> bantuValueToBytes(const Value& v) {
+    std::vector<uint8_t> out;
+    if (v.isList()) {
+        out.reserve(v.listVal.size());
+        for (const auto& e : v.listVal) {
+            int b = (int)e.numberVal;
+            if (b < 0) b = 0;
+            if (b > 255) b = 255;
+            out.push_back((uint8_t)b);
+        }
+    } else if (v.isString()) {
+        const auto& s = v.stringVal;
+        out.assign(s.begin(), s.end());
+    }
+    return out;
+}
+
+// Helper: convert std::vector<uint8_t> into a Bantu list-of-bytes.
+static Value bantuBytesToValue(const std::vector<uint8_t>& buf) {
+    std::vector<Value> out;
+    out.reserve(buf.size());
+    for (uint8_t b : buf) out.push_back(Value((double)b));
+    return Value(std::move(out));
+}
+
+// Helper: resolve a host string + port into a struct sockaddr_storage.
+// Supports IPv4 dotted-quad, IPv6 (with or without brackets), and hostnames
+// (uses getaddrinfo() to resolve). Returns 0 on success, -1 on failure.
+static int bantuUdpResolve(const std::string& host, int port,
+                            struct sockaddr_storage* ss, socklen_t* sslen,
+                            int family, std::string* errOut) {
+    memset(ss, 0, sizeof(*ss));
+
+    // Try IPv4 dotted-quad first (no DNS lookup)
+    if (family == AF_INET) {
+        struct sockaddr_in* sa = (struct sockaddr_in*)ss;
+        sa->sin_family = AF_INET;
+        sa->sin_port = htons((uint16_t)port);
+        if (inet_pton(AF_INET, host.c_str(), &sa->sin_addr) == 1) {
+            *sslen = sizeof(*sa);
+            return 0;
+        }
+    }
+    // Try IPv6 literal next (no DNS lookup)
+    if (family == AF_INET6) {
+        struct sockaddr_in6* sa6 = (struct sockaddr_in6*)ss;
+        sa6->sin6_family = AF_INET6;
+        sa6->sin6_port = htons((uint16_t)port);
+        if (inet_pton(AF_INET6, host.c_str(), &sa6->sin6_addr) == 1) {
+            *sslen = sizeof(*sa6);
+            return 0;
+        }
+    }
+
+    // Hostname — use getaddrinfo() with the requested family.
+    struct addrinfo hints;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = family;
+    hints.ai_socktype = SOCK_DGRAM;
+    hints.ai_flags = 0;
+    struct addrinfo* res = nullptr;
+    std::string portStr = std::to_string(port);
+    int gai_rc = getaddrinfo(host.c_str(), portStr.c_str(), &hints, &res);
+    if (gai_rc != 0) {
+        if (errOut) *errOut = std::string("could not resolve host '") + host + "': " + gai_strerror(gai_rc);
+        return -1;
+    }
+    if (!res) {
+        if (errOut) *errOut = std::string("no addresses for host: ") + host;
+        return -1;
+    }
+    // Use the first result. (Caller could iterate res->ai_next for round-robin.)
+    memcpy(ss, res->ai_addr, res->ai_addrlen);
+    *sslen = res->ai_addrlen;
+    freeaddrinfo(res);
+    return 0;
+}
+
+// Helper: format a sockaddr_storage back into "host:port" string.
+static std::string bantuUdpFormatAddr(const struct sockaddr_storage* ss) {
+    char buf[INET6_ADDRSTRLEN];
+    if (ss->ss_family == AF_INET) {
+        const struct sockaddr_in* sa = (const struct sockaddr_in*)ss;
+        inet_ntop(AF_INET, &sa->sin_addr, buf, sizeof(buf));
+        return std::string(buf) + ":" + std::to_string(ntohs(sa->sin_port));
+    }
+    if (ss->ss_family == AF_INET6) {
+        const struct sockaddr_in6* sa6 = (const struct sockaddr_in6*)ss;
+        inet_ntop(AF_INET6, &sa6->sin6_addr, buf, sizeof(buf));
+        return std::string("[") + buf + "]:" + std::to_string(ntohs(sa6->sin6_port));
+    }
+    return "unknown";
+}
+
+// Helper: cross-platform poll() wrapper.
+#ifdef _WIN32
+static int bantuUdpPoll(SOCKET fd, int timeoutMs) {
+    WSAPOLLFD pfd;
+    pfd.fd = fd;
+    pfd.events = POLLIN;
+    pfd.revents = 0;
+    return WSAPoll(&pfd, 1, timeoutMs);
+}
+static std::string bantuUdpErrStr() {
+    int e = WSAGetLastError();
+    char buf[256];
+    FormatMessageA(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+                   nullptr, e, 0, buf, sizeof(buf), nullptr);
+    return std::string(buf);
+}
+static void bantuUdpSetNonblocking(SOCKET fd) {
+    u_long mode = 1;
+    ioctlsocket(fd, FIONBIO, &mode);
+}
+#else
+static int bantuUdpPoll(int fd, int timeoutMs) {
+    struct pollfd pfd;
+    pfd.fd = fd;
+    pfd.events = POLLIN;
+    pfd.revents = 0;
+    return poll(&pfd, 1, timeoutMs);
+}
+static std::string bantuUdpErrStr() {
+    return std::string(strerror(errno));
+}
+static void bantuUdpSetNonblocking(int fd) {
+    int flags = fcntl(fd, F_GETFL, 0);
+    fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+}
+#endif
+
 // ─── FFI: call arbitrary C functions in shared libraries (via libffi) ───
 //   $m    = loadlib("libm.dylib")                 // dlopen a shared library
 //   $sqrt = func($m, "sqrt", "double", ["double"]) // bind a symbol + signature
@@ -1163,6 +1639,16 @@ class Evaluator {
 public:
     Evaluator() : env_(std::make_shared<Environment>()), globalEnv_(env_) {
         env_->functionScope = true;   // global root is an assignment boundary
+        bantuWsCallback = [this](Value callee, std::vector<Value> args) -> Value {
+            // Switch to the global environment so the handler can access
+            // 'sua' and other globals. The WS handler may be called from
+            // a different call stack than a normal HTTP request.
+            auto savedEnv = this->env_;
+            this->env_ = this->globalEnv_;
+            auto result = this->bantuCallFunction(callee, std::move(args));
+            this->env_ = savedEnv;
+            return result;
+        };
         curl_global_init(CURL_GLOBAL_DEFAULT);
         // Web Push takes its randomness from the one platform CSPRNG. Left
         // unset it fails closed rather than falling back to a predictable PRNG.
@@ -1891,6 +2377,19 @@ private:
             }
         }
 
+        // ─── WebSocket upgrade detection (RFC 6455) ────────────────
+        // If the request has Upgrade: websocket, handle it as a WS
+        // connection instead of a normal HTTP request.
+        if (headers.count("upgrade") &&
+            headers["upgrade"].toString().find("websocket") != std::string::npos) {
+            std::string wsKey = headers.count("sec-websocket-key")
+                ? headers["sec-websocket-key"].toString() : "";
+            if (!wsKey.empty()) {
+                bantuHandleWebSocket(sock, wsKey);
+                return;
+            }
+        }
+
         // Match route (exact first, then :param patterns)
         Value matchedHandler;
         ObjectMap params;
@@ -1939,14 +2438,39 @@ private:
                 }
             }
         }
-
-        // If no route matched, try static files (GET only)
+        // Third pass: wildcard match (route ends with *)
+        // Enables SPA fallback: sua.server.get("/*", handler)
+        // NOTE: This runs AFTER static file serving, so /style.css etc.
+        // are served as static files, not as SPA fallback.
         if (!found && method == "GET") {
+            // Try static files first — if served, we're done.
             if (bantuServeStaticFile(sock, path)) {
                 CLOSE_SOCKET(sock);
                 return;
             }
         }
+        if (!found) {
+            for (auto& route : bantuServerRoutes) {
+                if (route.method != method) continue;
+                if (route.path.size() >= 2 && route.path.substr(route.path.size() - 2) == "/*") {
+                    std::string prefix = route.path.substr(0, route.path.size() - 1);
+                    if (path.find(prefix) == 0 || path == route.path.substr(0, route.path.size() - 2)) {
+                        matchedHandler = route.handler;
+                        found = true;
+                        break;
+                    }
+                } else if (!route.path.empty() && route.path.back() == '*' && route.path != "*") {
+                    std::string prefix = route.path.substr(0, route.path.size() - 1);
+                    if (path.find(prefix) == 0) {
+                        matchedHandler = route.handler;
+                        found = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        // If no route matched, try static files for non-GET methods (rare but possible)
 
         // Build $req and $res
         auto state = std::make_shared<BantuHttpResponseState>();
@@ -2070,9 +2594,11 @@ private:
                 std::cerr << "  [SERVER] accept() failed: " << strerror(errno) << "\n";
                 continue;
             }
-            // Handle synchronously (single-threaded — simple but reliable)
-            // For higher throughput, spawn a thread here.
-            bantuHandleHttpRequest(clientSock);
+            // Handle each connection in its own thread so WebSocket
+            // clients don't block new connections.
+            std::thread([this, clientSock]() {
+                bantuHandleHttpRequest(clientSock);
+            }).detach();
         }
     }
 
@@ -6059,6 +6585,408 @@ private:
         });
 
         suaObj["webrtc"] = Value(std::move(webrtcObj));
+
+        // ════════════════════════════════════════════════════════════
+        // sua.udp — native UDP networking (v1.4.0)
+        // ════════════════════════════════════════════════════════════
+        //
+        //   $sock = sua.udp.socket({"family": "ipv4"})
+        //   sua.udp.bind($sock, "0.0.0.0:3478")
+        //   sua.udp.send_to($sock, "8.8.8.8:53", bytes([0xAA, 0xAB, 0xAC]))
+        //   $pkt = sua.udp.recvfrom($sock, {"timeoutMs": 2000})
+        //   // $pkt = {"from": "8.8.8.8:53", "data": [...], "timeout": false}
+        //   sua.udp.close($sock)
+        //
+        // Also a high-level one-shot:
+        //   $r = sua.udp.send("8.8.8.8:53", $queryBytes, {"timeoutMs": 2000})
+        //   // $r = {"from": "8.8.8.8:53", "data": [...]}
+        //
+        ObjectMap udpObj;
+
+        // sua.udp.socket(opts?) → handle dict
+        //   opts.family: "ipv4" (default) | "ipv6"
+        //   opts.nonblocking: bool (default false)
+        udpObj["socket"] = makeNative([](std::vector<Value> args) -> Value {
+            std::string familyStr = "ipv4";
+            bool nonblocking = false;
+            if (!args.empty() && args[0].isObject()) {
+                auto& o = *args[0].objectVal;
+                auto fit = o.find("family");
+                if (fit != o.end()) familyStr = fit->second.toString();
+                auto nit = o.find("nonblocking");
+                if (nit != o.end()) nonblocking = (bool)nit->second.numberVal;
+            }
+            int family = (familyStr == "ipv6") ? AF_INET6 : AF_INET;
+            int fd = (int)socket(family, SOCK_DGRAM, 0);
+            if (fd < 0) {
+                ErrorHandler::throwError(std::string("sua.udp.socket: socket() failed: ") + bantuUdpErrStr(),
+                                         0, 0, ErrorHandler::RUNTIME_ERROR);
+            }
+            if (nonblocking) {
+                bantuUdpSetNonblocking(fd);
+            }
+            int id = bantuNextUdpId++;
+            bantuUdpSocketTable()[id] = BantuUdpSocket{fd, family, false};
+            ObjectMap handle;
+            handle["__udp"]   = Value((double)id);
+            handle["family"]  = Value(familyStr);
+            handle["bound"]   = Value(false);
+            return Value(std::move(handle));
+        });
+
+        // Helper: extract the socket fd + entry from a handle dict.
+        auto udpIdOf = [](const Value& h, BantuUdpSocket** outEntry) -> int {
+            if (!h.isObject()) return -1;
+            auto it = h.objectVal->find("__udp");
+            if (it == h.objectVal->end()) return -1;
+            int id = (int)it->second.numberVal;
+            auto& table = bantuUdpSocketTable();
+            auto tit = table.find(id);
+            if (tit == table.end()) return -1;
+            if (outEntry) *outEntry = &tit->second;
+            return id;
+        };
+
+        // sua.udp.bind($sock, "host:port") → true on success, throws on error.
+        // Special: port 0 means "OS-assigned" (use getsockname to find out).
+        udpObj["bind"] = makeNative([udpIdOf](std::vector<Value> args) -> Value {
+            if (args.size() < 2)
+                ErrorHandler::throwError("sua.udp.bind(sock, addr) needs 2 args", 0, 0, ErrorHandler::RUNTIME_ERROR);
+            BantuUdpSocket* entry = nullptr;
+            int id = udpIdOf(args[0], &entry);
+            if (id < 0 || !entry || entry->fd < 0)
+                ErrorHandler::throwError("sua.udp.bind: not a valid socket handle", 0, 0, ErrorHandler::RUNTIME_ERROR);
+            auto [host, port] = bantuUdpParseAddr(args[1].toString());
+            if (port == 0 && args[1].toString().find(":0") == std::string::npos) {
+                // port missing entirely
+                if (args[1].toString().find(":") == std::string::npos) {
+                    ErrorHandler::throwError("sua.udp.bind: address must be 'host:port'", 0, 0, ErrorHandler::RUNTIME_ERROR);
+                }
+            }
+            struct sockaddr_storage ss;
+            socklen_t sslen = 0;
+            std::string err;
+            if (bantuUdpResolve(host, port, &ss, &sslen, entry->family, &err) != 0) {
+                ErrorHandler::throwError("sua.udp.bind: " + err, 0, 0, ErrorHandler::RUNTIME_ERROR);
+            }
+            // Allow address reuse (common for servers restarting)
+            int yes = 1;
+            setsockopt(entry->fd, SOL_SOCKET, SO_REUSEADDR, (const char*)&yes, sizeof(yes));
+            if (::bind(entry->fd, (struct sockaddr*)&ss, sslen) < 0) {
+                ErrorHandler::throwError(std::string("sua.udp.bind: bind() failed: ") + bantuUdpErrStr(),
+                                         0, 0, ErrorHandler::RUNTIME_ERROR);
+            }
+            entry->bound = true;
+            return Value(true);
+        });
+
+        // sua.udp.send_to($sock, "host:port", dataBytes) → number of bytes sent.
+        // `dataBytes` is a list of integers 0-255 (matching Bantu's existing byte
+        // representation used by the hash/crypto/uuid modules).
+        udpObj["send_to"] = makeNative([udpIdOf](std::vector<Value> args) -> Value {
+            if (args.size() < 3)
+                ErrorHandler::throwError("sua.udp.send_to(sock, addr, data) needs 3 args", 0, 0, ErrorHandler::RUNTIME_ERROR);
+            BantuUdpSocket* entry = nullptr;
+            int id = udpIdOf(args[0], &entry);
+            if (id < 0 || !entry || entry->fd < 0)
+                ErrorHandler::throwError("sua.udp.send_to: not a valid socket handle", 0, 0, ErrorHandler::RUNTIME_ERROR);
+            auto [host, port] = bantuUdpParseAddr(args[1].toString());
+            struct sockaddr_storage ss;
+            socklen_t sslen = 0;
+            std::string err;
+            if (bantuUdpResolve(host, port, &ss, &sslen, entry->family, &err) != 0) {
+                ErrorHandler::throwError("sua.udp.send_to: " + err, 0, 0, ErrorHandler::RUNTIME_ERROR);
+            }
+            std::vector<uint8_t> buf = bantuValueToBytes(args[2]);
+            if (buf.empty()) return Value((double)0);
+            ssize_t n = sendto(entry->fd, (const char*)buf.data(), (int)buf.size(), 0,
+                               (struct sockaddr*)&ss, sslen);
+            if (n < 0) {
+                ErrorHandler::throwError(std::string("sua.udp.send_to: sendto() failed: ") + bantuUdpErrStr(),
+                                         0, 0, ErrorHandler::RUNTIME_ERROR);
+            }
+            return Value((double)n);
+        });
+
+        // sua.udp.recvfrom($sock, opts?) → {from, data, timeout}
+        //   opts.timeoutMs: int (default 0 = blocking forever)
+        //   opts.maxBytes:  int (default 4096)
+        // Returns {"timeout": true} on timeout. Throws on hard error.
+        udpObj["recvfrom"] = makeNative([udpIdOf](std::vector<Value> args) -> Value {
+            if (args.empty())
+                ErrorHandler::throwError("sua.udp.recvfrom(sock, [opts]) needs at least 1 arg", 0, 0, ErrorHandler::RUNTIME_ERROR);
+            BantuUdpSocket* entry = nullptr;
+            int id = udpIdOf(args[0], &entry);
+            if (id < 0 || !entry || entry->fd < 0)
+                ErrorHandler::throwError("sua.udp.recvfrom: not a valid socket handle", 0, 0, ErrorHandler::RUNTIME_ERROR);
+            int timeoutMs = 0;
+            size_t maxBytes = 4096;
+            if (args.size() > 1 && args[1].isObject()) {
+                auto& o = *args[1].objectVal;
+                auto tit = o.find("timeoutMs");
+                if (tit != o.end()) timeoutMs = (int)tit->second.numberVal;
+                auto mit = o.find("maxBytes");
+                if (mit != o.end()) maxBytes = (size_t)mit->second.numberVal;
+            }
+            // Wait for data with optional timeout via poll()
+            if (timeoutMs > 0) {
+                int rc = bantuUdpPoll(entry->fd, timeoutMs);
+                if (rc == 0) {
+                    ObjectMap r;
+                    r["timeout"] = Value(true);
+                    r["from"]    = Value(std::string(""));
+                    r["data"]    = Value(std::vector<Value>{});
+                    return Value(std::move(r));
+                }
+                if (rc < 0) {
+                    ErrorHandler::throwError(std::string("sua.udp.recvfrom: poll() failed: ") + bantuUdpErrStr(),
+                                             0, 0, ErrorHandler::RUNTIME_ERROR);
+                }
+            }
+            std::vector<uint8_t> buf(maxBytes);
+            struct sockaddr_storage peer;
+            socklen_t peerLen = sizeof(peer);
+            ssize_t n = recvfrom(entry->fd, (char*)buf.data(), (int)buf.size(), 0,
+                                 (struct sockaddr*)&peer, &peerLen);
+            if (n < 0) {
+                ErrorHandler::throwError(std::string("sua.udp.recvfrom: recvfrom() failed: ") + bantuUdpErrStr(),
+                                         0, 0, ErrorHandler::RUNTIME_ERROR);
+            }
+            buf.resize(n);
+            ObjectMap r;
+            r["timeout"] = Value(false);
+            r["from"]    = Value(bantuUdpFormatAddr(&peer));
+            r["data"]    = bantuBytesToValue(buf);
+            return Value(std::move(r));
+        });
+
+        // sua.udp.send("host:port", data, opts?) → {from, data} or {timeout: true}
+        // High-level one-shot: creates a socket, sends, waits for reply, closes.
+        udpObj["send"] = makeNative([](std::vector<Value> args) -> Value {
+            if (args.size() < 2)
+                ErrorHandler::throwError("sua.udp.send(addr, data, [opts]) needs at least 2 args", 0, 0, ErrorHandler::RUNTIME_ERROR);
+            std::string addrStr = args[0].toString();
+            auto [host, port] = bantuUdpParseAddr(addrStr);
+            int timeoutMs = 2000;
+            size_t maxBytes = 4096;
+            std::string familyStr = "ipv4";
+            if (host.find(':') != std::string::npos) familyStr = "ipv6";  // looks like IPv6
+            if (args.size() > 2 && args[2].isObject()) {
+                auto& o = *args[2].objectVal;
+                auto tit = o.find("timeoutMs");
+                if (tit != o.end()) timeoutMs = (int)tit->second.numberVal;
+                auto mit = o.find("maxBytes");
+                if (mit != o.end()) maxBytes = (size_t)mit->second.numberVal;
+                auto fit = o.find("family");
+                if (fit != o.end()) familyStr = fit->second.toString();
+            }
+            int family = (familyStr == "ipv6") ? AF_INET6 : AF_INET;
+            int fd = (int)socket(family, SOCK_DGRAM, 0);
+            if (fd < 0) {
+                ErrorHandler::throwError(std::string("sua.udp.send: socket() failed: ") + bantuUdpErrStr(),
+                                         0, 0, ErrorHandler::RUNTIME_ERROR);
+            }
+            struct sockaddr_storage ss;
+            socklen_t sslen = 0;
+            std::string err;
+            if (bantuUdpResolve(host, port, &ss, &sslen, family, &err) != 0) {
+                BANTU_CLOSE_SOCKET(fd);
+                ErrorHandler::throwError("sua.udp.send: " + err, 0, 0, ErrorHandler::RUNTIME_ERROR);
+            }
+            std::vector<uint8_t> buf = bantuValueToBytes(args[1]);
+            ssize_t sent = sendto(fd, (const char*)buf.data(), (int)buf.size(), 0,
+                                  (struct sockaddr*)&ss, sslen);
+            if (sent < 0) {
+                BANTU_CLOSE_SOCKET(fd);
+                ErrorHandler::throwError(std::string("sua.udp.send: sendto() failed: ") + bantuUdpErrStr(),
+                                         0, 0, ErrorHandler::RUNTIME_ERROR);
+            }
+            // Wait for response
+            int rc = bantuUdpPoll(fd, timeoutMs);
+            ObjectMap r;
+            if (rc == 0) {
+                BANTU_CLOSE_SOCKET(fd);
+                r["timeout"] = Value(true);
+                r["from"]    = Value(std::string(""));
+                r["data"]    = Value(std::vector<Value>{});
+                return Value(std::move(r));
+            }
+            if (rc < 0) {
+                BANTU_CLOSE_SOCKET(fd);
+                ErrorHandler::throwError(std::string("sua.udp.send: poll() failed: ") + bantuUdpErrStr(),
+                                         0, 0, ErrorHandler::RUNTIME_ERROR);
+            }
+            std::vector<uint8_t> rbuf(maxBytes);
+            struct sockaddr_storage peer;
+            socklen_t peerLen = sizeof(peer);
+            ssize_t n = recvfrom(fd, (char*)rbuf.data(), (int)rbuf.size(), 0,
+                                 (struct sockaddr*)&peer, &peerLen);
+            BANTU_CLOSE_SOCKET(fd);
+            if (n < 0) {
+                ErrorHandler::throwError(std::string("sua.udp.send: recvfrom() failed: ") + bantuUdpErrStr(),
+                                         0, 0, ErrorHandler::RUNTIME_ERROR);
+            }
+            rbuf.resize(n);
+            r["timeout"] = Value(false);
+            r["from"]    = Value(bantuUdpFormatAddr(&peer));
+            r["data"]    = bantuBytesToValue(rbuf);
+            return Value(std::move(r));
+        });
+
+        // sua.udp.close($sock) → true. Safe to call multiple times.
+        udpObj["close"] = makeNative([udpIdOf](std::vector<Value> args) -> Value {
+            BantuUdpSocket* entry = nullptr;
+            int id = udpIdOf(args.empty() ? Value() : args[0], &entry);
+            if (id < 0 || !entry) return Value(false);
+            if (entry->fd >= 0) {
+                BANTU_CLOSE_SOCKET(entry->fd);
+                entry->fd = -1;
+            }
+            bantuUdpSocketTable().erase(id);
+            return Value(true);
+        });
+
+        // sua.udp.getsockname($sock) → "host:port" (the locally-bound address).
+        // Useful after binding to port 0 to discover the OS-assigned port.
+        udpObj["getsockname"] = makeNative([udpIdOf](std::vector<Value> args) -> Value {
+            BantuUdpSocket* entry = nullptr;
+            int id = udpIdOf(args.empty() ? Value() : args[0], &entry);
+            if (id < 0 || !entry || entry->fd < 0)
+                ErrorHandler::throwError("sua.udp.getsockname: not a valid socket handle", 0, 0, ErrorHandler::RUNTIME_ERROR);
+            struct sockaddr_storage ss;
+            socklen_t sslen = sizeof(ss);
+            if (getsockname(entry->fd, (struct sockaddr*)&ss, &sslen) < 0) {
+                ErrorHandler::throwError(std::string("sua.udp.getsockname: ") + bantuUdpErrStr(),
+                                         0, 0, ErrorHandler::RUNTIME_ERROR);
+            }
+            return Value(bantuUdpFormatAddr(&ss));
+        });
+
+        suaObj["udp"] = Value(std::move(udpObj));
+
+        // ════════════════════════════════════════════════════════════
+        // sua.ws — WebSocket support (RFC 6455, v1.4.0)
+        // ════════════════════════════════════════════════════════════
+        //
+        //   sua.ws.on("connect", def($client) { ... });
+        //   sua.ws.on("message", def($msg) { ... });
+        //   sua.ws.on("disconnect", def($client) { ... });
+        //   sua.ws.send($clientId, "hello");
+        //   sua.ws.broadcast("hello everyone");
+        //   sua.ws.clients() → list of connected client IDs
+        //
+        ObjectMap wsObj;
+
+        // sua.ws.on(event, handler) — register a WS event handler
+        wsObj["on"] = makeNative([](std::vector<Value> args) -> Value {
+            if (args.size() < 2) return Value(false);
+            std::string event = args[0].toString();
+            Value handler = args[1];
+            if (event == "connect") {
+                bantuWsOnConnect = handler;
+                std::cout << "  [WS] on(connect) registered\n";
+            } else if (event == "message") {
+                bantuWsOnMessage = handler;
+                std::cout << "  [WS] on(message) registered\n";
+            } else if (event == "disconnect") {
+                bantuWsOnDisconnect = handler;
+                std::cout << "  [WS] on(disconnect) registered\n";
+            } else {
+                return Value(false);
+            }
+            return Value(true);
+        });
+
+        // sua.ws.send(clientId, data) → send a text message to one client
+        wsObj["send"] = makeNative([](std::vector<Value> args) -> Value {
+            if (args.size() < 2) return Value(false);
+            std::string clientId = args[0].toString();
+            std::string data = args[1].toString();
+            // Find the client by ID
+            for (auto& [id, client] : bantuWsTable()) {
+                if (client.id == clientId && client.fd >= 0) {
+                    bantuWsSend(client.fd, data);
+                    return Value(true);
+                }
+            }
+            return Value(false);
+        });
+
+        // sua.ws.broadcast(data) → send to ALL connected clients
+        wsObj["broadcast"] = makeNative([](std::vector<Value> args) -> Value {
+            if (args.empty()) return Value((double)0);
+            std::string data = args[0].toString();
+            int count = 0;
+            for (auto& [id, client] : bantuWsTable()) {
+                if (client.fd >= 0 && client.alive) {
+                    bantuWsSend(client.fd, data);
+                    count++;
+                }
+            }
+            return Value((double)count);
+        });
+
+        // sua.ws.clients() → list of connected client IDs
+        wsObj["clients"] = makeNative([](std::vector<Value> args) -> Value {
+            std::vector<Value> out;
+            for (auto& [id, client] : bantuWsTable()) {
+                if (client.fd >= 0) {
+                    out.push_back(Value(client.id));
+                }
+            }
+            return Value(std::move(out));
+        });
+
+        // sua.ws.send_binary(clientId, byteList) → send binary frame (for voice/audio)
+        // byteList is a list of integers 0-255
+        wsObj["send_binary"] = makeNative([](std::vector<Value> args) -> Value {
+            if (args.size() < 2) return Value(false);
+            std::string clientId = args[0].toString();
+            std::vector<uint8_t> data = bantuValueToBytes(args[1]);
+            for (auto& [id, client] : bantuWsTable()) {
+                if (client.id == clientId && client.fd >= 0) {
+                    bantuWsSendBinary(client.fd, data);
+                    return Value(true);
+                }
+            }
+            return Value(false);
+        });
+
+        // sua.ws.broadcast_binary(byteList) → send binary to ALL clients
+        wsObj["broadcast_binary"] = makeNative([](std::vector<Value> args) -> Value {
+            if (args.empty()) return Value((double)0);
+            std::vector<uint8_t> data = bantuValueToBytes(args[0]);
+            int count = 0;
+            for (auto& [id, client] : bantuWsTable()) {
+                if (client.fd >= 0 && client.alive) {
+                    bantuWsSendBinary(client.fd, data);
+                    count++;
+                }
+            }
+            return Value((double)count);
+        });
+
+        // sua.ws.send_to(clientId, data, isBinary) — convenience: send text OR binary
+        // If isBinary is true, sends as binary frame; otherwise text.
+        wsObj["send_to"] = makeNative([](std::vector<Value> args) -> Value {
+            if (args.size() < 2) return Value(false);
+            std::string clientId = args[0].toString();
+            bool isBinary = args.size() > 2 && args[2].numberVal != 0;
+            for (auto& [id, client] : bantuWsTable()) {
+                if (client.id == clientId && client.fd >= 0) {
+                    if (isBinary) {
+                        std::vector<uint8_t> data = bantuValueToBytes(args[1]);
+                        bantuWsSendBinary(client.fd, data);
+                    } else {
+                        bantuWsSend(client.fd, args[1].toString());
+                    }
+                    return Value(true);
+                }
+            }
+            return Value(false);
+        });
+
+        suaObj["ws"] = Value(std::move(wsObj));
 
         // ════════════════════════════════════════════════════════
         // Register sua as a global variable
