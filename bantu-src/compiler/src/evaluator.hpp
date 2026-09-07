@@ -25,6 +25,8 @@
 #include <sstream>
 #include <chrono>
 #include <thread>
+#include <mutex>
+#include <atomic>
 #include <functional>
 #include <random>
 #include <algorithm>
@@ -161,6 +163,26 @@ struct BantuServerRoute {
     std::string path;
     Value handler;  // Bantu function (or null if none)
 };
+
+// ─── PHASE 1 SCAFFOLDING — deleted when the event loop lands ───────────────
+// See docs/sua-architecture.md §2.4 and §8.
+//
+// Upstream's accept loop hands every connection to its own detached thread, but
+// the Evaluator has ONE shared env_ that bantuCallFunction mutates
+// (env_ = callEnv; ... env_ = prevEnv;). Concurrent requests therefore tore each
+// other's scope out from under them: measured at 16 handler errors and 17
+// corrupted replies across 20 concurrent requests.
+//
+// This serialises Bantu execution while leaving socket I/O parallel, so a slow
+// WebSocket client still cannot block new connections. It is a safety belt, not
+// the fix — the event loop removes the shared state entirely and this goes away.
+//
+// RECURSIVE because a WebSocket callback can fire while the same thread is
+// already inside the interpreter; a plain mutex would self-deadlock.
+//
+// LOCK ORDER: this lock, THEN bantuWsTableMutex. Never the reverse, and never
+// hold the table lock across a bantuWsCallback call.
+static std::recursive_mutex bantuInterpreterMutex;
 
 static std::vector<BantuServerRoute> bantuServerRoutes;
 static int bantuServerPort = 3000;
@@ -411,7 +433,7 @@ static std::unordered_map<int, std::fstream>& bantuFileTable() {
     static std::unordered_map<int, std::fstream> table;
     return table;
 }
-static int bantuNextFileId = 1;
+static std::atomic<int> bantuNextFileId{1};
 
 // ─── UDP socket registry (sua.udp namespace, v1.4.0) ───
 // sua.udp.socket() returns a handle dict {"__udp": id}; the actual fd lives
@@ -449,7 +471,7 @@ static std::unordered_map<int, BantuUdpSocket>& bantuUdpSocketTable() {
     static std::unordered_map<int, BantuUdpSocket> table;
     return table;
 }
-static int bantuNextUdpId = 1;
+static std::atomic<int> bantuNextUdpId{1};
 
 // ─── SHA-1 (for WebSocket handshake, RFC 6455) ────────────────────
 // We need SHA1(key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11") → base64
@@ -535,7 +557,38 @@ static std::unordered_map<int, BantuWsClient>& bantuWsTable() {
     static std::unordered_map<int, BantuWsClient> table;
     return table;
 }
-static int bantuNextWsId = 1;
+// Guards bantuWsTable(). Connection threads insert/erase; sua.ws.* builtins
+// read. Concurrent insert/erase on an unordered_map is undefined behaviour.
+// Held only across map access, NEVER across a send or a Bantu callback.
+static std::mutex bantuWsTableMutex;
+
+// Snapshot helpers. The sua.ws.* builtins copy what they need out of the table
+// under the lock, then send with the lock released — holding a mutex across a
+// blocking socket write would let one slow reader stall every connect and
+// disconnect on the server.
+static std::vector<int> bantuWsLiveFds() {
+    std::lock_guard<std::mutex> g(bantuWsTableMutex);
+    std::vector<int> fds;
+    for (const auto& kv : bantuWsTable())
+        if (kv.second.fd >= 0 && kv.second.alive) fds.push_back(kv.second.fd);
+    return fds;
+}
+static std::vector<std::string> bantuWsLiveIds() {
+    std::lock_guard<std::mutex> g(bantuWsTableMutex);
+    std::vector<std::string> ids;
+    for (const auto& kv : bantuWsTable())
+        if (kv.second.fd >= 0) ids.push_back(kv.second.id);
+    return ids;
+}
+// -1 when the client is unknown or already gone.
+static int bantuWsFdFor(const std::string& clientId) {
+    std::lock_guard<std::mutex> g(bantuWsTableMutex);
+    for (const auto& kv : bantuWsTable())
+        if (kv.second.id == clientId && kv.second.fd >= 0) return kv.second.fd;
+    return -1;
+}
+
+static std::atomic<int> bantuNextWsId{1};
 
 // Bantu-level WS event handlers (set by sua.ws.on)
 static Value bantuWsOnConnect = Value();
@@ -620,7 +673,10 @@ static void bantuHandleWebSocket(int sock, const std::string& wsKey) {
     BantuWsClient client;
     client.fd = sock;
     client.id = "ws-" + std::to_string(wsId);
-    bantuWsTable()[wsId] = client;
+    {
+        std::lock_guard<std::mutex> g(bantuWsTableMutex);
+        bantuWsTable()[wsId] = client;
+    }
     std::cout << "  [WS] Client connected: " << client.id << " (fd=" << sock << ")\n";
 
     // Call the Bantu-level onConnect handler if registered
@@ -736,7 +792,10 @@ static void bantuHandleWebSocket(int sock, const std::string& wsKey) {
             catch (...) {}
         }
     }
-    bantuWsTable().erase(wsId);
+    {
+        std::lock_guard<std::mutex> g(bantuWsTableMutex);
+        bantuWsTable().erase(wsId);
+    }
     CLOSE_SOCKET(sock);
 }
 
@@ -1643,6 +1702,9 @@ public:
             // Switch to the global environment so the handler can access
             // 'sua' and other globals. The WS handler may be called from
             // a different call stack than a normal HTTP request.
+            // Serialised against every other connection thread — see the note
+            // on bantuInterpreterMutex.
+            std::lock_guard<std::recursive_mutex> gil(bantuInterpreterMutex);
             auto savedEnv = this->env_;
             this->env_ = this->globalEnv_;
             auto result = this->bantuCallFunction(callee, std::move(args));
@@ -2488,6 +2550,10 @@ private:
         // Call the handler (if any)
         if (found && (matchedHandler.isFunction() || matchedHandler.isNativeFn())) {
             try {
+                // Serialised — see the note on bantuInterpreterMutex. Only the
+                // handler runs under the lock; the socket read above and the
+                // response write below stay parallel.
+                std::lock_guard<std::recursive_mutex> gil(bantuInterpreterMutex);
                 bantuCallFunction(matchedHandler, {reqVal, resVal});
             } catch (const std::exception& e) {
                 std::cerr << "  [SERVER] Handler exception: " << e.what() << "\n";
@@ -6902,14 +6968,10 @@ private:
             if (args.size() < 2) return Value(false);
             std::string clientId = args[0].toString();
             std::string data = args[1].toString();
-            // Find the client by ID
-            for (auto& [id, client] : bantuWsTable()) {
-                if (client.id == clientId && client.fd >= 0) {
-                    bantuWsSend(client.fd, data);
-                    return Value(true);
-                }
-            }
-            return Value(false);
+            int fd = bantuWsFdFor(clientId);          // snapshot under the lock
+            if (fd < 0) return Value(false);
+            bantuWsSend(fd, data);                    // send with it released
+            return Value(true);
         });
 
         // sua.ws.broadcast(data) → send to ALL connected clients
@@ -6917,23 +6979,14 @@ private:
             if (args.empty()) return Value((double)0);
             std::string data = args[0].toString();
             int count = 0;
-            for (auto& [id, client] : bantuWsTable()) {
-                if (client.fd >= 0 && client.alive) {
-                    bantuWsSend(client.fd, data);
-                    count++;
-                }
-            }
+            for (int fd : bantuWsLiveFds()) { bantuWsSend(fd, data); count++; }
             return Value((double)count);
         });
 
         // sua.ws.clients() → list of connected client IDs
         wsObj["clients"] = makeNative([](std::vector<Value> args) -> Value {
             std::vector<Value> out;
-            for (auto& [id, client] : bantuWsTable()) {
-                if (client.fd >= 0) {
-                    out.push_back(Value(client.id));
-                }
-            }
+            for (const auto& id : bantuWsLiveIds()) out.push_back(Value(id));
             return Value(std::move(out));
         });
 
@@ -6943,13 +6996,10 @@ private:
             if (args.size() < 2) return Value(false);
             std::string clientId = args[0].toString();
             std::vector<uint8_t> data = bantuValueToBytes(args[1]);
-            for (auto& [id, client] : bantuWsTable()) {
-                if (client.id == clientId && client.fd >= 0) {
-                    bantuWsSendBinary(client.fd, data);
-                    return Value(true);
-                }
-            }
-            return Value(false);
+            int fd = bantuWsFdFor(clientId);
+            if (fd < 0) return Value(false);
+            bantuWsSendBinary(fd, data);
+            return Value(true);
         });
 
         // sua.ws.broadcast_binary(byteList) → send binary to ALL clients
@@ -6957,12 +7007,7 @@ private:
             if (args.empty()) return Value((double)0);
             std::vector<uint8_t> data = bantuValueToBytes(args[0]);
             int count = 0;
-            for (auto& [id, client] : bantuWsTable()) {
-                if (client.fd >= 0 && client.alive) {
-                    bantuWsSendBinary(client.fd, data);
-                    count++;
-                }
-            }
+            for (int fd : bantuWsLiveFds()) { bantuWsSendBinary(fd, data); count++; }
             return Value((double)count);
         });
 
@@ -6972,18 +7017,15 @@ private:
             if (args.size() < 2) return Value(false);
             std::string clientId = args[0].toString();
             bool isBinary = args.size() > 2 && args[2].numberVal != 0;
-            for (auto& [id, client] : bantuWsTable()) {
-                if (client.id == clientId && client.fd >= 0) {
-                    if (isBinary) {
-                        std::vector<uint8_t> data = bantuValueToBytes(args[1]);
-                        bantuWsSendBinary(client.fd, data);
-                    } else {
-                        bantuWsSend(client.fd, args[1].toString());
-                    }
-                    return Value(true);
-                }
+            int fd = bantuWsFdFor(clientId);
+            if (fd < 0) return Value(false);
+            if (isBinary) {
+                std::vector<uint8_t> data = bantuValueToBytes(args[1]);
+                bantuWsSendBinary(fd, data);
+            } else {
+                bantuWsSend(fd, args[1].toString());
             }
-            return Value(false);
+            return Value(true);
         });
 
         suaObj["ws"] = Value(std::move(wsObj));
