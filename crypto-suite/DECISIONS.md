@@ -133,3 +133,49 @@ future item (alongside an i64 type and a bytecode VM). **Security:** none; corre
 Windows (`BCryptGenRandom`) and Linux `getrandom(2)` sources.
 **Why:** a silent fallback to a PRNG for keys/salts/nonces is the vulnerability the suite exists to
 avoid. **Security:** this is the single most important control; callers surface the failure.
+
+### D14 — P-256 and AES-128-GCM are hand-written, as a documented exception to D6/D11
+**Decision:** Implement NIST P-256 (ECDH, ECDSA) and AES-128-GCM from scratch in C++
+(`p256.hpp`, `aes_gcm.hpp`), compiled unconditionally, reachable **only** through the `webpush_*`
+builtins. This is a deliberate exception to D6 ("don't roll your own") and D11 ("encryption comes
+from libsodium").
+**Why:** Web Push mandates P-256 (RFC 8291 §3.1) and `aes128gcm`. libsodium offers neither — it has
+Curve25519/Ed25519 and (X)ChaCha20-Poly1305 only — so there is nothing to delegate to. The remaining
+option, linking OpenSSL, would make libcrypto a hard runtime dependency of *every* Bantu binary,
+which is precisely what D11's opt-in static link exists to prevent. Once P-256 must be written by
+hand (the hard part), AES-128-GCM is a small marginal addition and is fully pinned by NIST vectors.
+Unlike sodium and Arrow this is **not** feature-gated: it adds no external dependency, and Bantu's
+float64 numbers make a pure-Bantu fallback impossible (the D5 reasoning that makes SHA-512
+native-only), so gating it would leave `has_native("webpush")` false with nothing to fall back to.
+**Rejected:** linking OpenSSL (new hard dependency); shipping push without a server-side sender
+(the feature's whole point); driving OpenSSL through the FFI (its marshalling is NUL-terminated
+strings only — it cannot carry binary or out-params).
+**Security — the mitigations that make this exception acceptable:**
+- **Complete (exception-free) point formulas** (Renes–Costello–Batina, a = −3), so there are no
+  `P == Q` or point-at-infinity special cases. Incomplete Jacobian formulas fail on a sparse,
+  scalar-dependent input set — the bug that passes a test suite and then corrupts one signature in
+  ten thousand.
+- **No secret-dependent branches or memory indices:** constant-time `cmov` in a table-free ladder,
+  Fermat inversion over a public exponent (binary xgcd is rejected — ECDSA inverts the secret `k`),
+  and a table-free bitwise GHASH (the 4-bit table is the published cache-timing target).
+- **Deterministic nonces (RFC 6979):** removes nonce reuse, which would leak a long-lived VAPID key,
+  and — the deciding argument — makes signing byte-comparable against published vectors.
+- **Every modulus-derived constant is computed, not transcribed** (`n0'`, R mod m, R² mod m), so a
+  mistyped magic number is impossible. Only p, n, b, Gx, Gy are literals.
+- **Subscriber public keys are validated on import** (uncompressed marker, X and Y < p, on-curve).
+  `p256dh` is attacker-supplied, so skipping this is the invalid-curve attack.
+- **Salt and ephemeral key are not parameters** of `webpush_encrypt`. RFC 8291 §2 requires both
+  fresh per message; reusing either reuses (CEK, NONCE) and breaks the AEAD completely.
+- **Fail-closed selftest:** FIPS 197, NIST GCM, RFC 5869, RFC 6979 §A.2.5 and RFC 5903 vectors run
+  once on first use. On any failure `has_native("webpush")` is false and every entry point returns
+  `null`, so a miscompiled binary cannot emit a broken or insecure push.
+- **Threat model stated in the headers:** a remote attacker against a server-side VAPID key. A
+  co-resident cache-observing attacker is out of scope, so scalar blinding and bitsliced AES are
+  deliberately absent.
+
+### D15 — TLS certificate verification is on by default
+**Decision:** `bantuHttpRequest` now sets `CURLOPT_SSL_VERIFYPEER`/`VERIFYHOST`; callers opt out
+per-request with `sua.http.request({"insecure": true})`.
+**Why:** it was unconditionally disabled, so every outbound HTTPS call was unauthenticated. Web Push
+POSTs bearer-equivalent VAPID credentials to third-party endpoints, which made this untenable.
+**Security:** the escape hatch is explicit and per-request, never global.

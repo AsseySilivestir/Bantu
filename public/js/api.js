@@ -239,3 +239,72 @@ if (api.token()) {
   setInterval(pollIncoming, 2000);
   if (api.token()) pollIncoming();
 })();
+
+// ════════════════════════════════════════════════════════════════════
+//  PUSH NOTIFICATIONS
+//  window.BantuPWA comes from /pwa.js, which sua injects into <head>.
+//  Subscriptions are tagged "user-<id>" so the server can push to exactly
+//  one person's browsers — see notify() in server.b.
+// ════════════════════════════════════════════════════════════════════
+(function () {
+  const CB = {
+    supported() {
+      return typeof BantuPWA !== 'undefined' && BantuPWA.pushSupported();
+    },
+
+    async status() {
+      if (!this.supported()) return 'unsupported';
+      if (Notification.permission === 'denied') return 'blocked';
+      return (await BantuPWA.isSubscribed()) ? 'on' : 'off';
+    },
+
+    // Ask permission and register this browser for the signed-in user.
+    async enable() {
+      const user = api.user();
+      if (!user) throw new Error('Sign in first');
+      if (!this.supported()) throw new Error('This browser does not support notifications');
+      await BantuPWA.subscribePush({ tag: 'user-' + user.id });
+      return true;
+    },
+
+    async disable() {
+      if (!this.supported()) return false;
+      return await BantuPWA.unsubscribePush();
+    },
+
+    // Wire up a button: reflects state and toggles on click.
+    bindToggle(el) {
+      if (!el) return;
+      const paint = async () => {
+        const s = await this.status();
+        el.dataset.state = s;
+        el.disabled = (s === 'unsupported' || s === 'blocked');
+        el.textContent = { on: 'Notifications on', off: 'Enable notifications',
+                           blocked: 'Notifications blocked', unsupported: 'Notifications unavailable' }[s];
+      };
+      el.addEventListener('click', async () => {
+        try {
+          const s = await this.status();
+          if (s === 'on') { await this.disable(); } else { await this.enable(); }
+        } catch (e) {
+          console.warn('[chatbantu] push:', e.message);
+        }
+        paint();
+      });
+      paint();
+    }
+  };
+
+  window.chatPush = CB;
+
+  // Offer to turn notifications on once, shortly after sign-in.
+  addEventListener('load', () => {
+    setTimeout(async () => {
+      if (!api.token()) return;
+      if (localStorage.getItem('cb_push_asked')) return;
+      if (!CB.supported() || Notification.permission !== 'default') return;
+      localStorage.setItem('cb_push_asked', '1');
+      try { await CB.enable(); } catch (e) { /* the user declined */ }
+    }, 4000);
+  });
+})();

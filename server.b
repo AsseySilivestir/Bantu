@@ -26,6 +26,10 @@ string $envPort = env("PORT");
 if (!$envPort) { $envPort = "8080"; }
 string $dbPath = "/data/chatbantu.db";
 
+// Set to true once Web Push is configured (see the PWA section near the end).
+// Declared up here so notify() can read it regardless of definition order.
+$PUSH_READY = false;
+
 // Probe persistent volume; fall back to local file
 dict $probe = sua.sqlite.open($dbPath);
 if (!$probe.connected) {
@@ -198,6 +202,19 @@ def notify($toUserId, $type, $body, $link) {
         "INSERT INTO notifications (user_id, type, body, link) VALUES (" +
         str($toUserId) + ", '" + esc($type) + "', '" + esc($body) + "', '" + esc($link) + "');"
     );
+    // Also deliver as a Web Push notification, so it arrives when the app is
+    // closed. Subscriptions are tagged "user-<id>" by the client, so this
+    // reaches only that recipient's browsers. It is a no-op when push is not
+    // configured or the user has never subscribed.
+    if ($PUSH_READY) {
+        sua.push.send_all({
+            "head": "ChatBantu",
+            "body": $body,
+            "icon": "/icons/icon-192.png",
+            "tag":  $type,
+            "url":  $link
+        }, {"ttl": 86400, "urgency": "high"}, "user-" + str($toUserId));
+    }
 }
 
 // ════════════════════════════════════════════════════════════════════
@@ -959,6 +976,64 @@ sua.server.get("/api/call/incoming",                  handleCallIncoming);
 
 // CORS preflight
 sua.server.options("/*",                              handleOptions);
+
+// ════════════════════════════════════════════════════════════════════
+//  PROGRESSIVE WEB APP
+//  Makes ChatBantu installable, usable offline, and able to receive push
+//  notifications while closed. Purely additive — every existing route is
+//  untouched, and the app runs exactly as before if push is unavailable.
+// ════════════════════════════════════════════════════════════════════
+sua.pwa.configure({
+    "name": "ChatBantu",
+    "short_name": "ChatBantu",
+    "description": "A social network and chat app written in pure Bantu",
+    "theme_color": "#1d4ed8",
+    "background_color": "#0b1020",
+    "display": "standalone",
+    "start_url": "/",
+    "scope": "/",
+    "orientation": "portrait",
+    "icons": [
+        {"src": "/icons/icon-192.png", "sizes": "192x192", "type": "image/png"},
+        {"src": "/icons/icon-512.png", "sizes": "512x512", "type": "image/png"},
+        {"src": "/icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable"}
+    ],
+    "shortcuts": [
+        {"name": "Feed", "url": "/feed.html", "description": "Your timeline"},
+        {"name": "Messages", "url": "/chat.html", "description": "Your conversations"},
+        {"name": "People", "url": "/people.html", "description": "Find people to follow"}
+    ],
+    "categories": ["social", "communication"],
+    "precache": ["/", "/feed.html", "/chat.html", "/people.html",
+                 "/notifications.html", "/css/styles.css", "/js/api.js"]
+});
+
+// VAPID keys live beside the database so they survive a redeploy on a
+// persistent volume. They must stay stable: the public key is embedded in
+// every subscription a browser has already created.
+$vapidPath = "./vapid.json";
+if ($dbPath == "/data/chatbantu.db") { $vapidPath = "/data/vapid.json"; }
+
+$pushKeys = sua.push.keys($vapidPath);
+if ($pushKeys != null) {
+    $pushDb = "./push_subscriptions.db";
+    if ($dbPath == "/data/chatbantu.db") { $pushDb = "/data/push_subscriptions.db"; }
+    dict $pushCfg = sua.push.configure({
+        "public_key": $pushKeys.public_key,
+        "private_key": $pushKeys.private_key,
+        "subject": "mailto:admin@chatbantu.app",
+        "db": $pushDb,
+        "subscribe_url": "/api/push/subscribe"
+    });
+    if ($pushCfg.ok) {
+        $PUSH_READY = true;
+        print "[OK] Web Push enabled (" + str(sua.push.count()) + " subscription(s)).";
+    } else {
+        print "[WARN] Web Push disabled: " + str($pushCfg.error);
+    }
+} else {
+    print "[WARN] Web Push unavailable in this build — notifications stay in-app only.";
+}
 
 // Static frontend
 sua.server.static("./public");

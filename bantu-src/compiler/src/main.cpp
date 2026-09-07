@@ -769,6 +769,83 @@ int cmdInitWeb(const std::string& projectName) {
     return 0;
 }
 
+// ─── bantu init --pwa / bantu new --pwa ──────────────────────────────
+// Scaffolds a Sua web app that is ALSO a Progressive Web App: an installable
+// manifest, a service worker with offline support, and Web Push notifications.
+
+int cmdInitPwa(const std::string& projectName) {
+    if (projectName.empty()) {
+        std::cerr << "  [ERROR] Project name required.\n";
+        std::cerr << "  Usage: bantu init --pwa <project-name>\n";
+        return 1;
+    }
+    if (projectName.find_first_of("/\\:*?\"<>|") != std::string::npos
+        || projectName.find(' ') != std::string::npos) {
+        std::cerr << "  [ERROR] Invalid project name: '" << projectName << "'\n";
+        std::cerr << "  Names cannot contain spaces or any of: / \\ : * ? \" < > |\n";
+        return 1;
+    }
+    if (fileExists(projectName)) {
+        std::cerr << "  [ERROR] Directory already exists: " << projectName << "\n";
+        return 1;
+    }
+
+    std::cout << "  Creating Bantu PWA: " << projectName << "\n";
+
+#ifdef _WIN32
+    #define BANTU_MKDIR_PWA(p) mkdir(p)
+#else
+    #define BANTU_MKDIR_PWA(p) mkdir(p, 0755)
+#endif
+    BANTU_MKDIR_PWA(projectName.c_str());
+    BANTU_MKDIR_PWA((projectName + "/public").c_str());
+    BANTU_MKDIR_PWA((projectName + "/public/css").c_str());
+    BANTU_MKDIR_PWA((projectName + "/public/js").c_str());
+    BANTU_MKDIR_PWA((projectName + "/public/icons").c_str());
+#undef BANTU_MKDIR_PWA
+
+    writeFile(projectName + "/main.b",                 bantu_templates::pwa_main_b(projectName));
+    writeFile(projectName + "/public/index.html",      bantu_templates::pwa_index_html(projectName));
+    writeFile(projectName + "/public/offline.html",    bantu_templates::pwa_offline_html(projectName));
+    writeFile(projectName + "/public/css/style.css",   bantu_templates::pwa_style_css());
+    writeFile(projectName + "/public/js/app.js",       bantu_templates::pwa_app_js());
+    writeFile(projectName + "/public/icons/icon-192.png", bantu_templates::pwa_icon_png(192));
+    writeFile(projectName + "/public/icons/icon-512.png", bantu_templates::pwa_icon_png(512));
+    writeFile(projectName + "/start.sh",               bantu_templates::start_sh());
+    writeFile(projectName + "/start.bat",              bantu_templates::start_bat());
+    writeFile(projectName + "/Dockerfile",             bantu_templates::dockerfile());
+    writeFile(projectName + "/render.yaml",            bantu_templates::render_yaml(projectName));
+    writeFile(projectName + "/.gitignore",             bantu_templates::pwa_gitignore());
+    writeFile(projectName + "/README.md",              bantu_templates::pwa_readme_md(projectName));
+    writeFile(projectName + "/bantu.json",             bantu_templates::pwa_bantu_json(projectName, BANTU_VERSION));
+
+#ifndef _WIN32
+    chmod((projectName + "/start.sh").c_str(), 0755);
+#endif
+
+    std::cout << "  ────────────────────────────\n";
+    std::cout << "  Project created: " << projectName << "/\n";
+    std::cout << "    " << projectName << "/main.b                 ← server + PWA + push config\n";
+    std::cout << "    " << projectName << "/public/                ← frontend\n";
+    std::cout << "    " << projectName << "/public/offline.html    ← shown when the network is gone\n";
+    std::cout << "    " << projectName << "/public/icons/          ← placeholder icons (replace these)\n";
+    std::cout << "    " << projectName << "/README.md              ← docs\n";
+    std::cout << "\n";
+    std::cout << "  Served for you automatically:\n";
+    std::cout << "    /manifest.json      /serviceworker.js      /offline\n";
+    std::cout << "    /pwa.js             /pwa/subscribe\n";
+    std::cout << "\n";
+    std::cout << "  Next steps:\n";
+    std::cout << "    cd " << projectName << "\n";
+    std::cout << "    bantu run main.b\n";
+    std::cout << "\n";
+    std::cout << "  Then open http://localhost:8080 and install it from the address bar.\n";
+    std::cout << "  A VAPID keypair is written to vapid.json on first run — keep it\n";
+    std::cout << "  secret and stable (it is gitignored for you).\n";
+
+    return 0;
+}
+
 // ─── bantu relay ────────────────────────────────────────────────────
 
 int cmdRelay(int port) {
@@ -2767,27 +2844,31 @@ int main(int argc, char* argv[]) {
     //   bantu new <name>             ← alias of init
     //   bantu new --web <name>       ← alias of init --web
     if (command == "init" || command == "new") {
-        // Parse args. The --web flag can come before or after the name.
-        bool web = false;
+        // Parse args. The flag can come before or after the name.
+        enum { KIND_CLI, KIND_WEB, KIND_PWA } kind = KIND_CLI;
         std::string name = "";
         for (int i = 2; i < argc; ++i) {
             std::string a = argv[i];
             if (a == "--web" || a == "-w" || a == "web") {
-                web = true;
+                kind = KIND_WEB;
+            } else if (a == "--pwa" || a == "-p" || a == "pwa") {
+                kind = KIND_PWA;
             } else if (a == "--cli" || a == "-c") {
-                web = false;
+                kind = KIND_CLI;
             } else if (a == "--help" || a == "-h") {
                 std::cout << "  Usage:\n";
                 std::cout << "    bantu init <name>           CLI project (default)\n";
                 std::cout << "    bantu init --web <name>     Sua web app starter\n";
+                std::cout << "    bantu init --pwa <name>     Installable PWA: manifest,\n";
+                std::cout << "                                service worker, offline page,\n";
+                std::cout << "                                and Web Push notifications\n";
                 return 0;
             } else if (!a.empty() && a[0] != '-') {
                 name = a;
             }
         }
-        if (web) {
-            return cmdInitWeb(name);
-        }
+        if (kind == KIND_PWA) return cmdInitPwa(name);
+        if (kind == KIND_WEB) return cmdInitWeb(name);
         return cmdInit(name);
     }
 

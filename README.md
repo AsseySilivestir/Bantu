@@ -301,6 +301,40 @@ sua.server.post("/api/users", def($req, $res) {
 sua.server.listen(3000);
 ```
 
+Full reference: **[docs/sua.md](docs/sua.md)** — routing, `$req`/`$res`, static files, the HTTP
+client, and known limitations.
+
+### Progressive Web Apps
+
+One config call makes any sua app installable and offline-capable, and adds push notifications.
+Modelled on Python's django-pwa (see [docs/pwa-research.md](docs/pwa-research.md)).
+
+```bantu
+sua.pwa.configure({
+    "name": "My App",
+    "theme_color": "#2563eb",
+    "icons": [{"src": "/icons/icon-192.png", "sizes": "192x192", "type": "image/png"}],
+    "precache": ["/", "/css/app.css"]
+});
+```
+
+That auto-registers `/manifest.json`, `/serviceworker.js`, `/offline` and `/pwa.js`, and injects the
+`<head>` tags into your HTML. Start a new one with `bantu init --pwa <name>`.
+
+Push notifications are real Web Push — RFC 8291 payload encryption and RFC 8292 VAPID signing,
+implemented natively:
+
+```bantu
+$keys = sua.push.keys("./vapid.json");
+sua.push.configure({
+    "public_key": $keys.public_key,
+    "private_key": $keys.private_key,
+    "subject": "mailto:you@example.com"
+});
+
+sua.push.send_all({"head": "Build finished", "body": "All tests passed.", "url": "/builds"});
+```
+
 ## Database Drivers
 
 ```bantu

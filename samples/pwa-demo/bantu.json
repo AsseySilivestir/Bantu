@@ -1,0 +1,6 @@
+{
+  "name": "pwa-demo",
+  "version": "1.0.0",
+  "entry": "server.b",
+  "description": "An installable, offline-capable Bantu web app with Web Push notifications"
+}

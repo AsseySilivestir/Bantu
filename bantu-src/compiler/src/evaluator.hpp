@@ -17,6 +17,8 @@
 #include "crypto_sodium.hpp"    // optional libsodium AEAD + argon2id (feature-gated)
 #include "dataframe_native.hpp" // native column primitives for the arctic data-science suite
 #include "dataframe_arrow.hpp"  // Parquet + Feather/Arrow-IPC I/O (opt-in: -DBANTU_ARROW)
+#include "pwa_native.hpp"       // manifest / service worker / offline rendering for sua.pwa
+#include "webpush.hpp"          // RFC 8188/8291/8292 Web Push (pulls in p256.hpp + aes_gcm.hpp)
 #include <iostream>
 #include <fstream>
 #include <sstream>
@@ -168,6 +170,12 @@ static std::vector<std::string> bantuServerStatic;
 static std::string bantuServerResponseData;
 static int bantuServerResponseStatus = 200;
 static std::string bantuServerResponseType = "text/plain";
+
+// ─── PWA state (sua.pwa / sua.push) ───
+static bantu_pwa::Config bantuPwaConfig;
+static std::string bantuPushPrivateKeyB64;   // VAPID private key, base64url
+static std::string bantuPushSubject;         // "mailto:..." or an https URL
+static std::string bantuPushDbPath = "";     // sqlite file holding subscriptions
 
 // ─── Per-request response state (used by $res.json / $res.send etc.) ───
 struct BantuHttpResponseState {
@@ -651,8 +659,19 @@ static std::string httpStatusText(int code) {
 }
 
 // ─── cURL HTTP Request Helper ───
-static Value bantuHttpRequest(const std::string& method, const std::string& url,
-                               const std::string& body = "", const std::string& contentType = "") {
+//
+// Options for the general form. The three-argument legacy helpers below fill
+// this in and keep their old behaviour.
+struct BantuHttpOptions {
+    std::vector<std::pair<std::string, std::string>> headers;
+    long timeout = 10;
+    bool verifyTls = true;    // certificates ARE verified; opt out per request
+    bool verbose   = false;   // print a one-line [HTTP] trace
+};
+
+static Value bantuHttpRequestEx(const std::string& method, const std::string& url,
+                                const std::string& body, const std::string& contentType,
+                                const BantuHttpOptions& opt) {
     CURL* curl = curl_easy_init();
     if (!curl) {
         ObjectMap err;
@@ -672,55 +691,63 @@ static Value bantuHttpRequest(const std::string& method, const std::string& url,
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &responseBody);
     curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, bantuCurlHeaderCallback);
     curl_easy_setopt(curl, CURLOPT_HEADERDATA, &responseHeaders);
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 10L);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, opt.timeout);
     curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 5L);
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
     curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 5L);
     curl_easy_setopt(curl, CURLOPT_USERAGENT, "Bantu-Lang/1.1.0");
-    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
+    // TLS peer/host verification is ON. Pass insecure:true per request to opt
+    // out (self-signed development endpoints).
+    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, opt.verifyTls ? 1L : 0L);
+    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, opt.verifyTls ? 2L : 0L);
 
-    // Set method
+    // Body: ALWAYS length-explicit. Without CURLOPT_POSTFIELDSIZE libcurl calls
+    // strlen() on the buffer, which truncates any binary body at its first NUL —
+    // e.g. an aes128gcm push payload, which begins with 16 random octets.
+    // COPYPOSTFIELDS makes curl own the bytes, so `body` need not outlive this.
+    auto setBody = [&]() {
+        curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE_LARGE, (curl_off_t)body.size());
+        curl_easy_setopt(curl, CURLOPT_COPYPOSTFIELDS, body.data());
+    };
+
     struct curl_slist* headers = nullptr;
-    headers = curl_slist_append(headers, "Accept: application/json, text/plain, */*");
+    bool callerSetAccept = false, callerSetContentType = false;
+    for (const auto& h : opt.headers) {
+        std::string lower;
+        for (char c : h.first) lower += (char)std::tolower((unsigned char)c);
+        if (lower == "accept")       callerSetAccept = true;
+        if (lower == "content-type") callerSetContentType = true;
+    }
+    if (!callerSetAccept)
+        headers = curl_slist_append(headers, "Accept: application/json, text/plain, */*");
 
-    if (method == "POST") {
-        curl_easy_setopt(curl, CURLOPT_POST, 1L);
-        if (!body.empty()) {
-            curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body.c_str());
-        }
-        if (!contentType.empty()) {
-            std::string ct = "Content-Type: " + contentType;
+    if (method == "POST" || method == "PUT" || method == "PATCH") {
+        if (method == "POST") curl_easy_setopt(curl, CURLOPT_POST, 1L);
+        else                  curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, method.c_str());
+        setBody();
+        if (!callerSetContentType) {
+            std::string ct = "Content-Type: " + (contentType.empty() ? std::string("application/json")
+                                                                     : contentType);
             headers = curl_slist_append(headers, ct.c_str());
-        } else {
-            headers = curl_slist_append(headers, "Content-Type: application/json");
-        }
-    } else if (method == "PUT") {
-        curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "PUT");
-        if (!body.empty()) {
-            curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body.c_str());
-        }
-        if (!contentType.empty()) {
-            std::string ct = "Content-Type: " + contentType;
-            headers = curl_slist_append(headers, ct.c_str());
-        } else {
-            headers = curl_slist_append(headers, "Content-Type: application/json");
         }
     } else if (method == "DELETE") {
         curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "DELETE");
-        if (!body.empty()) {
-            curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body.c_str());
-        }
-    } else if (method == "PATCH") {
-        curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "PATCH");
-        if (!body.empty()) {
-            curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body.c_str());
-        }
-        if (!contentType.empty()) {
+        if (!body.empty()) setBody();
+        if (!body.empty() && !callerSetContentType && !contentType.empty()) {
             std::string ct = "Content-Type: " + contentType;
             headers = curl_slist_append(headers, ct.c_str());
         }
     } else if (method == "HEAD") {
         curl_easy_setopt(curl, CURLOPT_NOBODY, 1L);
+    } else if (method != "GET") {
+        curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, method.c_str());
+        if (!body.empty()) setBody();
+    }
+
+    // Caller-supplied headers last, so they win.
+    for (const auto& h : opt.headers) {
+        std::string line = h.first + ": " + h.second;
+        headers = curl_slist_append(headers, line.c_str());
     }
 
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
@@ -739,7 +766,8 @@ static Value bantuHttpRequest(const std::string& method, const std::string& url,
         response["ok"] = Value(false);
         response["url"] = Value(url);
         response["method"] = Value(method);
-        std::cout << "  [HTTP] " << method << " " << url << " -> ERROR: " << curl_easy_strerror(res) << "\n";
+        if (opt.verbose)
+            std::cerr << "  [HTTP] " << method << " " << url << " -> ERROR: " << curl_easy_strerror(res) << "\n";
     } else {
         response["status"] = Value((double)responseCode);
         response["statusText"] = Value(httpStatusText((int)responseCode));
@@ -748,10 +776,316 @@ static Value bantuHttpRequest(const std::string& method, const std::string& url,
         response["url"] = Value(url);
         response["method"] = Value(method);
         response["headers"] = Value(responseHeaders);
-        std::cout << "  [HTTP] " << method << " " << url << " -> " << responseCode << " " << httpStatusText((int)responseCode) << "\n";
+        if (opt.verbose)
+            std::cerr << "  [HTTP] " << method << " " << url << " -> " << responseCode
+                      << " " << httpStatusText((int)responseCode) << "\n";
     }
 
     return Value(std::move(response));
+}
+
+// Legacy three-argument form. Behaviour is unchanged except that TLS
+// certificates are now verified and the trace line goes to stderr.
+static Value bantuHttpRequest(const std::string& method, const std::string& url,
+                              const std::string& body = "", const std::string& contentType = "") {
+    BantuHttpOptions opt;
+    opt.verbose = true;
+    return bantuHttpRequestEx(method, url, body, contentType, opt);
+}
+
+// ════════════════════════════════════════════════════════════════
+// PWA / WEB PUSH SERVER HELPERS
+//
+// Route handlers, the subscription store, and the send path for sua.pwa /
+// sua.push. Rendering lives in pwa_native.hpp; the crypto in webpush.hpp.
+// ════════════════════════════════════════════════════════════════
+
+// Write a complete response through the $res object handed to a route handler.
+static void bantuPwaRespond(const Value& res, int status, const std::string& contentType,
+                            const std::string& body,
+                            const std::vector<std::pair<std::string, std::string>>& extra = {}) {
+    if (!res.isObject()) return;
+    ObjectMap& r = *res.objectVal;
+    auto call = [&](const char* key, std::vector<Value> args) {
+        auto it = r.find(key);
+        if (it != r.end() && it->second.isNativeFn()) it->second.nativeFn(std::move(args));
+    };
+    call("status", { Value((double)status) });
+    call("type",   { Value(contentType) });
+    for (const auto& h : extra) call("set", { Value(h.first), Value(h.second) });
+    // `type` before `send`: send only overrides the content type when it is
+    // still the default "application/json".
+    call("send",   { Value(body) });
+}
+
+// ── subscription store ──────────────────────────────────────────────────────
+//
+// A dedicated sqlite handle, separate from the app's sua.sqlite connection so
+// configuring push can never disturb the application's own database.
+static sqlite3* bantuPushDb = nullptr;
+
+static bool bantuPushDbOpen(const std::string& path) {
+    if (bantuPushDb) { sqlite3_close(bantuPushDb); bantuPushDb = nullptr; }
+    if (sqlite3_open(path.c_str(), &bantuPushDb) != SQLITE_OK) {
+        if (bantuPushDb) { sqlite3_close(bantuPushDb); bantuPushDb = nullptr; }
+        return false;
+    }
+    const char* schema =
+        "CREATE TABLE IF NOT EXISTS push_subscriptions ("
+        "  endpoint TEXT PRIMARY KEY,"
+        "  p256dh   TEXT NOT NULL,"
+        "  auth     TEXT NOT NULL,"
+        "  tag      TEXT NOT NULL DEFAULT '',"
+        "  created  INTEGER NOT NULL DEFAULT 0);";
+    char* err = nullptr;
+    if (sqlite3_exec(bantuPushDb, schema, nullptr, nullptr, &err) != SQLITE_OK) {
+        if (err) { std::cerr << "  [sua.push] schema error: " << err << "\n"; sqlite3_free(err); }
+        return false;
+    }
+    return true;
+}
+
+// Pull {endpoint, p256dh, auth} out of either a full PushSubscription
+// ({endpoint, keys:{p256dh, auth}}) or an already-flattened row.
+static bool bantuPushExtract(const Value& v, std::string& endpoint,
+                             std::string& p256dh, std::string& auth) {
+    if (!v.isObject()) return false;
+    ObjectMap& o = *v.objectVal;
+    auto get = [&](ObjectMap& m, const char* k) {
+        auto it = m.find(k);
+        return (it == m.end() || it->second.isNull()) ? std::string("") : it->second.toString();
+    };
+    // Allow the browser's wrapper: { "subscription": {...} }
+    auto sit = o.find("subscription");
+    if (sit != o.end() && sit->second.isObject())
+        return bantuPushExtract(sit->second, endpoint, p256dh, auth);
+
+    endpoint = get(o, "endpoint");
+    auto kit = o.find("keys");
+    if (kit != o.end() && kit->second.isObject()) {
+        p256dh = get(*kit->second.objectVal, "p256dh");
+        auth   = get(*kit->second.objectVal, "auth");
+    } else {
+        p256dh = get(o, "p256dh");
+        auth   = get(o, "auth");
+    }
+    return !endpoint.empty() && !p256dh.empty() && !auth.empty();
+}
+
+static bool bantuPushSave(const Value& sub, const std::string& tag) {
+    if (!bantuPushDb) return false;
+    std::string endpoint, p256dh, auth;
+    if (!bantuPushExtract(sub, endpoint, p256dh, auth)) return false;
+
+    // Reject a subscription whose key material we could never use, rather than
+    // storing it and failing on every future send.
+    bantu_webpush::Bytes kb, ab;
+    if (!bantu_webpush::b64url_decode(p256dh, kb) || kb.size() != 65) return false;
+    if (!bantu_webpush::b64url_decode(auth, ab)   || ab.empty())      return false;
+
+    const char* sql = "INSERT INTO push_subscriptions(endpoint,p256dh,auth,tag,created) "
+                      "VALUES(?,?,?,?,?) ON CONFLICT(endpoint) DO UPDATE SET "
+                      "p256dh=excluded.p256dh, auth=excluded.auth, tag=excluded.tag;";
+    sqlite3_stmt* st = nullptr;
+    if (sqlite3_prepare_v2(bantuPushDb, sql, -1, &st, nullptr) != SQLITE_OK) return false;
+    sqlite3_bind_text(st, 1, endpoint.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 2, p256dh.c_str(),  -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 3, auth.c_str(),    -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 4, tag.c_str(),     -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(st, 5, (sqlite3_int64)std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count());
+    bool ok = sqlite3_step(st) == SQLITE_DONE;
+    sqlite3_finalize(st);
+    return ok;
+}
+
+static bool bantuPushForget(const std::string& endpoint) {
+    if (!bantuPushDb || endpoint.empty()) return false;
+    sqlite3_stmt* st = nullptr;
+    if (sqlite3_prepare_v2(bantuPushDb, "DELETE FROM push_subscriptions WHERE endpoint = ?;",
+                           -1, &st, nullptr) != SQLITE_OK) return false;
+    sqlite3_bind_text(st, 1, endpoint.c_str(), -1, SQLITE_TRANSIENT);
+    bool ok = sqlite3_step(st) == SQLITE_DONE;
+    sqlite3_finalize(st);
+    return ok && sqlite3_changes(bantuPushDb) > 0;
+}
+
+// Every stored subscription, or just those carrying `tag`.
+static Value bantuPushList(const std::string& tag) {
+    std::vector<Value> out;
+    if (!bantuPushDb) return Value(std::move(out));
+    const char* sql = tag.empty()
+        ? "SELECT endpoint,p256dh,auth,tag,created FROM push_subscriptions ORDER BY created;"
+        : "SELECT endpoint,p256dh,auth,tag,created FROM push_subscriptions WHERE tag = ? ORDER BY created;";
+    sqlite3_stmt* st = nullptr;
+    if (sqlite3_prepare_v2(bantuPushDb, sql, -1, &st, nullptr) != SQLITE_OK) return Value(std::move(out));
+    if (!tag.empty()) sqlite3_bind_text(st, 1, tag.c_str(), -1, SQLITE_TRANSIENT);
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        auto txt = [&](int i) {
+            const unsigned char* p = sqlite3_column_text(st, i);
+            return p ? std::string((const char*)p) : std::string("");
+        };
+        ObjectMap row, keys;
+        row["endpoint"] = Value(txt(0));
+        keys["p256dh"]  = Value(txt(1));
+        keys["auth"]    = Value(txt(2));
+        row["keys"]     = Value(std::move(keys));
+        row["tag"]      = Value(txt(3));
+        row["created"]  = Value((double)sqlite3_column_int64(st, 4));
+        out.push_back(Value(std::move(row)));
+    }
+    sqlite3_finalize(st);
+    return Value(std::move(out));
+}
+
+// ── sending ─────────────────────────────────────────────────────────────────
+
+static Value bantuPushSendOne(const Value& sub, const Value& payload, const Value& opts) {
+    ObjectMap out;
+    auto fail = [&](const std::string& msg, int status = 0) {
+        out["ok"] = Value(false);
+        out["status"] = Value((double)status);
+        out["error"] = Value(msg);
+        return Value(std::move(out));
+    };
+
+    if (!bantu_webpush::selftest().ok)
+        return fail("Web Push is unavailable: the crypto selftest failed in this binary");
+    if (bantuPushPrivateKeyB64.empty())
+        return fail("call sua.push.configure({public_key, private_key, subject}) first");
+
+    std::string endpoint, p256dh, auth;
+    if (!bantuPushExtract(sub, endpoint, p256dh, auth))
+        return fail("subscription needs endpoint plus keys.p256dh and keys.auth");
+
+    std::string aud;
+    if (!bantu_webpush::origin_of(endpoint, aud))
+        return fail("endpoint must be an https URL: " + endpoint);
+
+    // Payload: objects and lists become JSON (the shape /serviceworker.js
+    // expects); anything else is sent as text.
+    std::string body_text;
+    if (payload.isObject() || payload.isList()) body_text = bantuJsonStringify(payload);
+    else if (!payload.isNull())                 body_text = payload.toString();
+
+    if (body_text.size() > bantu_webpush::kMaxPayload)
+        return fail("payload is " + std::to_string(body_text.size()) + " octets; the limit is " +
+                    std::to_string(bantu_webpush::kMaxPayload) +
+                    " (4096 minus the 86-octet header, delimiter and tag)");
+
+    bantu_webpush::Bytes key, salt_auth;
+    if (!bantu_webpush::b64url_decode(p256dh, key) || key.size() != 65)
+        return fail("keys.p256dh must be 65 base64url octets");
+    if (!bantu_webpush::b64url_decode(auth, salt_auth) || salt_auth.empty())
+        return fail("keys.auth is not valid base64url");
+
+    bantu_webpush::Bytes encrypted;
+    if (!bantu_webpush::encrypt(key.data(), salt_auth.data(), salt_auth.size(),
+                                (const uint8_t*)body_text.data(), body_text.size(), encrypted))
+        return fail("encryption failed — the subscription's p256dh may not be a valid P-256 point");
+
+    // Options
+    long ttl = 86400;
+    std::string urgency, topic;
+    bool insecure = false;
+    if (opts.isObject()) {
+        ObjectMap& o = *opts.objectVal;
+        auto it = o.find("ttl");
+        if (it != o.end() && it->second.isNumber()) ttl = (long)it->second.numberVal;
+        it = o.find("urgency"); if (it != o.end() && !it->second.isNull()) urgency = it->second.toString();
+        it = o.find("topic");   if (it != o.end() && !it->second.isNull()) topic = it->second.toString();
+        it = o.find("insecure");if (it != o.end()) insecure = it->second.isTruthy();
+    }
+
+    int64_t now = (int64_t)std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    bantu_webpush::Bytes priv;
+    if (!bantu_webpush::b64url_decode(bantuPushPrivateKeyB64, priv) || priv.size() != 32)
+        return fail("the configured VAPID private key is malformed");
+
+    std::string authHeader;
+    // 12 hours: RFC 8292 §2 caps `exp` at 24 hours from now.
+    if (!bantu_webpush::vapid_header(priv.data(), aud, bantuPushSubject, now + 12 * 3600, authHeader))
+        return fail("could not build the VAPID Authorization header");
+
+    BantuHttpOptions hopt;
+    hopt.verifyTls = !insecure;
+    hopt.timeout = 15;
+    hopt.headers.emplace_back("Authorization", authHeader);
+    hopt.headers.emplace_back("Content-Encoding", "aes128gcm");
+    hopt.headers.emplace_back("Content-Type", "application/octet-stream");
+    hopt.headers.emplace_back("TTL", std::to_string(ttl));   // required by RFC 8030 §5.2
+    if (!urgency.empty()) hopt.headers.emplace_back("Urgency", urgency);
+    if (!topic.empty())   hopt.headers.emplace_back("Topic", topic);
+
+    std::string raw((const char*)encrypted.data(), encrypted.size());
+    Value resp = bantuHttpRequestEx("POST", endpoint, raw, "application/octet-stream", hopt);
+
+    int status = 0;
+    std::string respBody, err;
+    if (resp.isObject()) {
+        auto& r = *resp.objectVal;
+        auto it = r.find("status"); if (it != r.end()) status = (int)it->second.numberVal;
+        it = r.find("body");        if (it != r.end()) respBody = it->second.toString();
+        it = r.find("error");       if (it != r.end()) err = it->second.toString();
+    }
+    out["ok"] = Value(status >= 200 && status < 300);
+    out["status"] = Value((double)status);
+    out["endpoint"] = Value(endpoint);
+    out["bytes"] = Value((double)encrypted.size());
+    if (!respBody.empty()) out["body"] = Value(respBody);
+    if (!err.empty()) out["error"] = Value(err);
+    // 404/410 mean the subscription is permanently gone; send_all prunes on this.
+    out["expired"] = Value(status == 404 || status == 410);
+    if (status == 413) out["error"] = Value(std::string("push service rejected the payload as too large"));
+    if (status == 401 || status == 403)
+        out["error"] = Value(std::string("push service rejected the VAPID credentials "
+                                         "(check `subject` and that the public key matches "
+                                         "the one the browser subscribed with)"));
+    return Value(std::move(out));
+}
+
+// POST <subscribe_url> — store what /pwa.js sends after PushManager.subscribe().
+static Value bantuPushSubscribeHandler(std::vector<Value> args) {
+    Value req = args.size() > 0 ? args[0] : Value();
+    Value res = args.size() > 1 ? args[1] : Value();
+    std::string tag;
+    Value body;
+    if (req.isObject()) {
+        auto it = req.objectVal->find("body");
+        if (it != req.objectVal->end()) body = it->second;
+    }
+    if (body.isObject()) {
+        auto t = body.objectVal->find("tag");
+        if (t != body.objectVal->end() && !t->second.isNull()) tag = t->second.toString();
+    }
+    bool ok = bantuPushSave(body, tag);
+    ObjectMap o;
+    o["ok"] = Value(ok);
+    if (!ok) o["error"] = Value(std::string("invalid subscription"));
+    bantuPwaRespond(res, ok ? 201 : 400, "application/json; charset=utf-8",
+                    bantuJsonStringify(Value(std::move(o))));
+    return Value();
+}
+
+// DELETE <subscribe_url> — drop a subscription the browser has unsubscribed.
+static Value bantuPushUnsubscribeHandler(std::vector<Value> args) {
+    Value req = args.size() > 0 ? args[0] : Value();
+    Value res = args.size() > 1 ? args[1] : Value();
+    std::string endpoint;
+    if (req.isObject()) {
+        auto it = req.objectVal->find("body");
+        if (it != req.objectVal->end() && it->second.isObject()) {
+            auto e = it->second.objectVal->find("endpoint");
+            if (e != it->second.objectVal->end()) endpoint = e->second.toString();
+        }
+    }
+    bool ok = bantuPushForget(endpoint);
+    ObjectMap o;
+    o["ok"] = Value(ok);
+    bantuPwaRespond(res, 200, "application/json; charset=utf-8",
+                    bantuJsonStringify(Value(std::move(o))));
+    return Value();
 }
 
 // ════════════════════════════════════════════════════════════════
@@ -771,6 +1105,9 @@ public:
     Evaluator() : env_(std::make_shared<Environment>()), globalEnv_(env_) {
         env_->functionScope = true;   // global root is an assignment boundary
         curl_global_init(CURL_GLOBAL_DEFAULT);
+        // Web Push takes its randomness from the one platform CSPRNG. Left
+        // unset it fails closed rather than falling back to a predictable PRNG.
+        bantu_webpush::random_bytes = bantuCsprng;
         registerBuiltins();
     }
 
@@ -1380,25 +1717,35 @@ private:
             std::stringstream ss;
             ss << f.rdbuf();
             std::string content = ss.str();
-            // Determine content type
-            std::string ext = filePath.substr(filePath.find_last_of('.') + 1);
-            std::string ct = "application/octet-stream";
-            if (ext == "html" || ext == "htm") ct = "text/html; charset=utf-8";
-            else if (ext == "css")  ct = "text/css; charset=utf-8";
-            else if (ext == "js")   ct = "application/javascript; charset=utf-8";
-            else if (ext == "json") ct = "application/json; charset=utf-8";
-            else if (ext == "svg")  ct = "image/svg+xml";
-            else if (ext == "png")  ct = "image/png";
-            else if (ext == "jpg" || ext == "jpeg") ct = "image/jpeg";
-            else if (ext == "ico")  ct = "image/x-icon";
-            else if (ext == "txt")  ct = "text/plain; charset=utf-8";
-            // Send response
+
+            // Content type from the extension (table shared with sua.pwa).
+            std::string ext;
+            size_t dot = filePath.find_last_of('.');
+            size_t slash = filePath.find_last_of('/');
+            if (dot != std::string::npos && (slash == std::string::npos || dot > slash)) {
+                ext = filePath.substr(dot + 1);
+                for (auto& c : ext) c = (char)std::tolower((unsigned char)c);
+            }
+            std::string ct = bantu_pwa::mime_for_extension(ext);
+
+            // With auto_inject on, patch the PWA <head> block into served HTML so
+            // an existing app becomes installable without editing its templates.
+            // inject_meta() is idempotent — a page that already calls
+            // sua.pwa.meta() is left untouched.
+            if (bantuPwaConfig.configured && bantuPwaConfig.auto_inject &&
+                (ext == "html" || ext == "htm")) {
+                content = bantu_pwa::inject_meta(content, bantu_pwa::render_meta(bantuPwaConfig));
+            }
+
+            // A stale service worker is sticky, so never let one be cached.
+            bool noCache = (ext == "html" || ext == "htm" || ext == "webmanifest");
+
             std::ostringstream resp;
             resp << "HTTP/1.1 200 OK\r\n";
             resp << "Content-Type: " << ct << "\r\n";
             resp << "Content-Length: " << content.size() << "\r\n";
             resp << "Access-Control-Allow-Origin: *\r\n";
-            resp << "Cache-Control: public, max-age=300\r\n";
+            resp << "Cache-Control: " << (noCache ? "no-cache" : "public, max-age=300") << "\r\n";
             resp << "Server: Bantu-Sua/1.2\r\n";
             resp << "\r\n" << content;
             std::string respStr = resp.str();
@@ -2690,6 +3037,157 @@ private:
                 return Value(bantu_native::toHex(out.data(), out.size()));
             }));
 
+            // ════════════════════════════════════════════════════════
+            // WEB PUSH — RFC 8188 (aes128gcm) / 8291 / 8292 (VAPID)
+            //
+            // Atoms only: encryption and signing are separate so each is pinned
+            // by its own published vectors. Policy (TTL, retries, pruning dead
+            // subscriptions) lives in Bantu, in sua.push.
+            //
+            // Every entry point runs the memoised known-answer selftest first and
+            // FAILS CLOSED, so a miscompiled binary can never emit a broken or
+            // insecure push. See webpush.hpp.
+            // ════════════════════════════════════════════════════════
+
+            // Guard: returns false (and complains once) if the selftest failed.
+            auto webpushReady = []() -> bool {
+                const auto& st = bantu_webpush::selftest();
+                if (!st.ok) {
+                    static bool warned = false;
+                    if (!warned) {
+                        warned = true;
+                        std::cerr << "  [webpush] SELFTEST FAILED at \"" << st.first_failure
+                                  << "\" — Web Push is disabled in this binary.\n";
+                    }
+                    return false;
+                }
+                return true;
+            };
+
+            env_->define("webpush_selftest", makeNative([](std::vector<Value>) -> Value {
+                const auto& st = bantu_webpush::selftest();
+                ObjectMap o;
+                o["ok"] = Value(st.ok);
+                o["ran"] = Value((double)st.ran);
+                o["failed"] = st.ok ? Value() : Value(st.first_failure);
+                return Value(std::move(o));
+            }));
+
+            // Generate a VAPID application-server keypair. The public key is what
+            // the browser passes as `applicationServerKey`; keep the private key
+            // secret and STABLE — rotating it invalidates every subscription.
+            env_->define("webpush_keygen", makeNative([webpushReady](std::vector<Value>) -> Value {
+                if (!webpushReady()) return Value();
+                unsigned char priv[32], pub[65];
+                bool have = false;
+                for (int i = 0; i < 16 && !have; i++) {
+                    if (!bantuCsprng(priv, 32)) return Value();
+                    have = bantu_p256::valid_scalar(priv);   // rejection sampling, unbiased
+                }
+                if (!have || !bantu_p256::public_from_private(priv, pub)) return Value();
+                ObjectMap o;
+                // Not "public"/"private": those are reserved words, so `$k.public`
+                // would not parse in Bantu.
+                o["private_key"] = Value(bantu_webpush::b64url_encode(priv, 32));
+                o["public_key"]  = Value(bantu_webpush::b64url_encode(pub, 65));
+                bantu_p256::secure_zero(priv, sizeof priv);
+                return Value(std::move(o));
+            }));
+
+            // Derive the public key from a base64url private key.
+            env_->define("webpush_public_key", makeNative([webpushReady](std::vector<Value> a) -> Value {
+                if (!webpushReady() || a.empty()) return Value();
+                bantu_webpush::Bytes priv;
+                if (!bantu_webpush::b64url_decode(a[0].toString(), priv) || priv.size() != 32) return Value();
+                unsigned char pub[65];
+                if (!bantu_p256::public_from_private(priv.data(), pub)) return Value();
+                return Value(bantu_webpush::b64url_encode(pub, 65));
+            }));
+
+            // webpush_encrypt(p256dh, auth, plaintext) -> byte-list body
+            //
+            // `p256dh` and `auth` are the base64url strings from the browser's
+            // PushSubscription. The salt and the ephemeral keypair are generated
+            // internally and are deliberately NOT parameters — RFC 8291 §2
+            // requires both to be fresh per message, and reusing either breaks
+            // the AEAD completely.
+            env_->define("webpush_encrypt", makeNative([webpushReady](std::vector<Value> a) -> Value {
+                if (!webpushReady() || a.size() < 3) return Value();
+                bantu_webpush::Bytes p256dh, auth;
+                if (!bantu_webpush::b64url_decode(a[0].toString(), p256dh) || p256dh.size() != 65) return Value();
+                if (!bantu_webpush::b64url_decode(a[1].toString(), auth)   || auth.size() == 0)   return Value();
+                std::vector<unsigned char> pt = bantuToBytes(a[2]);
+                bantu_webpush::Bytes body;
+                if (!bantu_webpush::encrypt(p256dh.data(), auth.data(), auth.size(),
+                                            pt.data(), pt.size(), body)) return Value();
+                return bantuBytesToList(body.data(), body.size());
+            }));
+
+            // Decrypt as a subscriber would. For tests and tooling; a server
+            // never needs it. Returns null on ANY failure — null means REJECT.
+            env_->define("webpush_decrypt", makeNative([webpushReady](std::vector<Value> a) -> Value {
+                if (!webpushReady() || a.size() < 3) return Value();
+                bantu_webpush::Bytes priv, auth;
+                if (!bantu_webpush::b64url_decode(a[0].toString(), priv) || priv.size() != 32) return Value();
+                if (!bantu_webpush::b64url_decode(a[1].toString(), auth)) return Value();
+                std::vector<unsigned char> body = bantuToBytes(a[2]);
+                bantu_webpush::Bytes out;
+                if (!bantu_webpush::decrypt(priv.data(), auth.data(), auth.size(),
+                                            body.data(), body.size(), out)) return Value();
+                return bantuBytesToList(out.data(), out.size());
+            }));
+
+            // webpush_jwt(private, aud, sub, exp_seconds) -> signed ES256 JWT
+            env_->define("webpush_jwt", makeNative([webpushReady](std::vector<Value> a) -> Value {
+                if (!webpushReady() || a.size() < 4) return Value();
+                bantu_webpush::Bytes priv;
+                if (!bantu_webpush::b64url_decode(a[0].toString(), priv) || priv.size() != 32) return Value();
+                std::string out;
+                if (!bantu_webpush::jwt(priv.data(), a[1].toString(), a[2].toString(),
+                                        (int64_t)a[3].numberVal, out)) return Value();
+                return Value(out);
+            }));
+
+            // webpush_vapid_header(private, aud, sub, exp) -> "vapid t=..., k=..."
+            env_->define("webpush_vapid_header", makeNative([webpushReady](std::vector<Value> a) -> Value {
+                if (!webpushReady() || a.size() < 4) return Value();
+                bantu_webpush::Bytes priv;
+                if (!bantu_webpush::b64url_decode(a[0].toString(), priv) || priv.size() != 32) return Value();
+                std::string out;
+                if (!bantu_webpush::vapid_header(priv.data(), a[1].toString(), a[2].toString(),
+                                                 (int64_t)a[3].numberVal, out)) return Value();
+                return Value(out);
+            }));
+
+            // The `aud` claim: the ORIGIN of an endpoint, not the whole URL.
+            env_->define("webpush_aud", makeNative([](std::vector<Value> a) -> Value {
+                if (a.empty()) return Value();
+                std::string out;
+                if (!bantu_webpush::origin_of(a[0].toString(), out)) return Value();
+                return Value(out);
+            }));
+
+            // file_exists(path) -> bool. readfile()/open() raise on a missing
+            // file, so without this there is no way to write a "create it if it
+            // isn't there yet" flow in Bantu.
+            env_->define("file_exists", makeNative([](std::vector<Value> a) -> Value {
+                if (a.empty()) return Value(false);
+                std::ifstream f(a[0].toString(), std::ios::binary);
+                return Value(f.good());
+            }));
+
+            env_->define("b64url_encode", makeNative([](std::vector<Value> a) -> Value {
+                if (a.empty()) return Value(std::string(""));
+                std::vector<unsigned char> b = bantuToBytes(a[0]);
+                return Value(bantu_webpush::b64url_encode(b.data(), b.size()));
+            }));
+            env_->define("b64url_decode", makeNative([](std::vector<Value> a) -> Value {
+                if (a.empty()) return Value();
+                bantu_webpush::Bytes out;
+                if (!bantu_webpush::b64url_decode(a[0].toString(), out)) return Value();
+                return bantuBytesToList(out.data(), out.size());
+            }));
+
             // has_native(name) -> bool. Lets .b modules feature-detect an
             // accelerator and fall back to the pure implementation when a given
             // interpreter build doesn't ship it. Kept in sync with the set above.
@@ -2698,11 +3196,17 @@ private:
                 static const std::set<std::string> kNatives = {
                     "md5","sha1","sha224","sha256","sha384","sha512",
                     "hmac_sha256","hash_file",
-                    "col"   // arctic native column primitives + kernels
+                    "col",  // arctic native column primitives + kernels
+                    "pwa"   // sua.pwa: manifest / service worker / offline
 #ifdef BANTU_ARROW
                     ,"arrow"  // Parquet + Feather/Arrow-IPC I/O (opt-in build)
 #endif
                 };
+                if (a[0].stringVal == "webpush") {
+                    // Reported only when the known-answer selftest passes, so a
+                    // miscompiled build advertises no push support at all.
+                    return Value(bantu_webpush::selftest().ok);
+                }
                 return Value(kNatives.count(a[0].stringVal) > 0);
             }));
 
@@ -3989,7 +4493,6 @@ private:
         // sua.http.get(url)
         httpClientObj["get"] = makeNative([](std::vector<Value> args) -> Value {
             std::string url = args.size() > 0 ? args[0].toString() : "https://httpbin.org/get";
-            std::cout << "  [HTTP] GET " << url << "\n";
             return bantuHttpRequest("GET", url);
         });
 
@@ -3998,7 +4501,6 @@ private:
             std::string url = args.size() > 0 ? args[0].toString() : "https://httpbin.org/post";
             std::string body = args.size() > 1 ? args[1].toString() : "";
             std::string contentType = args.size() > 2 ? args[2].toString() : "application/json";
-            std::cout << "  [HTTP] POST " << url << "\n";
             return bantuHttpRequest("POST", url, body, contentType);
         });
 
@@ -4007,14 +4509,12 @@ private:
             std::string url = args.size() > 0 ? args[0].toString() : "https://httpbin.org/put";
             std::string body = args.size() > 1 ? args[1].toString() : "";
             std::string contentType = args.size() > 2 ? args[2].toString() : "application/json";
-            std::cout << "  [HTTP] PUT " << url << "\n";
             return bantuHttpRequest("PUT", url, body, contentType);
         });
 
         // sua.http.delete(url)
         httpClientObj["delete"] = makeNative([](std::vector<Value> args) -> Value {
             std::string url = args.size() > 0 ? args[0].toString() : "https://httpbin.org/delete";
-            std::cout << "  [HTTP] DELETE " << url << "\n";
             return bantuHttpRequest("DELETE", url);
         });
 
@@ -4023,18 +4523,516 @@ private:
             std::string url = args.size() > 0 ? args[0].toString() : "https://httpbin.org/patch";
             std::string body = args.size() > 1 ? args[1].toString() : "";
             std::string contentType = args.size() > 2 ? args[2].toString() : "application/json";
-            std::cout << "  [HTTP] PATCH " << url << "\n";
             return bantuHttpRequest("PATCH", url, body, contentType);
         });
 
         // sua.http.head(url)
         httpClientObj["head"] = makeNative([](std::vector<Value> args) -> Value {
             std::string url = args.size() > 0 ? args[0].toString() : "https://httpbin.org/get";
-            std::cout << "  [HTTP] HEAD " << url << "\n";
             return bantuHttpRequest("HEAD", url);
         });
 
+        // sua.http.request({method, url, headers, body, timeout, insecure})
+        //
+        // The general form: arbitrary request headers and a BINARY-SAFE body.
+        // The convenience helpers above cannot set an Authorization header, and
+        // before this existed a body containing a NUL byte was silently
+        // truncated by libcurl's strlen(). `body` may be a string or a byte-list.
+        httpClientObj["request"] = makeNative([](std::vector<Value> args) -> Value {
+            if (args.empty() || !args[0].isObject()) {
+                ObjectMap err;
+                err["ok"] = Value(false);
+                err["status"] = Value(0.0);
+                err["error"] = Value(std::string("sua.http.request expects an options object"));
+                return Value(std::move(err));
+            }
+            ObjectMap& o = *args[0].objectVal;
+            auto opt_str = [&](const char* k, const std::string& dflt) {
+                auto it = o.find(k);
+                return (it == o.end() || it->second.isNull()) ? dflt : it->second.toString();
+            };
+            std::string method = opt_str("method", "GET");
+            for (auto& c : method) c = (char)std::toupper((unsigned char)c);
+            std::string url = opt_str("url", "");
+            if (url.empty()) {
+                ObjectMap err;
+                err["ok"] = Value(false);
+                err["status"] = Value(0.0);
+                err["error"] = Value(std::string("sua.http.request: url is required"));
+                return Value(std::move(err));
+            }
+
+            std::string body;
+            auto bit = o.find("body");
+            if (bit != o.end() && !bit->second.isNull()) {
+                if (bit->second.isList()) {
+                    std::vector<unsigned char> b = bantuToBytes(bit->second);
+                    body.assign(b.begin(), b.end());
+                } else if (bit->second.isObject()) {
+                    body = bantuJsonStringify(bit->second);
+                } else {
+                    body = bit->second.toString();
+                }
+            }
+
+            BantuHttpOptions opt;
+            auto tit = o.find("timeout");
+            if (tit != o.end() && tit->second.isNumber()) opt.timeout = (long)tit->second.numberVal;
+            auto iit = o.find("insecure");
+            if (iit != o.end()) opt.verifyTls = !iit->second.isTruthy();
+            auto vit = o.find("verbose");
+            if (vit != o.end()) opt.verbose = vit->second.isTruthy();
+
+            auto hit = o.find("headers");
+            if (hit != o.end() && hit->second.isObject()) {
+                for (auto& kv : *hit->second.objectVal)
+                    opt.headers.emplace_back(kv.first, kv.second.toString());
+            }
+            std::string contentType = opt_str("content_type", "");
+            return bantuHttpRequestEx(method, url, body, contentType, opt);
+        });
+
         suaObj["http"] = Value(std::move(httpClientObj));
+
+        // ════════════════════════════════════════════════════════
+        // SUA PWA — manifest, service worker, offline page, install prompt.
+        //
+        // Modelled on django-pwa: one flat config dict, three auto-registered
+        // root URLs, and a meta-tag helper. See docs/pwa-research.md.
+        // ════════════════════════════════════════════════════════
+
+        ObjectMap pwaObj;
+
+        pwaObj["configure"] = makeNative([](std::vector<Value> args) -> Value {
+            bantu_pwa::Config& c = bantuPwaConfig;
+            if (!args.empty() && args[0].isObject()) {
+                ObjectMap& o = *args[0].objectVal;
+                auto S = [&](const char* k, std::string& dst) {
+                    auto it = o.find(k);
+                    if (it != o.end() && !it->second.isNull()) dst = it->second.toString();
+                };
+                auto B = [&](const char* k, bool& dst) {
+                    auto it = o.find(k);
+                    if (it != o.end() && !it->second.isNull()) dst = it->second.isTruthy();
+                };
+                auto J = [&](const char* k, std::string& dst) {   // pass the list through as JSON
+                    auto it = o.find(k);
+                    if (it != o.end() && it->second.isList()) dst = bantuJsonStringify(it->second);
+                };
+                // Parse a list of {src, sizes, type, media} for the meta tags.
+                auto ICONS = [&](const char* k, std::vector<bantu_pwa::IconEntry>& dst) {
+                    auto it = o.find(k);
+                    if (it == o.end() || !it->second.isList()) return;
+                    dst.clear();
+                    for (auto& e : it->second.listVal) {
+                        if (!e.isObject()) continue;
+                        bantu_pwa::IconEntry ie;
+                        ObjectMap& m = *e.objectVal;
+                        auto get = [&](const char* kk) {
+                            auto i2 = m.find(kk);
+                            return (i2 == m.end() || i2->second.isNull()) ? std::string("") : i2->second.toString();
+                        };
+                        ie.src = get("src"); ie.sizes = get("sizes");
+                        ie.type = get("type"); ie.media = get("media");
+                        if (!ie.src.empty()) dst.push_back(ie);
+                    }
+                };
+
+                S("name", c.name);                     S("short_name", c.short_name);
+                S("description", c.description);       S("theme_color", c.theme_color);
+                S("background_color", c.background_color);
+                S("display", c.display);               S("scope", c.scope);
+                S("start_url", c.start_url);           S("orientation", c.orientation);
+                S("lang", c.lang);                     S("dir", c.dir);
+                S("status_bar_color", c.status_bar_color);
+                S("offline_url", c.offline_url);       S("service_worker", c.service_worker);
+                S("cache_version", c.cache_version);
+                B("debug", c.debug);                   B("auto_inject", c.auto_inject);
+                B("auto_register", c.auto_register);
+
+                J("icons", c.icons_json);              J("screenshots", c.screenshots_json);
+                J("shortcuts", c.shortcuts_json);      J("categories", c.categories_json);
+                ICONS("icons", c.icons);
+                ICONS("icons_apple", c.icons_apple);
+                ICONS("splash_screen", c.splash_screen);
+
+                auto pit = o.find("precache");
+                if (pit != o.end() && pit->second.isList()) {
+                    c.precache.clear();
+                    for (auto& e : pit->second.listVal) c.precache.push_back(e.toString());
+                }
+            }
+            c.configured = true;
+
+            // ── auto-register the routes, exactly as django-pwa's urls.py does ──
+            // Dropping any previous set keeps configure() idempotent.
+            static const char* kPwaPaths[] = { "/manifest.json", "/manifest.webmanifest",
+                                               "/serviceworker.js", "/pwa.js", "/offline" };
+            bantuServerRoutes.erase(
+                std::remove_if(bantuServerRoutes.begin(), bantuServerRoutes.end(),
+                    [&](const BantuServerRoute& r) {
+                        for (const char* p : kPwaPaths)
+                            if (r.path == p && r.method == "GET") return true;
+                        return false;
+                    }),
+                bantuServerRoutes.end());
+
+            auto addRoute = [](const char* path, NativeFn fn) {
+                bantuServerRoutes.push_back({ "GET", path, makeNative(std::move(fn)) });
+            };
+
+            addRoute("/manifest.json", [](std::vector<Value> a) -> Value {
+                bantuPwaRespond(a.size() > 1 ? a[1] : Value(), 200,
+                                "application/manifest+json; charset=utf-8",
+                                bantu_pwa::render_manifest(bantuPwaConfig),
+                                {{"Cache-Control", "no-cache"}});
+                return Value();
+            });
+            addRoute("/manifest.webmanifest", [](std::vector<Value> a) -> Value {
+                bantuPwaRespond(a.size() > 1 ? a[1] : Value(), 200,
+                                "application/manifest+json; charset=utf-8",
+                                bantu_pwa::render_manifest(bantuPwaConfig),
+                                {{"Cache-Control", "no-cache"}});
+                return Value();
+            });
+            addRoute("/serviceworker.js", [](std::vector<Value> a) -> Value {
+                std::string js;
+                // A custom worker replaces ours wholesale (django-pwa's
+                // PWA_SERVICE_WORKER_PATH).
+                if (!bantuPwaConfig.service_worker.empty()) {
+                    std::ifstream f(bantuPwaConfig.service_worker, std::ios::binary);
+                    if (f.good()) { std::stringstream ss; ss << f.rdbuf(); js = ss.str(); }
+                    else {
+                        std::cerr << "  [sua.pwa] service_worker not found: "
+                                  << bantuPwaConfig.service_worker << " — serving the generated one\n";
+                    }
+                }
+                if (js.empty()) js = bantu_pwa::render_service_worker(bantuPwaConfig);
+                // Root scope + never cached: a stale worker is sticky and hard
+                // for a user to clear.
+                bantuPwaRespond(a.size() > 1 ? a[1] : Value(), 200,
+                                "application/javascript; charset=utf-8", js,
+                                {{"Cache-Control", "no-cache"},
+                                 {"Service-Worker-Allowed", "/"}});
+                return Value();
+            });
+            addRoute("/pwa.js", [](std::vector<Value> a) -> Value {
+                bantuPwaRespond(a.size() > 1 ? a[1] : Value(), 200,
+                                "application/javascript; charset=utf-8",
+                                bantu_pwa::render_client_js(bantuPwaConfig),
+                                {{"Cache-Control", "no-cache"}});
+                return Value();
+            });
+            addRoute("/offline", [](std::vector<Value> a) -> Value {
+                // Prefer the app's own offline.html from a static dir; fall back
+                // to the built-in page.
+                std::string html;
+                for (const auto& dir : bantuServerStatic) {
+                    std::string p = dir;
+                    if (!p.empty() && p.back() == '/') p.pop_back();
+                    p += "/offline.html";
+                    std::ifstream f(p, std::ios::binary);
+                    if (f.good()) { std::stringstream ss; ss << f.rdbuf(); html = ss.str(); break; }
+                }
+                if (html.empty()) html = bantu_pwa::render_offline_page(bantuPwaConfig);
+                else if (bantuPwaConfig.auto_inject)
+                    html = bantu_pwa::inject_meta(html, bantu_pwa::render_meta(bantuPwaConfig));
+                bantuPwaRespond(a.size() > 1 ? a[1] : Value(), 200,
+                                "text/html; charset=utf-8", html,
+                                {{"Cache-Control", "no-cache"}});
+                return Value();
+            });
+
+            ObjectMap info;
+            info["configured"] = Value(true);
+            info["name"] = Value(bantuPwaConfig.name);
+            std::vector<Value> routes;
+            for (const char* p : kPwaPaths) routes.push_back(Value(std::string(p)));
+            info["routes"] = Value(std::move(routes));
+            return Value(std::move(info));
+        });
+
+        // The <head> block — django-pwa's {% progressive_web_app_meta %}.
+        pwaObj["meta"] = makeNative([](std::vector<Value>) -> Value {
+            return Value(bantu_pwa::render_meta(bantuPwaConfig));
+        });
+        pwaObj["manifest"] = makeNative([](std::vector<Value>) -> Value {
+            return Value(bantu_pwa::render_manifest(bantuPwaConfig));
+        });
+        pwaObj["serviceworker"] = makeNative([](std::vector<Value>) -> Value {
+            return Value(bantu_pwa::render_service_worker(bantuPwaConfig));
+        });
+        pwaObj["client_js"] = makeNative([](std::vector<Value>) -> Value {
+            return Value(bantu_pwa::render_client_js(bantuPwaConfig));
+        });
+        pwaObj["offline_page"] = makeNative([](std::vector<Value>) -> Value {
+            return Value(bantu_pwa::render_offline_page(bantuPwaConfig));
+        });
+        // Inject the meta block into a caller-supplied HTML string.
+        pwaObj["inject"] = makeNative([](std::vector<Value> a) -> Value {
+            if (a.empty()) return Value(std::string(""));
+            return Value(bantu_pwa::inject_meta(a[0].toString(),
+                                                bantu_pwa::render_meta(bantuPwaConfig)));
+        });
+        pwaObj["config"] = makeNative([](std::vector<Value>) -> Value {
+            const bantu_pwa::Config& c = bantuPwaConfig;
+            ObjectMap o;
+            o["configured"] = Value(c.configured);
+            o["name"] = Value(c.name);
+            o["short_name"] = Value(c.short_name.empty() ? c.name : c.short_name);
+            o["theme_color"] = Value(c.theme_color);
+            o["display"] = Value(c.display);
+            o["scope"] = Value(c.scope);
+            o["start_url"] = Value(c.start_url);
+            o["offline_url"] = Value(c.offline_url);
+            o["auto_inject"] = Value(c.auto_inject);
+            o["debug"] = Value(c.debug);
+            o["push_enabled"] = Value(!c.vapid_public_key.empty());
+            return Value(std::move(o));
+        });
+
+        suaObj["pwa"] = Value(std::move(pwaObj));
+
+        // ════════════════════════════════════════════════════════
+        // SUA PUSH — Web Push notifications (the django-webpush half).
+        // ════════════════════════════════════════════════════════
+
+        ObjectMap pushObj;
+
+        pushObj["available"] = makeNative([](std::vector<Value>) -> Value {
+            return Value(bantu_webpush::selftest().ok);
+        });
+
+        // Generate a VAPID keypair. Do this ONCE and store it — the public key
+        // is baked into every subscription, so rotating it invalidates them all.
+        pushObj["vapid_keys"] = makeNative([](std::vector<Value>) -> Value {
+            if (!bantu_webpush::selftest().ok) return Value();
+            unsigned char priv[32], pub[65];
+            bool have = false;
+            for (int i = 0; i < 16 && !have; i++) {
+                if (!bantuCsprng(priv, 32)) return Value();
+                have = bantu_p256::valid_scalar(priv);
+            }
+            if (!have || !bantu_p256::public_from_private(priv, pub)) return Value();
+            ObjectMap o;
+            o["public_key"]  = Value(bantu_webpush::b64url_encode(pub, 65));
+            o["private_key"] = Value(bantu_webpush::b64url_encode(priv, 32));
+            bantu_p256::secure_zero(priv, sizeof priv);
+            return Value(std::move(o));
+        });
+
+        // sua.push.configure({public_key, private_key, subject, db, subscribe_url})
+        pushObj["configure"] = makeNative([](std::vector<Value> args) -> Value {
+            ObjectMap out;
+            if (args.empty() || !args[0].isObject()) {
+                out["ok"] = Value(false);
+                out["error"] = Value(std::string("sua.push.configure expects an options object"));
+                return Value(std::move(out));
+            }
+            ObjectMap& o = *args[0].objectVal;
+            auto get = [&](const char* k) {
+                auto it = o.find(k);
+                return (it == o.end() || it->second.isNull()) ? std::string("") : it->second.toString();
+            };
+            std::string pub = get("public_key"), priv = get("private_key"), subj = get("subject");
+            std::string db = get("db"), sub_url = get("subscribe_url");
+
+            if (pub.empty() || priv.empty()) {
+                out["ok"] = Value(false);
+                out["error"] = Value(std::string("public_key and private_key are required "
+                                                 "— generate them once with sua.push.vapid_keys()"));
+                return Value(std::move(out));
+            }
+            // Fail early and loudly rather than at the first 401 from a push service.
+            bantu_webpush::Bytes pb, sb;
+            if (!bantu_webpush::b64url_decode(priv, sb) || sb.size() != 32) {
+                out["ok"] = Value(false);
+                out["error"] = Value(std::string("private_key must be 32 base64url-encoded octets"));
+                return Value(std::move(out));
+            }
+            if (!bantu_webpush::b64url_decode(pub, pb) || pb.size() != 65) {
+                out["ok"] = Value(false);
+                out["error"] = Value(std::string("public_key must be 65 base64url-encoded octets "
+                                                 "(uncompressed P-256 point)"));
+                return Value(std::move(out));
+            }
+            unsigned char derived[65];
+            if (!bantu_p256::public_from_private(sb.data(), derived) ||
+                std::memcmp(derived, pb.data(), 65) != 0) {
+                out["ok"] = Value(false);
+                out["error"] = Value(std::string("public_key does not match private_key"));
+                return Value(std::move(out));
+            }
+            if (subj.empty()) subj = "mailto:admin@example.com";
+            if (subj.rfind("mailto:", 0) != 0 && subj.rfind("https://", 0) != 0) {
+                out["ok"] = Value(false);
+                out["error"] = Value(std::string("subject must be a mailto: or https: URI"));
+                return Value(std::move(out));
+            }
+
+            bantuPushPrivateKeyB64 = priv;
+            bantuPushSubject = subj;
+            bantuPwaConfig.vapid_public_key = pub;
+            if (!sub_url.empty()) bantuPwaConfig.subscribe_url = sub_url;
+            bantuPushDbPath = db.empty() ? std::string("./push_subscriptions.db") : db;
+            if (!bantuPushDbOpen(bantuPushDbPath)) {
+                out["ok"] = Value(false);
+                out["error"] = Value(std::string("could not open the subscription store: ") + bantuPushDbPath);
+                return Value(std::move(out));
+            }
+
+            // The subscribe/unsubscribe endpoint the generated /pwa.js posts to.
+            std::string path = bantuPwaConfig.subscribe_url;
+            bantuServerRoutes.erase(
+                std::remove_if(bantuServerRoutes.begin(), bantuServerRoutes.end(),
+                    [&](const BantuServerRoute& r) { return r.path == path; }),
+                bantuServerRoutes.end());
+            bantuServerRoutes.push_back({ "POST", path, makeNative(bantuPushSubscribeHandler) });
+            bantuServerRoutes.push_back({ "DELETE", path, makeNative(bantuPushUnsubscribeHandler) });
+
+            out["ok"] = Value(true);
+            out["subscribe_url"] = Value(path);
+            out["db"] = Value(bantuPushDbPath);
+            out["subject"] = Value(subj);
+            return Value(std::move(out));
+        });
+
+        // sua.push.keys(path) — load the VAPID keypair from `path`, generating
+        // and saving it on first run.
+        //
+        // The equivalent of django-webpush's `manage.py
+        // webpush_generate_vapid_keypair`, and the reason it exists: the public
+        // key is baked into every subscription a browser creates, so generating
+        // a fresh pair on each restart silently invalidates all of them. Keeping
+        // the "generate once, then reuse" logic here means an app cannot get
+        // that wrong.
+        pushObj["keys"] = makeNative([](std::vector<Value> a) -> Value {
+            if (!bantu_webpush::selftest().ok) return Value();
+            std::string path = a.empty() ? std::string("./vapid.json") : a[0].toString();
+
+            std::ifstream in(path, std::ios::binary);
+            if (in.good()) {
+                std::stringstream ss;
+                ss << in.rdbuf();
+                std::string text = ss.str();
+                size_t pos = 0;
+                Value parsed = bantuJsonParse(text, pos);
+                if (parsed.isObject()) {
+                    auto pk = parsed.objectVal->find("public_key");
+                    auto sk = parsed.objectVal->find("private_key");
+                    if (pk != parsed.objectVal->end() && sk != parsed.objectVal->end()) return parsed;
+                }
+                std::cerr << "  [sua.push] " << path << " is not a valid keypair file; "
+                             "move it aside to generate a new one\n";
+                return Value();
+            }
+
+            unsigned char priv[32], pub[65];
+            bool have = false;
+            for (int i = 0; i < 16 && !have; i++) {
+                if (!bantuCsprng(priv, 32)) return Value();
+                have = bantu_p256::valid_scalar(priv);
+            }
+            if (!have || !bantu_p256::public_from_private(priv, pub)) return Value();
+
+            ObjectMap o;
+            o["public_key"]  = Value(bantu_webpush::b64url_encode(pub, 65));
+            o["private_key"] = Value(bantu_webpush::b64url_encode(priv, 32));
+            bantu_p256::secure_zero(priv, sizeof priv);
+            Value v(std::move(o));
+
+            std::ofstream out(path, std::ios::binary | std::ios::trunc);
+            if (!out.good()) {
+                std::cerr << "  [sua.push] could not write " << path
+                          << " — the keypair will not survive a restart, "
+                             "which invalidates every subscription\n";
+                return v;
+            }
+            out << bantuJsonStringify(v) << "\n";
+            out.close();
+            std::cerr << "  [sua.push] generated a VAPID keypair -> " << path
+                      << " (keep it secret and stable)\n";
+            return v;
+        });
+
+        pushObj["save"] = makeNative([](std::vector<Value> a) -> Value {
+            if (a.empty()) return Value(false);
+            std::string tag = a.size() > 1 ? a[1].toString() : "";
+            return Value(bantuPushSave(a[0], tag));
+        });
+        pushObj["forget"] = makeNative([](std::vector<Value> a) -> Value {
+            if (a.empty()) return Value(false);
+            return Value(bantuPushForget(a[0].toString()));
+        });
+        pushObj["subscriptions"] = makeNative([](std::vector<Value> a) -> Value {
+            std::string tag = a.empty() ? "" : a[0].toString();
+            return bantuPushList(tag);
+        });
+        pushObj["count"] = makeNative([](std::vector<Value> a) -> Value {
+            std::string tag = a.empty() ? "" : a[0].toString();
+            Value l = bantuPushList(tag);
+            return Value((double)(l.isList() ? l.listVal.size() : 0));
+        });
+
+        // sua.push.send(subscription, payload, options?) -> {ok, status, ...}
+        pushObj["send"] = makeNative([](std::vector<Value> a) -> Value {
+            if (a.size() < 2) {
+                ObjectMap e; e["ok"] = Value(false);
+                e["error"] = Value(std::string("sua.push.send(subscription, payload)"));
+                return Value(std::move(e));
+            }
+            return bantuPushSendOne(a[0], a[1], a.size() > 2 ? a[2] : Value());
+        });
+
+        // Fan out to every stored subscription, pruning any the push service
+        // reports as gone (404/410) — the django-webpush behaviour.
+        pushObj["send_all"] = makeNative([](std::vector<Value> a) -> Value {
+            if (a.empty()) {
+                ObjectMap e; e["ok"] = Value(false);
+                e["error"] = Value(std::string("sua.push.send_all(payload, options?, tag?)"));
+                return Value(std::move(e));
+            }
+            Value opts = a.size() > 1 ? a[1] : Value();
+            std::string tag = a.size() > 2 ? a[2].toString() : "";
+            Value subs = bantuPushList(tag);
+            int sent = 0, failed = 0, pruned = 0;
+            std::vector<Value> results;
+            if (subs.isList()) {
+                for (auto& s : subs.listVal) {
+                    Value r = bantuPushSendOne(s, a[0], opts);
+                    bool ok = false;
+                    int status = 0;
+                    if (r.isObject()) {
+                        auto it = r.objectVal->find("ok");
+                        if (it != r.objectVal->end()) ok = it->second.isTruthy();
+                        auto st = r.objectVal->find("status");
+                        if (st != r.objectVal->end()) status = (int)st->second.numberVal;
+                    }
+                    if (ok) sent++;
+                    else {
+                        failed++;
+                        if (status == 404 || status == 410) {   // subscription is dead
+                            std::string ep;
+                            if (s.isObject()) {
+                                auto e = s.objectVal->find("endpoint");
+                                if (e != s.objectVal->end()) ep = e->second.toString();
+                            }
+                            if (!ep.empty() && bantuPushForget(ep)) pruned++;
+                        }
+                    }
+                    results.push_back(r);
+                }
+            }
+            ObjectMap out;
+            out["ok"] = Value(failed == 0);
+            out["sent"] = Value((double)sent);
+            out["failed"] = Value((double)failed);
+            out["pruned"] = Value((double)pruned);
+            out["results"] = Value(std::move(results));
+            return Value(std::move(out));
+        });
+
+        suaObj["push"] = Value(std::move(pushObj));
 
         // ════════════════════════════════════════════════════════
         // NEW: SUA RESPONSE — Response Helpers

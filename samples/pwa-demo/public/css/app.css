@@ -1,0 +1,51 @@
+:root {
+  color-scheme: dark;
+  --bg: #0f0f13;
+  --card: #17171f;
+  --line: #26263340;
+  --fg: #e9e9f2;
+  --dim: #9a9ab0;
+  --accent: #5b21b6;
+  --accent-lift: #7c3aed;
+  --good: #34d399;
+  --bad: #f87171;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0; background: var(--bg); color: var(--fg);
+  font: 16px/1.6 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  padding: max(1.5rem, env(safe-area-inset-top)) 1.25rem 3rem;
+}
+main { max-width: 44rem; margin: 0 auto; }
+header { text-align: center; padding: 1rem 0 2rem; }
+header img { border-radius: 22%; }
+h1 { font-size: 1.6rem; margin: .75rem 0 .25rem; letter-spacing: -.01em; }
+h2 { font-size: .8rem; text-transform: uppercase; letter-spacing: .08em;
+     color: var(--dim); margin: 0 0 1rem; font-weight: 600; }
+.sub { color: var(--dim); margin: 0; }
+.card {
+  background: var(--card); border: 1px solid var(--line);
+  border-radius: 14px; padding: 1.25rem; margin-bottom: 1.25rem;
+}
+dl { display: grid; grid-template-columns: auto 1fr; gap: .5rem 1rem; margin: 0; }
+dt { color: var(--dim); }
+dd { margin: 0; font-variant-numeric: tabular-nums; }
+.actions { display: flex; flex-wrap: wrap; gap: .6rem; }
+button {
+  font: inherit; font-weight: 500; padding: .6rem 1.1rem; border: 0;
+  border-radius: 9px; background: var(--accent); color: #fff; cursor: pointer;
+  transition: background .15s ease;
+}
+button:hover:not(:disabled) { background: var(--accent-lift); }
+button:disabled { opacity: .4; cursor: not-allowed; }
+button.ghost { background: transparent; border: 1px solid var(--line); color: var(--dim); }
+button.ghost:hover { background: #ffffff0d; color: var(--fg); }
+.msg { min-height: 1.5rem; margin: 1rem 0 0; font-size: .92rem; }
+.msg.good { color: var(--good); }
+.msg.bad { color: var(--bad); }
+ol { margin: 0 0 1rem; padding-left: 1.25rem; color: var(--dim); }
+ol li { margin-bottom: .35rem; }
+code { background: #ffffff0f; padding: .1rem .35rem; border-radius: 4px; font-size: .88em; }
+pre { color: var(--dim); font-size: .85rem; margin: .75rem 0 0; overflow-x: auto; }
+a { color: var(--accent-lift); }
+footer { text-align: center; color: var(--dim); font-size: .85rem; }

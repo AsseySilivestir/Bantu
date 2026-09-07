@@ -37,3 +37,10 @@ vscode-extension/package-lock.json
 bantu-src/compiler/build_pg/
 samples
 samples/webrtc-chat/server.b
+
+# Web Push secrets — a VAPID private key must never be committed. Replacing it
+# silently invalidates every push subscription a browser has already created.
+vapid.json
+**/vapid.json
+push_subscriptions.db
+subscriptions.db

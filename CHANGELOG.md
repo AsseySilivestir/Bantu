@@ -9,6 +9,65 @@ All notable changes to the Bantu programming language are documented in this fil
 
 ### Added
 
+- **[feature] Progressive Web Apps in `sua` (`sua.pwa`)** — any Bantu web app becomes installable and
+  offline-capable from one config call. Modelled on Python's **django-pwa**; the research and design
+  notes are in [docs/pwa-research.md](docs/pwa-research.md).
+  `sua.pwa.configure({...})` takes one flat dict (the `PWA_APP_*` settings minus the prefix) and
+  auto-registers **`/manifest.json`**, `/manifest.webmanifest`, **`/serviceworker.js`**,
+  **`/offline`** and **`/pwa.js`**. The worker is served from the ROOT so its scope covers the whole
+  origin — the single most common PWA bug. The generated worker precaches assets, serves navigations
+  network-first with a cache and offline-page fallback, cleans up old cache versions, and handles
+  `push`/`notificationclick`. `sua.pwa.meta()` renders the `<head>` block (django-pwa's
+  `{% progressive_web_app_meta %}`); with `auto_inject` on it is patched into served HTML
+  automatically, so an existing app becomes installable without touching a template.
+  `window.BantuPWA` (from `/pwa.js`) exposes registration, `beforeinstallprompt` capture,
+  `promptInstall()` and push subscription. Tests: `tests/sua_pwa_test.b` (101) and
+  `tests/sua_pwa_http_test.sh` (32, boots a real server and curls it).
+- **[feature] Web Push notifications (`sua.push`)** — real RFC 8291 (`aes128gcm`) payload encryption
+  and RFC 8292 (VAPID) signing, which django-pwa does *not* provide (that is `django-webpush`).
+  `sua.push.keys(path)` generates the VAPID keypair once and reuses it; `configure()` registers the
+  subscribe endpoint; `send()`/`send_all()` deliver, and `send_all` **prunes subscriptions the push
+  service reports as gone** (404/410). Subscriptions live in their own sqlite store and can be
+  grouped by `tag`. Payloads are capped at 3993 octets and rejected before any network call.
+- **[feature] P-256 and AES-128-GCM (`p256.hpp`, `aes_gcm.hpp`)** — self-contained, no new
+  dependency, compiled unconditionally. Needed because Web Push mandates P-256, which libsodium does
+  not provide; see **DECISIONS D14** for why this is a documented exception to "never hand-roll
+  crypto" and the mitigations that make it acceptable (complete exception-free point formulas,
+  no secret-dependent branches or memory indices, deterministic RFC 6979 nonces, computed rather
+  than transcribed constants, validated public-key import). A known-answer selftest
+  (FIPS 197, NIST GCM, RFC 5869, RFC 6979 §A.2.5, RFC 5903 — 52 checks) runs once on first use and
+  **fails closed**: on any failure `has_native("webpush")` is false and every entry point returns
+  `null`. Atoms are exposed as `webpush_*` plus `b64url_encode`/`b64url_decode`.
+  Tests: `tests/webpush_test.b` (53).
+- **[feature] `sua.http.request(opts)`** — the general HTTP client form, with arbitrary request
+  headers and binary-safe bodies (string, byte-list, or object auto-serialised to JSON).
+  The convenience helpers could not set an `Authorization` header at all.
+- **[feature] `bantu init --pwa <name>`** — scaffolds an installable app: server with PWA and push
+  wired up, offline page, placeholder icons, and a README explaining installability and key handling.
+- **[feature] `file_exists(path)`** — `readfile()`/`open()` raise on a missing file, so there was no
+  way to write a "create it if absent" flow in Bantu.
+- **[feature] `docs/sua.md`** — the first reference for the sua framework: routing, `$req`/`$res`,
+  static files, PWA, push, the HTTP client, and an honest list of known limitations.
+- **[feature] ChatBantu is now a PWA** — installable, offline-capable, and pushes notifications while
+  closed. Every existing route is untouched; `notify()` additionally sends a Web Push tagged to the
+  recipient, and degrades to in-app-only when push is unavailable.
+
+### Fixed
+
+- **[bug fix] Outbound HTTP truncated binary bodies at the first NUL byte** — `CURLOPT_POSTFIELDS`
+  was set without `CURLOPT_POSTFIELDSIZE`, so libcurl called `strlen()` on the buffer. An
+  `aes128gcm` push body starts with 16 random octets, so roughly two in five would have been
+  silently truncated. Bodies are now length-explicit.
+- **[bug fix] TLS certificates were never verified** — `CURLOPT_SSL_VERIFYPEER` was hard-coded to 0,
+  making every outbound HTTPS request unauthenticated. Verification is now **on by default**, with an
+  explicit per-request `"insecure": true` escape hatch (**DECISIONS D15**).
+- **[bug fix] `sua.http.*` logged every request URL to stdout** — unconditionally, which would have
+  written subscriber push endpoints into application output. The trace is now opt-in and goes to
+  stderr.
+- **[bug fix] Static file MIME types** — the table covered nine extensions and lacked
+  `.webmanifest` (required for a manifest served as a file), fonts, WebP/AVIF, WASM, and media.
+  Now ~28 types. HTML and manifests are also served `no-cache` so a stale shell cannot pin itself.
+
 - **[feature] Native digest accelerators (hash performance)** — byte-identical C++ fast paths for
   MD5/SHA-1/SHA-224/SHA-256/HMAC-SHA256 (`crypto_native.hpp`), which the `hash` module transparently
   delegates to via a new `has_native(name)` feature check, falling back to the pure-Bantu reference

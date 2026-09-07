@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Offline — ChatBantu</title>
+  <link rel="stylesheet" href="/css/styles.css">
+  <style>
+    .offline-wrap { min-height: 70vh; display: grid; place-items: center; text-align: center; padding: 2rem; }
+    .offline-wrap h1 { margin: .5rem 0; }
+    .offline-wrap p { opacity: .7; max-width: 26rem; margin: 0 auto 1.5rem; }
+    .offline-dot { display:inline-block; width:.6rem; height:.6rem; border-radius:50%; background:#e5484d; margin-right:.4rem; }
+  </style>
+</head>
+<body>
+  <div class="offline-wrap">
+    <div>
+      <img src="/icons/icon-192.png" alt="" width="72" height="72" style="border-radius:22%">
+      <p><span class="offline-dot"></span>No connection</p>
+      <h1>You're offline</h1>
+      <p>ChatBantu can't reach the server right now. Pages you've already opened are still available,
+         and anything you post will need a connection.</p>
+      <button onclick="location.reload()">Try again</button>
+    </div>
+  </div>
+  <script>addEventListener('online', () => location.reload());</script>
+</body>
+</html>
