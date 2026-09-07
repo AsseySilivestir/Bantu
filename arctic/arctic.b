@@ -144,6 +144,85 @@ class Series {
     def filter($mask)    { return new Series(this.name, col_filter(this.col, this._operand($mask))); }
     def head($n)         { return new Series(this.name, col_head(this.col, $n)); }
     def tail($n)         { return new Series(this.name, col_tail(this.col, $n)); }
+    def reverse()        { return new Series(this.name, col_reverse(this.col)); }
+    def slice($off, $len){ return new Series(this.name, col_slice(this.col, $off, $len)); }
+
+    // ── set / membership ─────────────────────────────────────────────────────
+    def unique()      { return new Series(this.name, col_filter(this.col, col_unique_mask(this.col))); }
+    def is_in($list)  { return new Series(this.name, col_is_in(this.col, $list)); }
+    def between($lo, $hi) { return new Series(this.name, col_and(col_ge(this.col, $lo), col_le(this.col, $hi))); }
+    def is_not_null() { return new Series(this.name, col_not(col_is_null(this.col))); }
+    def drop_nulls()  { return new Series(this.name, col_filter(this.col, col_not(col_is_null(this.col)))); }
+
+    // value_counts() -> DataFrame of [value, count], most frequent first
+    def value_counts() {
+        $g = col_group_agg(this.col, this.col, "count");
+        $c = {};                       // built imperatively: dict literals need literal keys
+        $c[this.name] = $g.keys[0];
+        $c["count"] = $g.values;
+        $vc = new DataFrame([this.name, "count"], $c);
+        return $vc.sort("count", true);
+    }
+    // the most frequent value (first on a tie)
+    def mode() { return this.value_counts().get(this.name).get(0); }
+
+    // ── cumulative / window ──────────────────────────────────────────────────
+    def cumsum()  { return new Series(this.name, col_cumsum(this.col)); }
+    def cumprod() { return new Series(this.name, col_cumprod(this.col)); }
+    def cummax()  { return new Series(this.name, col_cummax(this.col)); }
+    def cummin()  { return new Series(this.name, col_cummin(this.col)); }
+    def shift($n) { $k = 1; if ($n != null) { $k = $n; } return new Series(this.name, col_shift(this.col, $k)); }
+    def diff($n)  { $k = 1; if ($n != null) { $k = $n; } return this.sub(this.shift($k)); }
+    def pct_change($n) {
+        $k = 1; if ($n != null) { $k = $n; }
+        $prev = this.shift($k);
+        return this.sub($prev).div($prev);
+    }
+    def rank($desc) { $d = false; if ($desc != null) { $d = $desc; } return new Series(this.name, col_rank(this.col, $d)); }
+
+    // ── numeric shaping ──────────────────────────────────────────────────────
+    def quantile($q) { return col_quantile(this.col, $q); }
+    def round($d)    { $k = 0; if ($d != null) { $k = $d; } return new Series(this.name, col_round(this.col, $k)); }
+    def clip($lo, $hi) {
+        $c = this.col;
+        if ($lo != null) { $c = col_where(col_lt($c, $lo), $lo, $c); }
+        if ($hi != null) { $c = col_where(col_gt($c, $hi), $hi, $c); }
+        return new Series(this.name, $c);
+    }
+    def product() {
+        $cp = col_cumprod(this.col);
+        $nn = col_filter($cp, col_not(col_is_null($cp)));
+        if (col_len($nn) == 0) { return null; }
+        return col_get($nn, col_len($nn) - 1);
+    }
+    def first() { if (col_len(this.col) == 0) { return null; } return col_get(this.col, 0); }
+    def last()  { $n = col_len(this.col); if ($n == 0) { return null; } return col_get(this.col, $n - 1); }
+    def n_largest($n)  { return this.sort(true).head($n); }
+    def n_smallest($n) { return this.sort(false).head($n); }
+
+    // ── text ─────────────────────────────────────────────────────────────────
+    def upper()             { return new Series(this.name, col_upper(this.col)); }
+    def lower()             { return new Series(this.name, col_lower(this.col)); }
+    def strip()             { return new Series(this.name, col_strip(this.col)); }
+    def str_len()           { return new Series(this.name, col_str_len(this.col)); }
+    def contains($s)        { return new Series(this.name, col_contains(this.col, $s)); }
+    def starts_with($s)     { return new Series(this.name, col_starts_with(this.col, $s)); }
+    def ends_with($s)       { return new Series(this.name, col_ends_with(this.col, $s)); }
+    def replace($from, $to) { return new Series(this.name, col_replace(this.col, $from, $to)); }
+    def substr($start, $len){ return new Series(this.name, col_substr(this.col, $start, $len)); }
+
+    // ── escape hatch: apply a Bantu function elementwise ─────────────────────
+    // Interpreted per element (unlike the vectorized ops above), so use it for
+    // logic the built-ins can't express, not in the hot path.
+    def map($fn) {
+        $out = [];
+        each ($v in col_to_list(this.col)) {
+            if ($v == null) { $out[len($out)] = null; }
+            else { $out[len($out)] = $fn($v); }
+        }
+        return new Series(this.name, col($out, _inferDtype($out)));
+    }
+    def apply($fn) { return this.map($fn); }
 }
 
 
@@ -232,12 +311,161 @@ class DataFrame {
         return new DataFrame(this.names, $c);
     }
 
-    // sort all columns by one column -> DataFrame
+    // sort by one column, or by several (a list of names) -> DataFrame.
+    // Multi-key works because col_argsort is stable: sort by the last key first,
+    // then earlier keys, and earlier keys end up dominant.
     def sort($name, $desc) {
-        if (!this.has($name)) { throw "arctic: column '" + $name + "' not found"; }
-        $order = col_argsort(this.cols[$name], $desc);
+        if (type($name) == "string") {
+            if (!this.has($name)) { throw "arctic: column '" + $name + "' not found"; }
+            $order = col_argsort(this.cols[$name], $desc);
+            $c = {};
+            each ($n in this.names) { $c[$n] = col_take(this.cols[$n], $order); }
+            return new DataFrame(this.names, $c);
+        }
+        $out = this;
+        $i = len($name) - 1;
+        while ($i >= 0) {
+            $out = $out.sort($name[$i], $desc);
+            $i = $i - 1;
+        }
+        return $out;
+    }
+
+    // ── row selection / shaping ──────────────────────────────────────────────
+    def slice($off, $len) {
         $c = {};
-        each ($n in this.names) { $c[$n] = col_take(this.cols[$n], $order); }
+        each ($n in this.names) { $c[$n] = col_slice(this.cols[$n], $off, $len); }
+        return new DataFrame(this.names, $c);
+    }
+    def reverse() {
+        $c = {};
+        each ($n in this.names) { $c[$n] = col_reverse(this.cols[$n]); }
+        return new DataFrame(this.names, $c);
+    }
+    def is_empty()   { return this.nrows == 0; }
+    def n_largest($n, $col)  { return this.sort($col, true).head($n); }
+    def n_smallest($n, $col) { return this.sort($col, false).head($n); }
+
+    // keep only the first row of each distinct key combination
+    def unique($subset) {
+        $keys = $subset;
+        if ($keys == null) { $keys = this.names; }
+        if (type($keys) == "string") { $keys = [$keys]; }
+        $kc = [];
+        each ($k in $keys) {
+            if (!this.has($k)) { throw "arctic: column '" + $k + "' not found"; }
+            $kc[len($kc)] = this.cols[$k];
+        }
+        return this.filter(col_unique_mask($kc));
+    }
+    def drop_duplicates($subset) { return this.unique($subset); }
+
+    // drop rows that are null in any of $subset (default: any column)
+    def drop_nulls($subset) {
+        $cols = $subset;
+        if ($cols == null) { $cols = this.names; }
+        if (type($cols) == "string") { $cols = [$cols]; }
+        $mask = null;
+        each ($n in $cols) {
+            if (!this.has($n)) { throw "arctic: column '" + $n + "' not found"; }
+            $ok = col_not(col_is_null(this.cols[$n]));
+            if ($mask == null) { $mask = $ok; } else { $mask = col_and($mask, $ok); }
+        }
+        if ($mask == null) { return this; }
+        return this.filter($mask);
+    }
+
+    // replace nulls everywhere (or in named columns) with a value
+    def fill_null($value, $subset) {
+        $cols = $subset;
+        if ($cols == null) { $cols = this.names; }
+        if (type($cols) == "string") { $cols = [$cols]; }
+        $c = {};
+        each ($n in this.names) { $c[$n] = this.cols[$n]; }
+        each ($n in $cols) {
+            if (this.has($n)) { $c[$n] = col_fill_null(this.cols[$n], $value); }
+        }
+        return new DataFrame(this.names, $c);
+    }
+
+    // nulls per column -> dict
+    def null_count() {
+        $out = {};
+        each ($n in this.names) { $out[$n] = col_null_count(this.cols[$n]); }
+        return $out;
+    }
+
+    // cast columns via a {name: dtype} dict
+    def cast($map) {
+        $c = {};
+        each ($n in this.names) {
+            if (keyIn($map, $n)) { $c[$n] = col_cast(this.cols[$n], $map[$n]); }
+            else { $c[$n] = this.cols[$n]; }
+        }
+        return new DataFrame(this.names, $c);
+    }
+
+    // add/replace several columns at once: [[name, SeriesOrValue], ...]
+    def with_columns($pairs) {
+        $out = this;
+        each ($p in $pairs) { $out = $out.with_column($p[0], $p[1]); }
+        return $out;
+    }
+
+    // one row as a dict, and all rows as a list of dicts
+    def row($i) {
+        $r = {};
+        each ($n in this.names) { $r[$n] = col_get(this.cols[$n], $i); }
+        return $r;
+    }
+    def iter_rows() {
+        $out = [];
+        $i = 0;
+        while ($i < this.nrows) { $out[len($out)] = this.row($i); $i = $i + 1; }
+        return $out;
+    }
+
+    // frequency table for one column
+    def value_counts($name) { return this.get($name).value_counts(); }
+
+    // quantile per numeric column -> dict
+    def quantile($q) {
+        $out = {};
+        each ($n in this.names) {
+            $dt = col_dtype(this.cols[$n]);
+            if ($dt == "i64") { $out[$n] = col_quantile(this.cols[$n], $q); }
+            else if ($dt == "f64") { $out[$n] = col_quantile(this.cols[$n], $q); }
+        }
+        return $out;
+    }
+
+    // Pearson correlation between two numeric columns
+    def corr($a, $b) {
+        $x = this.get($a); $y = this.get($b);
+        $mx = $x.mean(); $my = $y.mean();
+        $dx = $x.sub($mx); $dy = $y.sub($my);
+        $num = $dx.mul($dy).sum();
+        $den = sqrt($dx.mul($dx).sum() * $dy.mul($dy).sum());
+        if ($den == 0) { return null; }
+        return $num / $den;
+    }
+
+    // a random sample of $n rows (without replacement when $n <= height)
+    def sample($n) {
+        $k = $n; if ($k > this.nrows) { $k = this.nrows; }
+        $picked = {};
+        $idx = [];
+        $guard = 0;
+        while (len($idx) < $k) {
+            $r = floor(random() * this.nrows);
+            $rk = str($r);
+            if ($picked[$rk] == null) { $picked[$rk] = true; $idx[len($idx)] = $r; }   // O(1), not keyIn
+            $guard = $guard + 1;
+            if ($guard > this.nrows * 20) { break; }
+        }
+        $order = col($idx, "i64");
+        $c = {};
+        each ($nm in this.names) { $c[$nm] = col_take(this.cols[$nm], $order); }
         return new DataFrame(this.names, $c);
     }
 
@@ -313,8 +541,115 @@ class DataFrame {
         return this.filter(_evalQuery(this, $expr));
     }
 
+    // ── reshape ──────────────────────────────────────────────────────────────
+    // pivot(index, columns, values, op?) — long → wide. One row per distinct
+    // `index` value, one column per distinct `columns` value, cells aggregated
+    // with `op` (default "sum"). Missing combinations are null.
+    def pivot($index, $columns, $values, $op) {
+        $agg = "sum"; if ($op != null) { $agg = $op; }
+        $g = col_group_agg([this.cols[$index], this.cols[$columns]], this.cols[$values], $agg);
+        $iKeys = col_to_list($g.keys[0]);
+        $cKeys = col_to_list($g.keys[1]);
+        $vals  = col_to_list($g.values);
+        // Direct dict lookups (a missing key reads as null) — never keyIn() here,
+        // which scans every key and would make this quadratic in the group count.
+        $cell = {};        // "row|col" -> aggregated value
+        $seenRow = {};
+        $seenCol = {};
+        $rowVals = [];  $rowKeys = [];
+        $colVals = [];
+        $i = 0;
+        while ($i < len($iKeys)) {
+            $rk = str($iKeys[$i]);
+            $ck = str($cKeys[$i]);
+            $cell[$rk + "|" + $ck] = $vals[$i];
+            if ($seenRow[$rk] == null) { $seenRow[$rk] = true; $rowVals[len($rowVals)] = $iKeys[$i]; $rowKeys[len($rowKeys)] = $rk; }
+            if ($seenCol[$ck] == null) { $seenCol[$ck] = true; $colVals[len($colVals)] = $cKeys[$i]; }
+            $i = $i + 1;
+        }
+        $names = [$index];
+        $cols = {};
+        $cols[$index] = col($rowVals, _inferDtype($rowVals));
+        each ($cv in $colVals) {
+            $colName = str($cv);
+            $cells = [];
+            $j = 0;
+            while ($j < len($rowKeys)) {
+                $cells[len($cells)] = $cell[$rowKeys[$j] + "|" + $colName];   // null when absent
+                $j = $j + 1;
+            }
+            $names[len($names)] = $colName;
+            $cols[$colName] = col($cells, _inferDtype($cells));
+        }
+        return new DataFrame($names, $cols);
+    }
+
+    // melt(idVars, valueVars) — wide → long: keeps idVars, and turns each of
+    // valueVars into (variable, value) rows.
+    def melt($idVars, $valueVars) {
+        $ids = $idVars; if (type($ids) == "string") { $ids = [$ids]; }
+        $vals = $valueVars;
+        if ($vals == null) {
+            $vals = [];
+            each ($n in this.names) { if (!_listHas($ids, $n)) { $vals[len($vals)] = $n; } }
+        }
+        if (type($vals) == "string") { $vals = [$vals]; }
+        $names = [];
+        $cols = {};
+        // each id column repeated once per value column
+        each ($idn in $ids) {
+            $parts = [];
+            each ($vn in $vals) { $parts[len($parts)] = this.cols[$idn]; }
+            $names[len($names)] = $idn;
+            $cols[$idn] = col_concat($parts);
+        }
+        // the variable name column, then the stacked values
+        $varParts = [];
+        $valParts = [];
+        each ($vn in $vals) {
+            $varParts[len($varParts)] = col_full(this.nrows, $vn);
+            $valParts[len($valParts)] = this.cols[$vn];
+        }
+        $names[len($names)] = "variable";
+        $cols["variable"] = col_concat($varParts);
+        $names[len($names)] = "value";
+        $cols["value"] = col_concat($valParts);
+        return new DataFrame($names, $cols);
+    }
+
+    // ── combining ────────────────────────────────────────────────────────────
+    // stack another frame's rows underneath this one (columns matched by name)
+    def concat($other) {
+        $c = {};
+        each ($n in this.names) {
+            if (!$other.has($n)) { throw "arctic: concat needs matching columns — '" + $n + "' missing on the right"; }
+            $c[$n] = col_concat([this.cols[$n], $other.cols[$n]]);
+        }
+        return new DataFrame(this.names, $c);
+    }
+    def vstack($other) { return this.concat($other); }
+    // place another frame's columns beside this one (same number of rows)
+    def hstack($other) {
+        $names = _cloneList(this.names);
+        $c = {};
+        each ($n in this.names) { $c[$n] = this.cols[$n]; }
+        each ($n in $other.names) {
+            $nn = $n;
+            if (this.has($n)) { $nn = $n + "_right"; }
+            $names[len($names)] = $nn;
+            $c[$nn] = $other.cols[$n];
+        }
+        return new DataFrame($names, $c);
+    }
+
     def to_csv($path) {
         return write_csv(this.names, this.cols, $path);
+    }
+    // JSON: a list of row objects (the usual interchange shape)
+    def to_json($path) {
+        $text = json.stringify(this.iter_rows());
+        if ($path != null) { writefile($path, $text); return true; }
+        return $text;
     }
     // Parquet / Feather (need an Arrow-enabled build)
     def to_parquet($path) { _needArrow(); return write_parquet(this.names, this.cols, $path); }
@@ -384,6 +719,30 @@ class GroupBy {
     def min($colName)  { return this.agg([[$colName, "min", $colName]]); }
     def max($colName)  { return this.agg([[$colName, "max", $colName]]); }
     def count($colName){ return this.agg([[$colName, "count", $colName]]); }
+    def std($colName)     { return this.agg([[$colName, "std", $colName]]); }
+    def var($colName)     { return this.agg([[$colName, "var", $colName]]); }
+    def median($colName)  { return this.agg([[$colName, "median", $colName]]); }
+    def nunique($colName) { return this.agg([[$colName, "nunique", $colName]]); }
+    def any_($colName)    { return this.agg([[$colName, "any", $colName]]); }
+    def all_($colName)    { return this.agg([[$colName, "all", $colName]]); }
+
+    // rows per group -> DataFrame of [keys..., "count"]
+    def size() {
+        $first = this.keys[0];
+        return this.agg([[$first, "count", "count"]]);
+    }
+
+    // apply every op to one column at once, e.g. .stats("amount")
+    def stats($colName) {
+        return this.agg([
+            [$colName, "count",  $colName + "_count"],
+            [$colName, "sum",    $colName + "_sum"],
+            [$colName, "mean",   $colName + "_mean"],
+            [$colName, "min",    $colName + "_min"],
+            [$colName, "max",    $colName + "_max"],
+            [$colName, "std",    $colName + "_std"]
+        ]);
+    }
 }
 
 
@@ -413,7 +772,16 @@ class LazyFrame {
     def sort($name, $desc)  { return _lazyAppend(this, {"op": "sort", "name": $name, "desc": $desc}); }
     def head($n)            { return _lazyAppend(this, {"op": "head", "n": $n}); }
     def tail($n)            { return _lazyAppend(this, {"op": "tail", "n": $n}); }
+    def limit($n)           { return _lazyAppend(this, {"op": "head", "n": $n}); }
     def with_column($n, $fn){ return _lazyAppend(this, {"op": "with_column", "name": $n, "fn": $fn}); }
+    def drop($cols)         { return _lazyAppend(this, {"op": "drop", "cols": $cols}); }
+    def rename($map)        { return _lazyAppend(this, {"op": "rename", "map": $map}); }
+    def unique($subset)     { return _lazyAppend(this, {"op": "unique", "subset": $subset}); }
+    def drop_nulls($subset) { return _lazyAppend(this, {"op": "drop_nulls", "subset": $subset}); }
+    def reverse()           { return _lazyAppend(this, {"op": "reverse"}); }
+    def slice($off, $len)   { return _lazyAppend(this, {"op": "slice", "off": $off, "len": $len}); }
+    def fill_null($v)       { return _lazyAppend(this, {"op": "fill_null", "value": $v}); }
+    def join($other, $on, $how) { return _lazyAppend(this, {"op": "join", "other": $other, "on": $on, "how": $how}); }
     def groupby($keys) {
         $k = $keys; if (type($keys) == "string") { $k = [$keys]; }
         return new LazyGroupBy(this, $k);
@@ -421,35 +789,60 @@ class LazyFrame {
 
     // Build the optimized plan: { ops: [...], scanCols: [...]|null }.
     def _optimize() {
-        // (1) predicate pushdown — hoist filters that use only base columns.
-        $added = {};       // columns produced by with_column (can't hoist past)
+        // (1) predicate pushdown. A filter may only be hoisted to the front if
+        // every op before it COMMUTES with a row filter. Row-count ops
+        // (head/tail/slice), first-wins ops (unique), namespace ops
+        // (rename/join/with_column/groupby) and value-rewrites (fill_null) do
+        // not commute, so they act as barriers: once one is seen, later filters
+        // stay where they are. select/drop/sort/reverse/drop_nulls are safe.
+        $added = {};        // columns produced by with_column
+        $canHoist = true;
         $hoisted = [];
         $rest = [];
         each ($op in this.ops) {
-            if ($op.op == "with_column") { $added[$op.name] = true; $rest[len($rest)] = $op; }
-            else if ($op.op == "filter") {
+            if ($op.op == "filter") {
                 $usesAdded = false;
                 each ($r in _queryCols($op.expr)) { if (keyIn($added, $r)) { $usesAdded = true; } }
-                if ($usesAdded) { $rest[len($rest)] = $op; }
-                else { $hoisted[len($hoisted)] = $op; }
+                if ($canHoist) {
+                    if ($usesAdded) { $rest[len($rest)] = $op; }
+                    else { $hoisted[len($hoisted)] = $op; }
+                } else { $rest[len($rest)] = $op; }
+            } else {
+                if ($op.op == "with_column") { $added[$op.name] = true; }
+                if (_lazyIsBarrier($op.op)) { $canHoist = false; }
+                $rest[len($rest)] = $op;
             }
-            else { $rest[len($rest)] = $op; }
         }
         $ops2 = [];
         each ($h in $hoisted) { $ops2[len($ops2)] = $h; }
         each ($r in $rest) { $ops2[len($ops2)] = $r; }
 
-        // (2) projection pushdown — only safe when no with_column is present.
-        $hasWith = false;
-        each ($op in $ops2) { if ($op.op == "with_column") { $hasWith = true; } }
+        // (2) projection pushdown. Only safe when nothing can touch a column we
+        // can't see statically: with_column (opaque function), rename/join/drop
+        // (namespace churn) and whole-frame fill_null/unique/drop_nulls.
+        $safe = true;
+        each ($op in $ops2) {
+            if ($op.op == "with_column") { $safe = false; }
+            else if ($op.op == "rename") { $safe = false; }
+            else if ($op.op == "join") { $safe = false; }
+            else if ($op.op == "drop") { $safe = false; }
+            else if ($op.op == "fill_null") { $safe = false; }
+            else if ($op.op == "unique") { if ($op.subset == null) { $safe = false; } }
+            else if ($op.op == "drop_nulls") { if ($op.subset == null) { $safe = false; } }
+        }
         $scanCols = null;
-        if (!$hasWith) {
+        if ($safe) {
             $needed = {};
             $bounded = false;   // do we know the exact set of output columns?
             each ($op in $ops2) {
                 if ($op.op == "filter") { each ($r in _queryCols($op.expr)) { $needed[$r] = true; } }
-                else if ($op.op == "sort") { $needed[$op.name] = true; }
+                else if ($op.op == "sort") {
+                    if (type($op.name) == "string") { $needed[$op.name] = true; }
+                    else { each ($s in $op.name) { $needed[$s] = true; } }
+                }
                 else if ($op.op == "select") { $bounded = true; each ($c in $op.cols) { $needed[$c] = true; } }
+                else if ($op.op == "unique")     { each ($c in $op.subset) { $needed[$c] = true; } }
+                else if ($op.op == "drop_nulls") { each ($c in $op.subset) { $needed[$c] = true; } }
                 else if ($op.op == "groupby_agg") {
                     $bounded = true;
                     each ($k in $op.keys) { $needed[$k] = true; }
@@ -511,6 +904,14 @@ class LazyFrame {
             else if ($op.op == "tail") { $s = $s + "  TAIL " + str($op.n) + "\n"; }
             else if ($op.op == "with_column") { $s = $s + "  WITH_COLUMN " + $op.name + "\n"; }
             else if ($op.op == "groupby_agg") { $s = $s + "  GROUPBY " + str($op.keys) + " AGG " + str($op.specs) + "\n"; }
+            else if ($op.op == "drop") { $s = $s + "  DROP " + str($op.cols) + "\n"; }
+            else if ($op.op == "rename") { $s = $s + "  RENAME " + str($op.map) + "\n"; }
+            else if ($op.op == "unique") { $s = $s + "  UNIQUE " + str($op.subset) + "\n"; }
+            else if ($op.op == "drop_nulls") { $s = $s + "  DROP_NULLS " + str($op.subset) + "\n"; }
+            else if ($op.op == "reverse") { $s = $s + "  REVERSE\n"; }
+            else if ($op.op == "slice") { $s = $s + "  SLICE " + str($op.off) + "," + str($op.len) + "\n"; }
+            else if ($op.op == "fill_null") { $s = $s + "  FILL_NULL " + str($op.value) + "\n"; }
+            else if ($op.op == "join") { $s = $s + "  JOIN on=" + str($op.on) + " how=" + str($op.how) + "\n"; }
         }
         return $s;
     }
@@ -585,6 +986,36 @@ def scan_csv($path, $options) {
     return new LazyFrame({"kind": "csv", "path": $path, "options": $options}, []);
 }
 
+// read_json(pathOrText) -> DataFrame. Accepts a list of row objects (the shape
+// to_json writes) or a {column: list} object.
+def read_json($src) {
+    _need();
+    $text = $src;
+    try { $text = readfile($src); } catch ($e) { $text = $src; }
+    $data = json.parse($text);
+    if ($data == null) { throw "arctic.read_json: could not parse JSON"; }
+    // {column: [...]} form
+    if (type($data) == "object") { return dataframe($data, null); }
+    // [ {col: val, ...}, ... ] form
+    $names = [];
+    $buckets = {};
+    each ($row in $data) {
+        each ($k in keys($row)) {
+            if (!keyIn($buckets, $k)) { $buckets[$k] = []; $names[len($names)] = $k; }
+        }
+    }
+    each ($row in $data) {
+        each ($k in $names) {
+            $b = $buckets[$k];
+            if (keyIn($row, $k)) { $b[len($b)] = $row[$k]; } else { $b[len($b)] = null; }
+            $buckets[$k] = $b;
+        }
+    }
+    $cols = {};
+    each ($k in $names) { $cols[$k] = col($buckets[$k], _inferDtype($buckets[$k])); }
+    return new DataFrame($names, $cols);
+}
+
 // dataframe({name: list, ...}, dtypes?) -> DataFrame
 // Build from Bantu lists; dtype inferred per column unless given in $dtypes.
 def dataframe($data, $dtypes) {
@@ -620,6 +1051,12 @@ def keyIn($dict, $key) {
     return false;
 }
 
+// does a list contain a value?
+def _listHas($l, $x) {
+    each ($e in $l) { if ($e == $x) { return true; } }
+    return false;
+}
+
 // shallow copy of a list (for immutable lazy-plan building)
 def _cloneList($l) {
     $o = [];
@@ -643,6 +1080,20 @@ def _lazyAppend($lf, $op) {
     return new LazyFrame($lf.source, $o);
 }
 
+// Ops a row filter must NOT be hoisted above (see LazyFrame._optimize).
+def _lazyIsBarrier($opName) {
+    if ($opName == "head") { return true; }
+    if ($opName == "tail") { return true; }
+    if ($opName == "slice") { return true; }
+    if ($opName == "unique") { return true; }
+    if ($opName == "rename") { return true; }
+    if ($opName == "join") { return true; }
+    if ($opName == "with_column") { return true; }
+    if ($opName == "fill_null") { return true; }
+    if ($opName == "groupby_agg") { return true; }
+    return false;
+}
+
 // Execute an optimized op list against a materialized DataFrame. Also a free
 // function so its $df.method(...) calls bind `this` to the DataFrame correctly.
 def _runLazy($df, $ops) {
@@ -654,6 +1105,18 @@ def _runLazy($df, $ops) {
         else if ($op.op == "tail") { $df = $df.tail($op.n); }
         else if ($op.op == "with_column") { $fn = $op.fn; $df = $df.with_column($op.name, $fn($df)); }
         else if ($op.op == "groupby_agg") { $df = $df.groupby($op.keys).agg($op.specs); }
+        else if ($op.op == "drop") { $df = $df.drop($op.cols); }
+        else if ($op.op == "rename") { $df = $df.rename($op.map); }
+        else if ($op.op == "unique") { $df = $df.unique($op.subset); }
+        else if ($op.op == "drop_nulls") { $df = $df.drop_nulls($op.subset); }
+        else if ($op.op == "reverse") { $df = $df.reverse(); }
+        else if ($op.op == "slice") { $df = $df.slice($op.off, $op.len); }
+        else if ($op.op == "fill_null") { $df = $df.fill_null($op.value, null); }
+        else if ($op.op == "join") {
+            $oth = $op.other;
+            if ($oth.ops != null) { $oth = $oth.collect(); }   // a LazyFrame → materialize it
+            $df = $df.join($oth, $op.on, $op.how);
+        }
     }
     return $df;
 }

@@ -177,6 +177,28 @@ Comparisons are overlay-aware: a datetime/date column vs an ISO **string** parse
 same epoch unit; a categorical compares as its category text. `sort`/`filter`/`take`/`head`/group
 keys keep the overlay so results still render as timestamps / categories.
 
+## Window, set & text atoms
+| Builtin | What it does |
+|---|---|
+| `col_cumsum/cumprod/cummax/cummin(c)` | running totals; nulls stay null and are skipped by the accumulator |
+| `col_shift(c, n)` | move values down by n (negative = up); vacated slots null; keeps datetime/categorical |
+| `col_rank(c, desc?)` | 1-based ranks, ties share the lowest ("min" method) |
+| `col_quantile(c, q)` | quantile with linear interpolation, `q` in 0..1 |
+| `col_reverse(c)` | rows in reverse order |
+| `col_concat([c1, c2, ...])` | stack columns end to end; mixed dtypes widen (utf8 > f64 > i64/bool) |
+| `col_unique_mask(cols)` | boolean mask, true at the **first** occurrence of each key combination |
+| `col_is_in(c, [values])` | membership mask |
+| `col_round(c, digits)` | round to N decimals |
+| `col_full(n, value)` | a constant column of length n (broadcast a literal without building a list) |
+| `col_upper/lower/strip/str_len(c)` | text transforms (`str_len` → i64) |
+| `col_contains/starts_with/ends_with(c, s)` | text predicates → boolean mask |
+| `col_replace(c, from, to)` | replace every occurrence |
+| `col_substr(c, start, len?)` | substring; a negative `start` counts from the end, `len` omitted = to the end |
+
+Text atoms accept a categorical column too (it is materialized to its category strings first).
+On 1M rows: `cumsum` ~10 ms, `shift` ~29 ms, `concat` ~39 ms, `upper` ~67 ms, `is_in` ~67 ms,
+`unique_mask` ~163 ms, `quantile` ~158 ms, `rank` ~499 ms (it sorts).
+
 ## Fast & columnar I/O atoms
 | Builtin | What it does |
 |---|---|

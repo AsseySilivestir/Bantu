@@ -46,6 +46,7 @@
 #include <cerrno>
 #include <charconv>
 #include <cstdio>
+#include <cctype>
 
 namespace arctic {
 
@@ -1197,6 +1198,349 @@ inline Value joinIdx(const std::vector<ColumnPtr>& L, const std::vector<ColumnPt
         isnull = false; return rowKey(side==0?L:Rk, i);
     };
     return joinImpl<std::string>(ln, rn, keyOf, how);
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+//  WINDOW / SET / STRING KERNELS
+//  ---------------------------------------------------------------------------
+//  The building blocks the arctic package needs for cumulative stats, shifting,
+//  ranking, quantiles, de-duplication, concatenation, membership and text work.
+//  All single-pass (or one sort) over the contiguous buffers — doing any of these
+//  as an interpreted per-element loop would be orders of magnitude slower.
+// ════════════════════════════════════════════════════════════════════════════
+
+enum class Cum { SUM, PROD, MAX, MIN };
+
+// Running total/product/max/min. Nulls stay null and are skipped by the
+// accumulator (pandas semantics), so a null never poisons the rest.
+inline ColumnPtr cumOp(const Column& c, Cum op) {
+    if (c.dtype == DType::UTF8 || c.logical == Logical::CAT)
+        throw std::runtime_error("cumulative operations need a numeric column");
+    bool intPath = (c.dtype == DType::I64 || c.dtype == DType::BOOL) && c.logical == Logical::NONE;
+    auto o = std::make_shared<Column>(); o->n = c.n; o->valid = c.valid;
+    if (intPath) {
+        o->dtype = DType::I64; o->i64.resize(c.n);
+        int64_t acc = (op == Cum::PROD) ? 1 : 0; bool started = false;
+        for (size_t i = 0; i < c.n; i++) {
+            if (!c.valid[i]) continue;
+            int64_t v = (c.dtype == DType::I64) ? c.i64[i] : (c.b[i] ? 1 : 0);
+            if (!started) { acc = v; started = true; }
+            else switch (op) {
+                case Cum::SUM:  acc += v; break;
+                case Cum::PROD: acc *= v; break;
+                case Cum::MAX:  if (v > acc) acc = v; break;
+                case Cum::MIN:  if (v < acc) acc = v; break;
+            }
+            o->i64[i] = acc;
+        }
+    } else {
+        o->dtype = DType::F64; o->f64.resize(c.n);
+        double acc = 0; bool started = false;
+        for (size_t i = 0; i < c.n; i++) {
+            if (!c.valid[i]) continue;
+            double v = (c.dtype == DType::F64) ? c.f64[i]
+                     : (c.dtype == DType::I64 ? (double)c.i64[i] : (c.b[i] ? 1.0 : 0.0));
+            if (!started) { acc = v; started = true; }
+            else switch (op) {
+                case Cum::SUM:  acc += v; break;
+                case Cum::PROD: acc *= v; break;
+                case Cum::MAX:  if (v > acc) acc = v; break;
+                case Cum::MIN:  if (v < acc) acc = v; break;
+            }
+            o->f64[i] = acc;
+        }
+    }
+    return o;
+}
+
+// col_shift(c, n): move values down by n (n<0 moves up); vacated slots are null.
+// Keeps dtype + datetime/categorical overlay, so shifting a timestamp column
+// still renders as timestamps.
+inline ColumnPtr shiftOp(const Column& c, int64_t n) {
+    auto o = std::make_shared<Column>();
+    o->dtype = c.dtype; o->n = c.n; o->valid.assign(c.n, 0);
+    switch (c.dtype) { case DType::F64:o->f64.resize(c.n);break; case DType::I64:o->i64.resize(c.n);break;
+                       case DType::BOOL:o->b.resize(c.n);break; case DType::UTF8:o->s.resize(c.n);break; }
+    for (size_t i = 0; i < c.n; i++) {
+        int64_t src = (int64_t)i - n;
+        if (src < 0 || (size_t)src >= c.n) continue;      // outside → stays null
+        if (!c.valid[src]) continue;
+        o->valid[i] = 1;
+        switch (c.dtype) {
+            case DType::F64:  o->f64[i] = c.f64[src]; break;
+            case DType::I64:  o->i64[i] = c.i64[src]; break;
+            case DType::BOOL: o->b[i]   = c.b[src];   break;
+            case DType::UTF8: o->s[i]   = c.s[src];   break;
+        }
+    }
+    carryMeta(*o, c);
+    return o;
+}
+
+// col_full(n, value): a constant column of length n (dtype inferred from value).
+// Used for broadcasting a literal into a frame (e.g. melt's `variable` column)
+// without building an n-element Bantu list first.
+inline ColumnPtr fullOp(size_t n, const Value& v) {
+    auto o = std::make_shared<Column>(); o->n = n;
+    if (v.isNull()) { o->dtype = DType::F64; o->f64.assign(n, 0.0); o->valid.assign(n, 0); return o; }
+    o->valid.assign(n, 1);
+    if (v.isBool())        { o->dtype = DType::BOOL; o->b.assign(n, v.boolVal ? 1 : 0); }
+    else if (v.isNumber()) {
+        if (std::floor(v.numberVal) == v.numberVal && std::fabs(v.numberVal) < 9.0e15) {
+            o->dtype = DType::I64; o->i64.assign(n, (int64_t)std::llround(v.numberVal));
+        } else { o->dtype = DType::F64; o->f64.assign(n, v.numberVal); }
+    }
+    else { o->dtype = DType::UTF8; o->s.assign(n, v.isString() ? v.stringVal : v.toString()); }
+    return o;
+}
+
+// col_reverse(c): rows in reverse order (keeps dtype + overlay).
+inline ColumnPtr reverseOp(const Column& c) {
+    auto o = std::make_shared<Column>();
+    o->dtype = c.dtype; o->n = c.n; o->valid.resize(c.n);
+    switch (c.dtype) { case DType::F64:o->f64.resize(c.n);break; case DType::I64:o->i64.resize(c.n);break;
+                       case DType::BOOL:o->b.resize(c.n);break; case DType::UTF8:o->s.resize(c.n);break; }
+    for (size_t i = 0; i < c.n; i++) {
+        size_t j = c.n - 1 - i;
+        o->valid[i] = c.valid[j];
+        switch (c.dtype) {
+            case DType::F64:  o->f64[i] = c.f64[j]; break;
+            case DType::I64:  o->i64[i] = c.i64[j]; break;
+            case DType::BOOL: o->b[i]   = c.b[j];   break;
+            case DType::UTF8: o->s[i]   = c.s[j];   break;
+        }
+    }
+    carryMeta(*o, c);
+    return o;
+}
+
+// col_rank(c, descending): 1-based ranks; ties share the lowest rank ("min"
+// method, like pandas rank(method="min")). Nulls stay null.
+inline ColumnPtr rankOp(const Column& c, bool desc) {
+    ColumnPtr ord = argsortOp(c, desc);               // stable, nulls last
+    auto o = std::make_shared<Column>();
+    o->dtype = DType::I64; o->n = c.n; o->valid.assign(c.n, 0); o->i64.resize(c.n);
+    // Walk in sorted order; a new rank starts whenever the value changes.
+    size_t rank = 0, seen = 0;
+    for (size_t k = 0; k < c.n; k++) {
+        size_t i = (size_t)ord->i64[k];
+        if (!c.valid[i]) continue;                     // nulls are last → done
+        bool newGroup = (seen == 0);
+        if (!newGroup) {
+            size_t prev = (size_t)ord->i64[k - 1];
+            if (c.dtype == DType::UTF8) newGroup = (c.s[i] != c.s[prev]);
+            else {
+                double a = c.dtype==DType::F64?c.f64[i]:(c.dtype==DType::I64?(double)c.i64[i]:(c.b[i]?1:0));
+                double b = c.dtype==DType::F64?c.f64[prev]:(c.dtype==DType::I64?(double)c.i64[prev]:(c.b[prev]?1:0));
+                newGroup = (a != b);
+            }
+        }
+        seen++;
+        if (newGroup) rank = seen;                     // "min" rank for the tie block
+        o->valid[i] = 1; o->i64[i] = (int64_t)rank;
+    }
+    return o;
+}
+
+// col_quantile(c, q) with linear interpolation (numpy/pandas default). q in [0,1].
+inline Value quantileOp(const Column& c, double q) {
+    if (c.dtype == DType::UTF8 || c.logical == Logical::CAT)
+        throw std::runtime_error("quantile needs a numeric column");
+    if (q < 0 || q > 1) throw std::runtime_error("quantile: q must be between 0 and 1");
+    std::vector<double> v;
+    v.reserve(c.n);
+    for (size_t i = 0; i < c.n; i++) if (c.valid[i])
+        v.push_back(c.dtype==DType::F64?c.f64[i]:(c.dtype==DType::I64?(double)c.i64[i]:(c.b[i]?1:0)));
+    if (v.empty()) return Value();
+    std::sort(v.begin(), v.end());
+    double pos = q * (double)(v.size() - 1);
+    size_t lo = (size_t)std::floor(pos), hi = (size_t)std::ceil(pos);
+    if (lo == hi) return Value(v[lo]);
+    double frac = pos - (double)lo;
+    return Value(v[lo] * (1.0 - frac) + v[hi] * frac);
+}
+
+// col_concat([c1, c2, ...]): stack columns end to end. Mixed dtypes widen
+// (any utf8/categorical → utf8, else any f64 → f64, else i64/bool).
+inline ColumnPtr concatCols(const std::vector<ColumnPtr>& parts) {
+    if (parts.empty()) throw std::runtime_error("col_concat: need at least one column");
+    bool anyStr = false, anyF64 = false, allSameLogical = true;
+    Logical lg = parts[0]->logical;
+    for (auto& p : parts) {
+        if (p->dtype == DType::UTF8 || p->logical == Logical::CAT) anyStr = true;
+        if (p->dtype == DType::F64) anyF64 = true;
+        if (p->logical != lg) allSameLogical = false;
+    }
+    size_t total = 0; for (auto& p : parts) total += p->n;
+    auto o = std::make_shared<Column>(); o->n = total; o->valid.reserve(total);
+
+    if (anyStr) {
+        o->dtype = DType::UTF8; o->s.reserve(total);
+        for (auto& p : parts) {
+            ColumnPtr src = (p->logical == Logical::CAT) ? catToUtf8(*p) : p;
+            for (size_t i = 0; i < src->n; i++) {
+                o->valid.push_back(src->valid[i]);
+                o->s.push_back(src->valid[i] ? (src->dtype == DType::UTF8 ? src->s[i]
+                                              : elemToValue(*src, i).toString()) : std::string());
+            }
+        }
+        return o;
+    }
+    if (anyF64) {
+        o->dtype = DType::F64; o->f64.reserve(total);
+        for (auto& p : parts) for (size_t i = 0; i < p->n; i++) {
+            o->valid.push_back(p->valid[i]);
+            o->f64.push_back(p->valid[i] ? (p->dtype==DType::F64?p->f64[i]
+                             :(p->dtype==DType::I64?(double)p->i64[i]:(p->b[i]?1.0:0.0))) : 0.0);
+        }
+        return o;
+    }
+    // all integral / boolean
+    bool allBool = true; for (auto& p : parts) if (p->dtype != DType::BOOL) allBool = false;
+    if (allBool) {
+        o->dtype = DType::BOOL; o->b.reserve(total);
+        for (auto& p : parts) for (size_t i = 0; i < p->n; i++) { o->valid.push_back(p->valid[i]); o->b.push_back(p->b[i]); }
+        return o;
+    }
+    o->dtype = DType::I64; o->i64.reserve(total);
+    for (auto& p : parts) for (size_t i = 0; i < p->n; i++) {
+        o->valid.push_back(p->valid[i]);
+        o->i64.push_back(p->valid[i] ? (p->dtype==DType::I64?p->i64[i]:(p->b[i]?1:0)) : 0);
+    }
+    if (allSameLogical && lg != Logical::CAT) { o->logical = lg; }   // datetime/date survive
+    return o;
+}
+
+// col_unique_mask(keycols): true at the FIRST occurrence of each distinct key
+// combination — the primitive behind unique()/drop_duplicates().
+inline ColumnPtr uniqueMask(const std::vector<ColumnPtr>& keys) {
+    if (keys.empty()) throw std::runtime_error("col_unique_mask: need at least one column");
+    size_t n = keys[0]->n;
+    for (auto& c : keys) if (c->n != n) throw std::runtime_error("col_unique_mask: columns differ in length");
+    std::vector<int64_t> gid; std::vector<size_t> firstRow;
+    groupRows(keys, n, gid, firstRow);
+    auto o = std::make_shared<Column>(); o->dtype = DType::BOOL; o->n = n;
+    o->valid.assign(n, 1); o->b.assign(n, 0);
+    for (size_t i = 0; i < n; i++) if (firstRow[gid[i]] == i) o->b[i] = 1;
+    return o;
+}
+
+// col_is_in(c, [values]) → boolean mask (null stays null).
+inline ColumnPtr isInOp(const Column& c, const std::vector<Value>& vals) {
+    auto o = std::make_shared<Column>(); o->dtype = DType::BOOL; o->n = c.n;
+    o->valid = c.valid; o->b.assign(c.n, 0);
+    bool textual = (c.dtype == DType::UTF8 || c.logical == Logical::CAT);
+    if (textual) {
+        std::unordered_set<std::string> set;
+        for (auto& v : vals) if (!v.isNull()) set.insert(v.isString() ? v.stringVal : v.toString());
+        ColumnPtr src = (c.logical == Logical::CAT) ? catToUtf8(c) : nullptr;
+        const Column& u = src ? *src : c;
+        for (size_t i = 0; i < c.n; i++) if (c.valid[i]) o->b[i] = set.count(u.s[i]) ? 1 : 0;
+    } else {
+        std::unordered_set<double> set;
+        for (auto& v : vals) if (v.isNumber()) set.insert(v.numberVal);
+                             else if (v.isBool()) set.insert(v.boolVal ? 1.0 : 0.0);
+        for (size_t i = 0; i < c.n; i++) if (c.valid[i]) {
+            double d = c.dtype==DType::F64?c.f64[i]:(c.dtype==DType::I64?(double)c.i64[i]:(c.b[i]?1:0));
+            o->b[i] = set.count(d) ? 1 : 0;
+        }
+    }
+    return o;
+}
+
+// col_round(c, digits) → f64 rounded to `digits` decimal places.
+inline ColumnPtr roundOp(const Column& c, int digits) {
+    if (c.dtype == DType::UTF8 || c.logical == Logical::CAT)
+        throw std::runtime_error("round needs a numeric column");
+    auto o = std::make_shared<Column>(); o->dtype = DType::F64; o->n = c.n; o->valid = c.valid; o->f64.resize(c.n);
+    double scale = std::pow(10.0, (double)digits);
+    for (size_t i = 0; i < c.n; i++) {
+        if (!c.valid[i]) continue;
+        double v = c.dtype==DType::F64?c.f64[i]:(c.dtype==DType::I64?(double)c.i64[i]:(c.b[i]?1:0));
+        o->f64[i] = std::round(v * scale) / scale;
+    }
+    return o;
+}
+
+// ── String kernels (operate on utf8; a categorical is materialized first) ─────
+inline const Column& asTextColumn(const Column& c, ColumnPtr& tmpHolder) {
+    if (c.logical == Logical::CAT) { tmpHolder = catToUtf8(c); return *tmpHolder; }
+    if (c.dtype != DType::UTF8) throw std::runtime_error("this is a text operation — expected a utf8 column");
+    return c;
+}
+
+enum class StrUn { UPPER, LOWER, STRIP, LENGTH };
+
+inline ColumnPtr strUnary(const Column& c, StrUn op) {
+    ColumnPtr hold; const Column& t = asTextColumn(c, hold);
+    auto o = std::make_shared<Column>(); o->n = t.n; o->valid = t.valid;
+    if (op == StrUn::LENGTH) { o->dtype = DType::I64; o->i64.resize(t.n); }
+    else { o->dtype = DType::UTF8; o->s.resize(t.n); }
+    for (size_t i = 0; i < t.n; i++) {
+        if (!t.valid[i]) continue;
+        const std::string& s = t.s[i];
+        switch (op) {
+            case StrUn::LENGTH: o->i64[i] = (int64_t)s.size(); break;
+            case StrUn::UPPER: { std::string r = s; for (auto& ch : r) ch = (char)std::toupper((unsigned char)ch); o->s[i] = r; break; }
+            case StrUn::LOWER: { std::string r = s; for (auto& ch : r) ch = (char)std::tolower((unsigned char)ch); o->s[i] = r; break; }
+            case StrUn::STRIP: {
+                size_t b = s.find_first_not_of(" \t\r\n");
+                size_t e = s.find_last_not_of(" \t\r\n");
+                o->s[i] = (b == std::string::npos) ? std::string() : s.substr(b, e - b + 1);
+                break;
+            }
+        }
+    }
+    return o;
+}
+
+enum class StrPred { CONTAINS, STARTS, ENDS };
+
+inline ColumnPtr strPredicate(const Column& c, StrPred op, const std::string& needle) {
+    ColumnPtr hold; const Column& t = asTextColumn(c, hold);
+    auto o = std::make_shared<Column>(); o->dtype = DType::BOOL; o->n = t.n; o->valid = t.valid; o->b.assign(t.n, 0);
+    for (size_t i = 0; i < t.n; i++) {
+        if (!t.valid[i]) continue;
+        const std::string& s = t.s[i];
+        bool r = false;
+        switch (op) {
+            case StrPred::CONTAINS: r = s.find(needle) != std::string::npos; break;
+            case StrPred::STARTS:   r = s.size() >= needle.size() && s.compare(0, needle.size(), needle) == 0; break;
+            case StrPred::ENDS:     r = s.size() >= needle.size() && s.compare(s.size()-needle.size(), needle.size(), needle) == 0; break;
+        }
+        o->b[i] = r ? 1 : 0;
+    }
+    return o;
+}
+
+inline ColumnPtr strReplace(const Column& c, const std::string& from, const std::string& to) {
+    ColumnPtr hold; const Column& t = asTextColumn(c, hold);
+    auto o = std::make_shared<Column>(); o->dtype = DType::UTF8; o->n = t.n; o->valid = t.valid; o->s.resize(t.n);
+    for (size_t i = 0; i < t.n; i++) {
+        if (!t.valid[i]) continue;
+        if (from.empty()) { o->s[i] = t.s[i]; continue; }
+        std::string r = t.s[i];
+        size_t pos = 0;
+        while ((pos = r.find(from, pos)) != std::string::npos) { r.replace(pos, from.size(), to); pos += to.size(); }
+        o->s[i] = r;
+    }
+    return o;
+}
+
+// Substring by byte offset; a negative start counts from the end.
+inline ColumnPtr strSlice(const Column& c, int64_t start, int64_t len) {
+    ColumnPtr hold; const Column& t = asTextColumn(c, hold);
+    auto o = std::make_shared<Column>(); o->dtype = DType::UTF8; o->n = t.n; o->valid = t.valid; o->s.resize(t.n);
+    for (size_t i = 0; i < t.n; i++) {
+        if (!t.valid[i]) continue;
+        const std::string& s = t.s[i];
+        int64_t b = start < 0 ? (int64_t)s.size() + start : start;
+        if (b < 0) b = 0;
+        if ((size_t)b >= s.size()) { o->s[i] = ""; continue; }
+        size_t take = (len < 0) ? (s.size() - (size_t)b) : (size_t)len;
+        o->s[i] = s.substr((size_t)b, take);
+    }
+    return o;
 }
 
 // ════════════════════════════════════════════════════════════════════════════

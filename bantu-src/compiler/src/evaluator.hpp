@@ -2947,6 +2947,126 @@ private:
                 });
             }));
 
+            // ── Window / set / string kernels ─────────────────────────────────
+            // Cumulative statistics: col_cumsum/cumprod/cummax/cummin(c).
+            auto defCum = [&](const char* name, arctic::Cum op) {
+                env_->define(name, makeNative([colGuard, name, op](std::vector<Value> a) -> Value {
+                    return colGuard(name, [&]() -> Value {
+                        return arctic::wrap(arctic::cumOp(*arctic::asColumn(a[0]), op));
+                    });
+                }));
+            };
+            defCum("col_cumsum",  arctic::Cum::SUM);
+            defCum("col_cumprod", arctic::Cum::PROD);
+            defCum("col_cummax",  arctic::Cum::MAX);
+            defCum("col_cummin",  arctic::Cum::MIN);
+
+            // col_shift(c, n) — move values down by n (negative = up); gaps null.
+            env_->define("col_shift", makeNative([colGuard](std::vector<Value> a) -> Value {
+                return colGuard("col_shift", [&]() -> Value {
+                    if (a.size() < 2 || !a[1].isNumber()) throw std::runtime_error("usage: col_shift(column, n)");
+                    return arctic::wrap(arctic::shiftOp(*arctic::asColumn(a[0]), (int64_t)a[1].numberVal));
+                });
+            }));
+            // col_full(n, value) — a constant column of length n.
+            env_->define("col_full", makeNative([colGuard](std::vector<Value> a) -> Value {
+                return colGuard("col_full", [&]() -> Value {
+                    if (a.empty() || !a[0].isNumber()) throw std::runtime_error("usage: col_full(n, value)");
+                    size_t n = (size_t)std::max(0.0, a[0].numberVal);
+                    return arctic::wrap(arctic::fullOp(n, a.size() > 1 ? a[1] : Value()));
+                });
+            }));
+            // col_reverse(c) — rows in reverse order.
+            env_->define("col_reverse", makeNative([colGuard](std::vector<Value> a) -> Value {
+                return colGuard("col_reverse", [&]() -> Value {
+                    return arctic::wrap(arctic::reverseOp(*arctic::asColumn(a[0])));
+                });
+            }));
+            // col_rank(c, descending?) — 1-based, ties share the lowest rank.
+            env_->define("col_rank", makeNative([colGuard](std::vector<Value> a) -> Value {
+                return colGuard("col_rank", [&]() -> Value {
+                    bool desc = a.size() > 1 && a[1].isTruthy();
+                    return arctic::wrap(arctic::rankOp(*arctic::asColumn(a[0]), desc));
+                });
+            }));
+            // col_quantile(c, q) — linear interpolation, q in [0,1].
+            env_->define("col_quantile", makeNative([colGuard](std::vector<Value> a) -> Value {
+                return colGuard("col_quantile", [&]() -> Value {
+                    if (a.size() < 2 || !a[1].isNumber()) throw std::runtime_error("usage: col_quantile(column, q)");
+                    return arctic::quantileOp(*arctic::asColumn(a[0]), a[1].numberVal);
+                });
+            }));
+            // col_concat([c1, c2, ...]) or col_concat(c1, c2, ...) — stack rows.
+            env_->define("col_concat", makeNative([colGuard](std::vector<Value> a) -> Value {
+                return colGuard("col_concat", [&]() -> Value {
+                    std::vector<arctic::ColumnPtr> parts;
+                    if (a.size() == 1 && a[0].isList()) { for (auto& v : a[0].listVal) parts.push_back(arctic::asColumn(v)); }
+                    else { for (auto& v : a) parts.push_back(arctic::asColumn(v)); }
+                    return arctic::wrap(arctic::concatCols(parts));
+                });
+            }));
+            // col_unique_mask(cols) — true at the first occurrence of each key.
+            env_->define("col_unique_mask", makeNative([colGuard](std::vector<Value> a) -> Value {
+                return colGuard("col_unique_mask", [&]() -> Value {
+                    return arctic::wrap(arctic::uniqueMask(arctic::asColumnList(a[0])));
+                });
+            }));
+            // col_is_in(c, [values]) — membership mask.
+            env_->define("col_is_in", makeNative([colGuard](std::vector<Value> a) -> Value {
+                return colGuard("col_is_in", [&]() -> Value {
+                    if (a.size() < 2 || !a[1].isList()) throw std::runtime_error("usage: col_is_in(column, list)");
+                    return arctic::wrap(arctic::isInOp(*arctic::asColumn(a[0]), a[1].listVal));
+                });
+            }));
+            // col_round(c, digits)
+            env_->define("col_round", makeNative([colGuard](std::vector<Value> a) -> Value {
+                return colGuard("col_round", [&]() -> Value {
+                    int d = (a.size() > 1 && a[1].isNumber()) ? (int)a[1].numberVal : 0;
+                    return arctic::wrap(arctic::roundOp(*arctic::asColumn(a[0]), d));
+                });
+            }));
+
+            // Text: col_upper/lower/strip/str_len, contains/starts_with/ends_with,
+            // col_replace(c, from, to), col_substr(c, start, len).
+            auto defStrUn = [&](const char* name, arctic::StrUn op) {
+                env_->define(name, makeNative([colGuard, name, op](std::vector<Value> a) -> Value {
+                    return colGuard(name, [&]() -> Value {
+                        return arctic::wrap(arctic::strUnary(*arctic::asColumn(a[0]), op));
+                    });
+                }));
+            };
+            defStrUn("col_upper",   arctic::StrUn::UPPER);
+            defStrUn("col_lower",   arctic::StrUn::LOWER);
+            defStrUn("col_strip",   arctic::StrUn::STRIP);
+            defStrUn("col_str_len", arctic::StrUn::LENGTH);
+
+            auto defStrPred = [&](const char* name, arctic::StrPred op) {
+                env_->define(name, makeNative([colGuard, name, op](std::vector<Value> a) -> Value {
+                    return colGuard(name, [&]() -> Value {
+                        if (a.size() < 2 || !a[1].isString()) throw std::runtime_error("needs a text argument");
+                        return arctic::wrap(arctic::strPredicate(*arctic::asColumn(a[0]), op, a[1].stringVal));
+                    });
+                }));
+            };
+            defStrPred("col_contains",    arctic::StrPred::CONTAINS);
+            defStrPred("col_starts_with", arctic::StrPred::STARTS);
+            defStrPred("col_ends_with",   arctic::StrPred::ENDS);
+
+            env_->define("col_replace", makeNative([colGuard](std::vector<Value> a) -> Value {
+                return colGuard("col_replace", [&]() -> Value {
+                    if (a.size() < 3 || !a[1].isString() || !a[2].isString())
+                        throw std::runtime_error("usage: col_replace(column, from, to)");
+                    return arctic::wrap(arctic::strReplace(*arctic::asColumn(a[0]), a[1].stringVal, a[2].stringVal));
+                });
+            }));
+            env_->define("col_substr", makeNative([colGuard](std::vector<Value> a) -> Value {
+                return colGuard("col_substr", [&]() -> Value {
+                    if (a.size() < 2 || !a[1].isNumber()) throw std::runtime_error("usage: col_substr(column, start, len?)");
+                    int64_t len = (a.size() > 2 && a[2].isNumber()) ? (int64_t)a[2].numberVal : -1;
+                    return arctic::wrap(arctic::strSlice(*arctic::asColumn(a[0]), (int64_t)a[1].numberVal, len));
+                });
+            }));
+
             // ── Kernels (Phase 3) — each operand may be a column OR a scalar ──
 
             // Arithmetic: col_add/sub/mul/div/mod/pow(a, b) -> column.
@@ -5010,17 +5130,21 @@ private:
 
         // json helper
         ObjectMap jsonObj;
+        // Real JSON, not a placeholder: these delegate to the same serializer and
+        // parser the HTTP layer uses, so json.stringify() emits valid JSON (quoted
+        // keys/strings, escaping) and json.parse() returns objects/lists/numbers.
+        // (They previously returned Value::toString() and echoed the input, which
+        // produced invalid JSON and could not round-trip. No stdout noise either —
+        // a data pipeline may call these in a loop.)
         jsonObj["stringify"] = makeNative([](std::vector<Value> args) -> Value {
             if (args.empty()) return Value(std::string("null"));
-            std::string result = args[0].toString();
-            std::cout << "  [JSON] Stringified\n";
-            return Value(result);
+            return Value(bantuJsonStringify(args[0]));
         });
 
         jsonObj["parse"] = makeNative([](std::vector<Value> args) -> Value {
             if (args.empty() || !args[0].isString()) return Value();
-            std::cout << "  [JSON] Parsed string value\n";
-            return args[0];
+            size_t pos = 0;
+            return bantuJsonParse(args[0].stringVal, pos);
         });
 
         env_->define("json", Value(std::move(jsonObj)));

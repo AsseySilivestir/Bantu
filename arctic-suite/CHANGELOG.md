@@ -6,6 +6,45 @@ tracks granular per-phase progress, including feature- and stress-test results.
 
 ## [Unreleased]
 
+### 2026-09-07 — arctic 1.2.0: API completion (window · set · text · reshape · combine · JSON)
+Closes the remaining gaps against pandas/polars so the package is feature-complete for everyday
+data work. Native atoms first (for speed), then the pure-Bantu API on top.
+
+- **[feature] New native atoms** (`dataframe_native.hpp` + builtins): `col_cumsum/cumprod/cummax/
+  cummin`, `col_shift`, `col_rank` (min-method ties), `col_quantile` (linear interpolation),
+  `col_reverse`, `col_concat` (dtype-widening), `col_unique_mask` (first-occurrence mask),
+  `col_is_in`, `col_round`, `col_full` (constant column), and text: `col_upper/lower/strip/str_len`,
+  `col_contains/starts_with/ends_with`, `col_replace`, `col_substr`. Text atoms accept categoricals.
+- **[feature] Series**: `unique value_counts mode is_in between drop_nulls is_not_null`,
+  `cumsum cumprod cummax cummin shift diff pct_change rank`, `quantile clip round product first last
+  n_largest n_smallest reverse slice`, text `upper lower strip str_len contains starts_with ends_with
+  replace substr`, and `map/apply` for arbitrary Bantu functions.
+- **[feature] DataFrame**: multi-column `sort([a,b], desc)`, `unique/drop_duplicates`, `drop_nulls`,
+  `fill_null`, `null_count`, `slice`, `reverse`, `is_empty`, `n_largest/n_smallest`, `sample`,
+  `with_columns`, `cast`, `row`/`iter_rows`, `value_counts`, `quantile`, `corr`, **`pivot`** and
+  **`melt`**, **`concat`/`vstack`/`hstack`**, and `to_json`.
+- **[feature] GroupBy**: `std var median nunique any_ all_`, `size()` and `stats(col)`.
+- **[feature] LazyFrame**: `drop rename unique drop_nulls reverse slice fill_null limit join`
+  (accepts an eager or lazy right side), all wired through the optimizer and `explain()`.
+- **[feature] JSON I/O**: `arctic.read_json(pathOrText)` and `DataFrame.to_json(path?)`.
+- **[bug fix] Optimizer correctness — filters are no longer hoisted past a barrier.** Previously a
+  filter was hoisted to the front unconditionally, so `.head(2).filter(...)` was reordered into
+  `.filter(...).head(2)` — a different result. Ops that change row counts (`head/tail/slice`), pick
+  first-wins rows (`unique`), rewrite values (`fill_null`) or change the namespace (`rename/join/
+  with_column/groupby`) are now barriers. Projection pushdown is likewise disabled when a plan
+  contains ops whose column needs can't be determined statically.
+- **[bug fix] Host `json.stringify`/`json.parse` were placeholders** — stringify returned
+  `Value::toString()` (invalid JSON: unquoted keys) and parse echoed its input, so JSON could not
+  round-trip. Both now delegate to the real serializer/parser already used by the HTTP layer, and no
+  longer print `[JSON] …` noise on every call.
+- **[patch]** `pivot` and `sample` use direct dict lookups instead of `keyIn()` (which scans every
+  key); `pivot` was quadratic in the group count before this.
+- **Tests:** `tests/arctic_window_test.b` 34/34 (native atoms), `tests/arctic_api_test.b` 72/72
+  (full API incl. barrier correctness and JSON round-trip). **Stress (1M rows):** cumsum 10 ms,
+  shift 29 ms, concat 39 ms, upper 67 ms, is_in 67 ms, unique 163 ms, quantile 158 ms, rank 499 ms;
+  package-level value_counts 144 ms, melt 1M→2M 258 ms, groupby stats 778 ms, multi-sort 1.29 s,
+  realistic pivot (5×12) 251 ms. Full regression green on default and Arrow builds.
+
 ### 2026-09-07 — Follow-up: in-place list-field mutation fix (interpreter)
 - **[bug fix]** Mutating a **list field of a class instance in place** now persists:
   `this.list[i] = x`, `this.list[len(this.list)] = x` (append), `this.list.push(x)` / `.pop()`,

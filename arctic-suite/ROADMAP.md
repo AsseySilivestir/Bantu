@@ -73,7 +73,22 @@ Perf: 1M-row CSV read **894 ms** (< 1 s); 3M-row datetime parse 231 ms + compone
 projection 903 ms vs 1173 ms eager; Parquet read **471 ms vs 1081 ms CSV** (245 ms projected),
 file 11 MB vs 27 MB. Full regression green on both default and Arrow builds.
 
+## API completion (2026-09-07) — arctic 1.2.0 ✅
+| Area | What landed | Tests |
+|---|---|---|
+| native atoms | cum*, shift, rank, quantile, reverse, concat, unique_mask, is_in, round, full, 9 text ops | `arctic_window_test.b` 34/34 |
+| Series | set/membership, window/cumulative, numeric shaping, text, `map/apply` | `arctic_api_test.b` |
+| DataFrame | multi-sort, unique, drop_nulls/fill_null, slice/reverse/sample, with_columns, cast, row/iter_rows, value_counts/quantile/corr, **pivot**, **melt**, **concat/hstack**, to_json | `arctic_api_test.b` 72/72 |
+| GroupBy | std/var/median/nunique/any/all, `size()`, `stats()` | ✔ |
+| LazyFrame | drop/rename/unique/drop_nulls/reverse/slice/fill_null/limit/join + optimizer wiring | ✔ |
+| I/O | `read_json` / `to_json` (host json.stringify/parse fixed to emit real JSON) | ✔ |
+| optimizer fix | filters no longer hoisted past row-count/first-wins/namespace **barriers** | ✔ |
+
+**arctic is now feature-complete for everyday data work** — load (CSV/JSON/SQLite/Parquet/Feather),
+clean (nulls, dedupe, cast, text), transform (window, group, join, reshape), and write back, eagerly
+or lazily with pushdown.
+
 ## Deferred (next efforts)
 - Predicate/row-group pushdown into the Parquet reader (skip row-groups by min/max stats).
-- Window functions, `pivot`, `unique`; timezone database (currently UTC-only); Arrow Flight;
-  streaming/out-of-core execution.
+- Rolling/`over` window functions partitioned by group; timezone database (currently UTC-only);
+  Arrow Flight; streaming/out-of-core execution.

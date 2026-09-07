@@ -150,6 +150,24 @@ if (has_native("arrow")) {
 }
 
 print("");
+print("-- completed API: set ops, window, reshape, combine, JSON --");
+eq(str($df.get("region").unique().to_list()), "[EU, US]", "Series.unique");
+eq(str($df.get("amount").cumsum().to_list()), "[1200, 1700, 3700, 4400, 7400]", "Series.cumsum");
+eq(str($df.get("amount").rank(true).to_list()), "[3, 5, 2, 4, 1]", "Series.rank desc");
+eq($df.get("amount").quantile(0.5), 1200, "Series.quantile");
+eq(str($df.get("name").upper().to_list()), "[ADA, BOB, CY, DEE, EVE]", "Series.upper");
+eq($df.unique(["region"]).height(), 2, "DataFrame.unique on a subset");
+eq(str($df.sort(["region", "amount"], false).get("amount").to_list()), "[1200, 2000, 3000, 500, 700]", "multi-column sort");
+$pv = $df.pivot("region", "age", "amount", "sum");
+ok($pv.height() == 2, "pivot produces a row per region");
+$ml = $df.select(["region", "amount", "age"]).melt(["region"], ["amount", "age"]);
+eq($ml.height(), 10, "melt expands rows");
+eq(str($df.head(1).concat($df.tail(1)).get("name").to_list()), "[Ada, Eve]", "concat");
+eq($df.groupby("region").size().get("count").sum(), 5, "groupby.size");
+$js = $df.to_json(null);
+ok(contains($js, "\"region\""), "to_json emits real JSON");
+
+print("");
 print("========================================");
 print("  PASS: " + str($R.pass) + "   FAIL: " + str($R.fail));
 print("========================================");
