@@ -548,6 +548,153 @@ static inline SelftestResult run_selftest() {
         BWP_CHECK(!bantu_p256::import_public(bad, pt), "rejects X >= p");
     }
 
+    // ── RFC 8188 §3.1 — published single-record vector ──
+    //
+    // The IKM is supplied directly, so this pins the content-coding layer alone:
+    // HKDF → CEK/NONCE → record padding → header framing → AES-128-GCM. No
+    // elliptic curve involved, so a failure here is never a P-256 bug.
+    //
+    // NOTE: the RFC's prose says "54-octet content body" and Content-Length: 54,
+    // but the published base64url decodes to 53 octets
+    // (21 header + 15 plaintext + 1 delimiter + 16 tag). The encoded value is
+    // authoritative; the octet count is an editorial slip.
+    {
+        Bytes ikm, salt_full, want;
+        BWP_CHECK(b64url_decode("yqdlZ-tYemfogSmv7Ws5PQ", ikm), "8188 3.1 ikm decodes");
+        BWP_CHECK(b64url_decode("I1BsxtFttlv3u_Oo94xnmw", salt_full), "8188 3.1 salt decodes");
+        BWP_CHECK(b64url_decode(
+            "I1BsxtFttlv3u_Oo94xnmwAAEAAA-NAVub2qFgBEuQKRapoZu-IxkIva3MEB1PD-ly8Thjg",
+            want), "8188 3.1 body decodes");
+        BWP_CHECK(want.size() == 53, "8188 3.1 body is 53 octets");
+
+        // The intermediates the RFC publishes, checked individually so a failure
+        // localises to one derivation step.
+        uint8_t cek[16], nonce[12], prk[32];
+        hkdf_extract(salt_full.data(), 16, ikm.data(), ikm.size(), prk);
+        Bytes wprk, wcek, wnonce;
+        b64url_decode("zyeH5phsIsgUyd4oiSEIy35x-gIi4aM7y0hCF8mwn9g", wprk);
+        b64url_decode("_wniytB-ofscZDh4tbSjHw", wcek);
+        b64url_decode("Bcs8gkIRKLI8GeI8", wnonce);
+        BWP_CHECK(wprk.size() == 32 && std::memcmp(prk, wprk.data(), 32) == 0, "8188 3.1 PRK");
+        derive_cek_nonce(salt_full.data(), ikm.data(), ikm.size(), cek, nonce);
+        BWP_CHECK(wcek.size() == 16 && std::memcmp(cek, wcek.data(), 16) == 0, "8188 3.1 CEK");
+        BWP_CHECK(wnonce.size() == 12 && std::memcmp(nonce, wnonce.data(), 12) == 0, "8188 3.1 NONCE");
+
+        const char* pt = "I am the walrus";
+        Bytes got;
+        BWP_CHECK(aes128gcm_encrypt(ikm.data(), ikm.size(), salt_full.data(), 4096,
+                                    nullptr, 0, (const uint8_t*)pt, std::strlen(pt), got),
+                  "8188 3.1 encrypt");
+        BWP_CHECK(got == want, "8188 3.1 body matches the published vector");
+
+        Bytes back;
+        BWP_CHECK(aes128gcm_decrypt(ikm.data(), ikm.size(), want.data(), want.size(), back),
+                  "8188 3.1 decrypt");
+        BWP_CHECK(back.size() == std::strlen(pt) &&
+                  std::memcmp(back.data(), pt, back.size()) == 0, "8188 3.1 plaintext");
+    }
+
+    // ── RFC 8188 §3.2 — published MULTI-record vector (decrypt) ──
+    //
+    // rs = 25, keyid "a1", two records: 7 message octets + one 0x00 pad octet in
+    // the first, 8 in the second. We only ever emit a single record, but this is
+    // the only published vector that pins the SEQ-XOR nonce derivation and the
+    // 0x01-vs-0x02 delimiter distinction, so it runs on the decrypt path.
+    {
+        Bytes ikm, body;
+        BWP_CHECK(b64url_decode("BO3ZVPxUlnLORbVGMpbT1Q", ikm), "8188 3.2 ikm decodes");
+        BWP_CHECK(b64url_decode(
+            "uNCkWiNYzKTnBN9ji3-qWAAAABkCYTHOG8chz_gnvgOqdGYovxyjuqRyJFjEDyoF"
+            "1Fvkj6hQPdPHI51OEUKEpgz3SsLWIqS_uA", body), "8188 3.2 body decodes");
+        BWP_CHECK(body.size() == 73, "8188 3.2 body is 73 octets");
+        BWP_CHECK(body[20] == 2 && body[21] == 'a' && body[22] == '1', "8188 3.2 keyid is \"a1\"");
+
+        Bytes back;
+        BWP_CHECK(aes128gcm_decrypt(ikm.data(), ikm.size(), body.data(), body.size(), back),
+                  "8188 3.2 multi-record decrypt");
+        const char* pt = "I am the walrus";
+        BWP_CHECK(back.size() == std::strlen(pt) &&
+                  std::memcmp(back.data(), pt, back.size()) == 0, "8188 3.2 plaintext");
+    }
+
+    // ── RFC 8291 §5 + Appendix A — the published Web Push vector ──
+    //
+    // as_private and salt are pinned, so the entire body is deterministic and
+    // byte-comparable. This is the single strongest test in the suite: it
+    // exercises ECDH on P-256, the "WebPush: info" key combination, both HKDF
+    // expansions, AES-128-GCM and the framing, end to end, against bytes
+    // published by the IETF.
+    //
+    // NOTE: as in §3.1, the RFC's Content-Length says 145 while the published
+    // base64url decodes to 144 octets (86 header + 41 plaintext + 1 + 16).
+    {
+        Bytes as_priv, ua_priv, ua_pub_v, as_pub_v, salt, auth, want, want_hdr;
+        BWP_CHECK(b64url_decode("yfWPiYE-n46HLnH0KqZOF1fJJU3MYrct3AELtAQ-oRw", as_priv), "8291 as_private");
+        BWP_CHECK(b64url_decode("q1dXpw3UpT5VOmu_cf_v6ih07Aems3njxI-JWgLcM94", ua_priv), "8291 ua_private");
+        BWP_CHECK(b64url_decode("BCVxsr7N_eNgVRqvHtD0zTZsEc6-VV-JvLexhqUzORcx"
+                                "aOzi6-AYWXvTBHm4bjyPjs7Vd8pZGH6SRpkNtoIAiw4", ua_pub_v), "8291 ua_public");
+        BWP_CHECK(b64url_decode("BP4z9KsN6nGRTbVYI_c7VJSPQTBtkgcy27mlmlMoZIIg"
+                                "Dll6e3vCYLocInmYWAmS6TlzAC8wEqKK6PBru3jl7A8", as_pub_v), "8291 as_public");
+        BWP_CHECK(b64url_decode("DGv6ra1nlYgDCS1FRnbzlw", salt), "8291 salt");
+        BWP_CHECK(b64url_decode("BTBZMqHH6r4Tts7J_aSIgg", auth), "8291 auth_secret");
+        BWP_CHECK(b64url_decode(
+            "DGv6ra1nlYgDCS1FRnbzlwAAEABBBP4z9KsN6nGRTbVYI_c7VJSPQTBtkgcy27ml"
+            "mlMoZIIgDll6e3vCYLocInmYWAmS6TlzAC8wEqKK6PBru3jl7A_yl95bQpu6cVPT"
+            "pK4Mqgkf1CXztLVBSt2Ks3oZwbuwXPXLWyouBWLVWGNWQexSgSxsj_Qulcy4a-fN",
+            want), "8291 body decodes");
+        BWP_CHECK(want.size() == 144, "8291 body is 144 octets");
+        BWP_CHECK(salt.size() == 16 && auth.size() == 16, "8291 salt/auth are 16 octets");
+
+        // Both public keys must be derivable from their private keys — this alone
+        // pins scalar multiplication against IETF-published values.
+        uint8_t derived[65];
+        BWP_CHECK(bantu_p256::public_from_private(as_priv.data(), derived) &&
+                  std::memcmp(derived, as_pub_v.data(), 65) == 0, "8291 as_public from as_private");
+        BWP_CHECK(bantu_p256::public_from_private(ua_priv.data(), derived) &&
+                  std::memcmp(derived, ua_pub_v.data(), 65) == 0, "8291 ua_public from ua_private");
+
+        // ECDH must agree in both directions and match the published secret.
+        uint8_t s1[32], s2[32];
+        Bytes want_ecdh;
+        b64url_decode("kyrL1jIIOHEzg3sM2ZWRHDRB62YACZhhSlknJ672kSs", want_ecdh);
+        BWP_CHECK(bantu_p256::ecdh(as_priv.data(), ua_pub_v.data(), s1), "8291 ECDH as->ua");
+        BWP_CHECK(bantu_p256::ecdh(ua_priv.data(), as_pub_v.data(), s2), "8291 ECDH ua->as");
+        BWP_CHECK(std::memcmp(s1, s2, 32) == 0, "8291 ECDH is symmetric");
+        BWP_CHECK(want_ecdh.size() == 32 && std::memcmp(s1, want_ecdh.data(), 32) == 0,
+                  "8291 ecdh_secret matches Appendix A");
+
+        // The combined IKM, then the content-encryption PRK/CEK/NONCE.
+        uint8_t ikm[32];
+        Bytes want_ikm, want_cek, want_nonce;
+        b64url_decode("S4lYMb_L0FxCeq0WhDx813KgSYqU26kOyzWUdsXYyrg", want_ikm);
+        b64url_decode("oIhVW04MRdy2XN9CiKLxTg", want_cek);
+        b64url_decode("4h_95klXJ5E_qnoN", want_nonce);
+        webpush_ikm(s1, auth.data(), auth.size(), ua_pub_v.data(), as_pub_v.data(), ikm);
+        BWP_CHECK(want_ikm.size() == 32 && std::memcmp(ikm, want_ikm.data(), 32) == 0,
+                  "8291 IKM matches Appendix A");
+        uint8_t cek[16], nonce[12];
+        derive_cek_nonce(salt.data(), ikm, 32, cek, nonce);
+        BWP_CHECK(want_cek.size() == 16 && std::memcmp(cek, want_cek.data(), 16) == 0,
+                  "8291 CEK matches Appendix A");
+        BWP_CHECK(want_nonce.size() == 12 && std::memcmp(nonce, want_nonce.data(), 12) == 0,
+                  "8291 NONCE matches Appendix A");
+
+        // And finally the whole body, byte for byte.
+        const char* msg = "When I grow up, I want to be a watermelon";
+        Bytes got;
+        BWP_CHECK(encrypt_with_params(ua_pub_v.data(), auth.data(), auth.size(),
+                                      (const uint8_t*)msg, std::strlen(msg),
+                                      as_priv.data(), salt.data(), got), "8291 encrypt");
+        BWP_CHECK(got == want, "8291 body matches the published vector");
+
+        // And the receiver's side of the same vector.
+        Bytes back;
+        BWP_CHECK(decrypt(ua_priv.data(), auth.data(), auth.size(),
+                          want.data(), want.size(), back), "8291 decrypt the published body");
+        BWP_CHECK(back.size() == std::strlen(msg) &&
+                  std::memcmp(back.data(), msg, back.size()) == 0, "8291 published plaintext");
+    }
+
     // ── RFC 8291 end-to-end, against our own decryptor ──
     // Encrypt to a subscriber keypair and decrypt as that subscriber would. This
     // pins the full composition: ECDH → IKM → CEK/NONCE → record → framing.

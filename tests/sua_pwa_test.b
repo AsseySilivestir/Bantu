@@ -270,6 +270,21 @@ ok(contains($oversize.error, "limit"), "and names the limit");
 sua.push.forget("https://push.example.com/b");
 
 print("");
+print("-- sua.http: TLS verification and its escape hatch --");
+// Verification is ON by default. sua.http.get/post/... take no options object,
+// so the global toggle is their only way out; sua.http.request() takes a
+// per-request "insecure" instead, which is preferred.
+$st = sua.http.insecure(false);
+ok($st.verify, "verification is on by default");
+ok(!$st.insecure, "and insecure is false");
+$st2 = sua.http.insecure(true);
+ok($st2.insecure, "sua.http.insecure(true) flips it");
+ok(!$st2.verify, "verify reads as false");
+$st3 = sua.http.insecure(false);
+ok($st3.verify, "and it can be turned back on");
+
+
+print("");
 print("========================================");
 print("  PASS: " + str($R.pass) + "   FAIL: " + str($R.fail));
 print("========================================");

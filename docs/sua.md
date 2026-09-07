@@ -381,10 +381,40 @@ if ($r.ok) { print($r.body); }
 Returns `{ok, status, statusText, body, headers, url, method}`, or `{ok: false, status: 0, error}` on
 a transport failure.
 
-**TLS certificates are verified.** Pass `"insecure": true` for a self-signed development endpoint —
-and only then.
+### TLS
 
-Bodies are length-explicit, so a body containing NUL bytes is transmitted intact.
+**Certificates are verified.** Pass `"insecure": true` on a single `sua.http.request()` for a
+self-signed development endpoint — and only then:
+
+```bantu
+$r = sua.http.request({"url": "https://self-signed.internal/x", "insecure": true});
+```
+
+The six convenience helpers take no options object, so they have a global escape hatch instead. It
+is deliberately loud — it prints a warning and applies to every subsequent call, so prefer the
+per-request flag whenever you can scope it:
+
+```bantu
+sua.http.insecure(true);     // -> {insecure: true, verify: false}
+sua.http.insecure(false);    // back to verifying
+```
+
+If verification fails, the returned `error` says so and names both ways forward.
+
+### Bodies and logging
+
+Bodies are length-explicit, so a body containing NUL bytes is transmitted intact — binary payloads
+(images, protobuf, an `aes128gcm` push body) are safe.
+
+Each request writes one trace line to **stderr**, naming only the origin:
+
+```
+  [HTTP] POST https://api.example.com -> 201 Created
+```
+
+The path and query are omitted on purpose: they routinely carry API tokens, and a Web Push endpoint's
+path *is* the subscription identifier. Set `BANTU_HTTP_DEBUG=1` for the full URL while debugging, or
+run under `bantu -q` to silence the trace entirely.
 
 ## Databases
 

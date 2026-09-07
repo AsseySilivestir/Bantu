@@ -274,7 +274,32 @@ that trade-off is stated in the headers.
 4. Every call printed `[HTTP] <method> <url>` to stdout, which would have logged subscriber endpoints.
 
 All four are fixed, and `sua.http.request(opts)` exposes headers and binary bodies generally — not
-just for push.
+just for push. Specifically:
+
+- `CURLOPT_POSTFIELDSIZE_LARGE` is set **before** `CURLOPT_COPYPOSTFIELDS`. That order is
+  load-bearing: libcurl documents that without a prior size "the data is assumed to be a
+  null-terminated string", which is exactly the truncation bug.
+- Verification is on by default. `sua.http.request()` takes a per-request `"insecure": true`; the
+  six convenience helpers, which have no options object, share the global `sua.http.insecure(true)`
+  toggle so an app on a self-signed internal endpoint still has a way forward. A verification
+  failure now returns an error that names both options instead of curl's bare string.
+- The trace moved to stderr, honours `bantu -q`, and names only the **origin** — the path and query
+  carry API tokens, and a push endpoint's path *is* the subscription id. `BANTU_HTTP_DEBUG=1` opts
+  back in to the full URL.
+
+### 5.3 Where the MIME table lives
+
+Extension → Content-Type is `bantu-src/compiler/src/mime_types.hpp` (`bantu_mime::for_path`), not the
+PWA header — only the static file server consumes it, and it is not a PWA concern. The original
+inline table covered nine extensions; anything else fell through to `application/octet-stream`, which
+browsers refuse to execute or render. It now covers `.webmanifest`, every common font, WebP/AVIF,
+WASM, source maps and media.
+
+Caching is deliberately conservative. A manifest is always revalidated, because a stale one pins an
+old `start_url` or icon set. HTML only switches to `no-cache` **once `sua.pwa.configure()` has been
+called** — there a stale shell pins old asset URLs and the service worker makes it sticky. An app
+that never configures a PWA keeps the previous `max-age=300` exactly, so this cannot change
+behaviour it relies on.
 
 ## 6. Test-vector gates
 
@@ -290,8 +315,8 @@ Each layer is pinned independently so a failure localises to one primitive.
 | ECDSA verify | round-trip, plus rejection of out-of-range `r`/`s` and tampered messages |
 | AES-128 | FIPS 197 Appendix B |
 | AES-128-GCM | McGrew–Viega Appendix B cases 1–4; cases 5–6 (non-96-bit IV) as rejection tests |
-| RFC 8188 framing | §3.1 single record, §3.2 multi-record |
-| RFC 8291 | §5 worked example, every intermediate asserted individually |
+| RFC 8188 framing | §3.1 single record (byte-exact body), §3.2 multi-record (decrypt) |
+| RFC 8291 | §5 + Appendix A — byte-exact body, every intermediate asserted individually |
 | VAPID | self-verify, `aud` extraction unit tests, and a pinned JWT cross-verified once against an independent implementation |
 
 ## 7. Deliberate limitations
@@ -299,6 +324,11 @@ Each layer is pinned independently so a failure localises to one primitive.
 - **UTC only.** No timezone database; `exp` is computed from epoch seconds.
 - **Single record.** We only ever emit one `aes128gcm` record, so payloads cap at 3993 octets.
   Multi-record is implemented on the *decrypt* side only, to run the RFC 8188 §3.2 vector.
+
+  A transcription note for anyone re-checking the vectors: RFC 8188 §3.1 says "54-octet content
+  body" and RFC 8291 §5 sends `Content-Length: 145`, but the published base64url values decode to
+  **53** and **144** octets respectively. The encoded values are authoritative and are what the
+  selftest asserts; the octet counts in the prose are editorial slips.
 - **The server is single-threaded** (`bantuStartHttpServer`, evaluator.hpp). `sua.push.send_all()`
   blocks the accept loop for the duration of the fan-out. For large subscriber lists, send from a
   separate process.

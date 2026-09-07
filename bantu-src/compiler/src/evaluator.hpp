@@ -17,6 +17,7 @@
 #include "crypto_sodium.hpp"    // optional libsodium AEAD + argon2id (feature-gated)
 #include "dataframe_native.hpp" // native column primitives for the arctic data-science suite
 #include "dataframe_arrow.hpp"  // Parquet + Feather/Arrow-IPC I/O (opt-in: -DBANTU_ARROW)
+#include "mime_types.hpp"       // extension -> Content-Type for the static file server
 #include "pwa_native.hpp"       // manifest / service worker / offline rendering for sua.pwa
 #include "webpush.hpp"          // RFC 8188/8291/8292 Web Push (pulls in p256.hpp + aes_gcm.hpp)
 #include <iostream>
@@ -659,7 +660,16 @@ static std::string httpStatusText(int code) {
 }
 
 // ─── cURL HTTP Request Helper ───
-//
+
+// Mirrors the evaluator's --quiet flag for code outside the class (setQuiet
+// keeps them in step), so diagnostics honour `bantu -q` like everything else.
+static bool bantuQuietMode = false;
+
+// Global TLS opt-out for the convenience helpers (sua.http.get/post/...), which
+// take no options object. Set with sua.http.insecure(true). Per-request
+// "insecure": true on sua.http.request() is preferred and independent of this.
+static bool bantuHttpInsecureAll = false;
+
 // Options for the general form. The three-argument legacy helpers below fill
 // this in and keep their old behaviour.
 struct BantuHttpOptions {
@@ -668,6 +678,24 @@ struct BantuHttpOptions {
     bool verifyTls = true;    // certificates ARE verified; opt out per request
     bool verbose   = false;   // print a one-line [HTTP] trace
 };
+
+// scheme://host[:port] — what we log instead of the full URL.
+//
+// A URL's path and query routinely carry secrets: API tokens in query strings,
+// and a Web Push endpoint whose path IS the subscription identifier. Logging
+// the origin keeps the trace useful for debugging without writing those into
+// application output. BANTU_HTTP_DEBUG=1 opts in to the full URL.
+static std::string bantuUrlOrigin(const std::string& url) {
+    size_t scheme = url.find("://");
+    if (scheme == std::string::npos) return "<url>";
+    size_t hostStart = scheme + 3;
+    size_t end = url.find_first_of("/?#", hostStart);
+    std::string origin = (end == std::string::npos) ? url : url.substr(0, end);
+    // Strip any userinfo (user:pass@host) — credentials must never be logged.
+    size_t at = origin.find('@', hostStart);
+    if (at != std::string::npos) origin = origin.substr(0, hostStart) + origin.substr(at + 1);
+    return origin;
+}
 
 static Value bantuHttpRequestEx(const std::string& method, const std::string& url,
                                 const std::string& body, const std::string& contentType,
@@ -701,10 +729,17 @@ static Value bantuHttpRequestEx(const std::string& method, const std::string& ur
     curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, opt.verifyTls ? 1L : 0L);
     curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, opt.verifyTls ? 2L : 0L);
 
-    // Body: ALWAYS length-explicit. Without CURLOPT_POSTFIELDSIZE libcurl calls
-    // strlen() on the buffer, which truncates any binary body at its first NUL —
-    // e.g. an aes128gcm push payload, which begins with 16 random octets.
-    // COPYPOSTFIELDS makes curl own the bytes, so `body` need not outlive this.
+    // Body: ALWAYS length-explicit.
+    //
+    // CURLOPT_COPYPOSTFIELDS documents that "if the size has not been set prior
+    // to CURLOPT_COPYPOSTFIELDS, the data is assumed to be a null-terminated
+    // string" — so without a size libcurl calls strlen() and truncates any
+    // binary body at its first NUL. An aes128gcm push body opens with 16 random
+    // octets, so roughly two in five were being silently cut short.
+    //
+    // The ORDER below is load-bearing: the size must be set first. COPYPOSTFIELDS
+    // (rather than POSTFIELDS) makes libcurl own the bytes, so `body` need not
+    // outlive the call.
     auto setBody = [&]() {
         curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE_LARGE, (curl_off_t)body.size());
         curl_easy_setopt(curl, CURLOPT_COPYPOSTFIELDS, body.data());
@@ -760,14 +795,34 @@ static Value bantuHttpRequestEx(const std::string& method, const std::string& ur
 
     ObjectMap response;
 
+    // Log the origin, not the full URL — see bantuUrlOrigin. BANTU_HTTP_DEBUG=1
+    // opts in to the full URL when you are actually debugging a request.
+    const char* httpDebug = std::getenv("BANTU_HTTP_DEBUG");
+    bool fullUrl = httpDebug && httpDebug[0] && httpDebug[0] != '0';
+    std::string traceTarget = fullUrl ? url : bantuUrlOrigin(url);
+    bool trace = opt.verbose && !bantuQuietMode;
+
     if (res != CURLE_OK) {
-        response["error"] = Value(std::string(curl_easy_strerror(res)));
+        std::string err = curl_easy_strerror(res);
+        // curl's certificate errors say nothing about how to proceed. Since
+        // verification is now on by default, spell out the two real options.
+        if (res == CURLE_PEER_FAILED_VERIFICATION || res == CURLE_SSL_CACERT_BADFILE
+#ifdef CURLE_SSL_CACERT
+            || res == CURLE_SSL_CACERT
+#endif
+            ) {
+            err += " — the server's TLS certificate could not be verified. "
+                   "Install a trusted certificate, or, for a development endpoint only, "
+                   "pass \"insecure\": true to sua.http.request()";
+        }
+        response["error"] = Value(err);
         response["status"] = Value(0.0);
         response["ok"] = Value(false);
         response["url"] = Value(url);
         response["method"] = Value(method);
-        if (opt.verbose)
-            std::cerr << "  [HTTP] " << method << " " << url << " -> ERROR: " << curl_easy_strerror(res) << "\n";
+        if (trace)
+            std::cerr << "  [HTTP] " << method << " " << traceTarget << " -> ERROR: "
+                      << curl_easy_strerror(res) << "\n";
     } else {
         response["status"] = Value((double)responseCode);
         response["statusText"] = Value(httpStatusText((int)responseCode));
@@ -776,20 +831,24 @@ static Value bantuHttpRequestEx(const std::string& method, const std::string& ur
         response["url"] = Value(url);
         response["method"] = Value(method);
         response["headers"] = Value(responseHeaders);
-        if (opt.verbose)
-            std::cerr << "  [HTTP] " << method << " " << url << " -> " << responseCode
+        if (trace)
+            std::cerr << "  [HTTP] " << method << " " << traceTarget << " -> " << responseCode
                       << " " << httpStatusText((int)responseCode) << "\n";
     }
 
     return Value(std::move(response));
 }
 
-// Legacy three-argument form. Behaviour is unchanged except that TLS
-// certificates are now verified and the trace line goes to stderr.
+// Legacy three-argument form, behind sua.http.get/post/put/delete/patch/head.
+// Behaviour is unchanged except that TLS certificates are now verified and the
+// trace goes to stderr, honours --quiet, and names only the origin. These
+// helpers take no options object, so they read the global TLS opt-out set by
+// sua.http.insecure().
 static Value bantuHttpRequest(const std::string& method, const std::string& url,
                               const std::string& body = "", const std::string& contentType = "") {
     BantuHttpOptions opt;
     opt.verbose = true;
+    opt.verifyTls = !bantuHttpInsecureAll;
     return bantuHttpRequestEx(method, url, body, contentType, opt);
 }
 
@@ -1123,7 +1182,10 @@ public:
     }
 
     // v1.2.2: Suppress informational [INCLUDE] log lines. Errors still print.
-    void setQuiet(bool q) { quietMode_ = q; }
+    void setQuiet(bool q) {
+        quietMode_ = q;
+        bantuQuietMode = q;   // free functions (the HTTP trace) read this
+    }
     bool isQuiet() const { return quietMode_; }
 
     Value evaluate(std::vector<std::shared_ptr<ASTNode>>& program) {
@@ -1718,27 +1780,24 @@ private:
             ss << f.rdbuf();
             std::string content = ss.str();
 
-            // Content type from the extension (table shared with sua.pwa).
-            std::string ext;
-            size_t dot = filePath.find_last_of('.');
-            size_t slash = filePath.find_last_of('/');
-            if (dot != std::string::npos && (slash == std::string::npos || dot > slash)) {
-                ext = filePath.substr(dot + 1);
-                for (auto& c : ext) c = (char)std::tolower((unsigned char)c);
-            }
-            std::string ct = bantu_pwa::mime_for_extension(ext);
+            std::string ct = bantu_mime::for_path(filePath);
+            bool isHtml = ct.rfind("text/html", 0) == 0;
 
             // With auto_inject on, patch the PWA <head> block into served HTML so
             // an existing app becomes installable without editing its templates.
             // inject_meta() is idempotent — a page that already calls
             // sua.pwa.meta() is left untouched.
-            if (bantuPwaConfig.configured && bantuPwaConfig.auto_inject &&
-                (ext == "html" || ext == "htm")) {
+            if (bantuPwaConfig.configured && bantuPwaConfig.auto_inject && isHtml) {
                 content = bantu_pwa::inject_meta(content, bantu_pwa::render_meta(bantuPwaConfig));
             }
 
-            // A stale service worker is sticky, so never let one be cached.
-            bool noCache = (ext == "html" || ext == "htm" || ext == "webmanifest");
+            // A manifest is always revalidated: a stale one pins an old start_url
+            // or icon set. HTML is only switched to no-cache once a PWA is
+            // configured — there a stale shell pins old asset URLs and the
+            // service worker makes it sticky. Non-PWA apps keep the previous
+            // max-age so this change cannot alter behaviour they rely on.
+            bool noCache = ct.rfind("application/manifest+json", 0) == 0
+                        || (isHtml && bantuPwaConfig.configured);
 
             std::ostringstream resp;
             resp << "HTTP/1.1 200 OK\r\n";
@@ -4590,6 +4649,29 @@ private:
             }
             std::string contentType = opt_str("content_type", "");
             return bantuHttpRequestEx(method, url, body, contentType, opt);
+        });
+
+        // sua.http.insecure(true) — disable TLS certificate verification for the
+        // convenience helpers above, which take no options object.
+        //
+        // The escape hatch exists because verification is now on by default and
+        // sua.http.get(...) has nowhere to put a per-request flag; without it, an
+        // app talking to a self-signed internal endpoint would have no way
+        // forward. It is deliberately loud, global and explicit — prefer
+        // sua.http.request({..., "insecure": true}) so the exemption is scoped to
+        // the one call that needs it.
+        httpClientObj["insecure"] = makeNative([](std::vector<Value> args) -> Value {
+            bool on = args.empty() ? true : args[0].isTruthy();
+            if (on != bantuHttpInsecureAll && on) {
+                std::cerr << "  [sua.http] WARNING: TLS certificate verification disabled for "
+                             "sua.http.get/post/put/delete/patch/head. Every outbound HTTPS request "
+                             "is now unauthenticated and open to interception.\n";
+            }
+            bantuHttpInsecureAll = on;
+            ObjectMap o;
+            o["insecure"] = Value(bantuHttpInsecureAll);
+            o["verify"] = Value(!bantuHttpInsecureAll);
+            return Value(std::move(o));
         });
 
         suaObj["http"] = Value(std::move(httpClientObj));

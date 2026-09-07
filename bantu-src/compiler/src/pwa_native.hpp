@@ -129,42 +129,6 @@ inline std::string js_escape(const std::string& s) {
     return o;
 }
 
-// ── MIME types ──────────────────────────────────────────────────────────────
-//
-// Shared by the static file server. The original table covered nine extensions
-// and lacked `.webmanifest` (required for a manifest served as a file) and the
-// font/media types any real app needs.
-inline std::string mime_for_extension(const std::string& ext) {
-    if (ext == "html" || ext == "htm")   return "text/html; charset=utf-8";
-    if (ext == "css")                    return "text/css; charset=utf-8";
-    if (ext == "js" || ext == "mjs")     return "application/javascript; charset=utf-8";
-    if (ext == "json" || ext == "map")   return "application/json; charset=utf-8";
-    if (ext == "webmanifest")            return "application/manifest+json; charset=utf-8";
-    if (ext == "svg")                    return "image/svg+xml";
-    if (ext == "png")                    return "image/png";
-    if (ext == "jpg" || ext == "jpeg")   return "image/jpeg";
-    if (ext == "gif")                    return "image/gif";
-    if (ext == "webp")                   return "image/webp";
-    if (ext == "avif")                   return "image/avif";
-    if (ext == "ico")                    return "image/x-icon";
-    if (ext == "txt")                    return "text/plain; charset=utf-8";
-    if (ext == "xml")                    return "application/xml; charset=utf-8";
-    if (ext == "pdf")                    return "application/pdf";
-    if (ext == "wasm")                   return "application/wasm";
-    if (ext == "woff")                   return "font/woff";
-    if (ext == "woff2")                  return "font/woff2";
-    if (ext == "ttf")                    return "font/ttf";
-    if (ext == "otf")                    return "font/otf";
-    if (ext == "eot")                    return "application/vnd.ms-fontobject";
-    if (ext == "mp4")                    return "video/mp4";
-    if (ext == "webm")                   return "video/webm";
-    if (ext == "mp3")                    return "audio/mpeg";
-    if (ext == "ogg")                    return "audio/ogg";
-    if (ext == "wav")                    return "audio/wav";
-    if (ext == "csv")                    return "text/csv; charset=utf-8";
-    return "application/octet-stream";
-}
-
 // ── the manifest ────────────────────────────────────────────────────────────
 
 inline std::string render_icon_array(const std::vector<IconEntry>& icons, bool with_type) {

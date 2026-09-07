@@ -145,6 +145,27 @@ contains "original head preserved" "$IDX" "<title>Test App</title>"
 CSSCT="$(curl -s -o /dev/null -D - "$BASE/app.css" | tr -d '\r' | awk -F': ' 'tolower($1)=="content-type"{print $2}')"
 check "css content-type" "$CSSCT" "text/css; charset=utf-8"
 
+# The MIME table used to cover nine extensions; everything else fell through to
+# application/octet-stream, which browsers refuse to execute or render.
+ctype() { curl -s -o /dev/null -D - "$BASE/$1" | tr -d '\r' | awk -F': ' 'tolower($1)=="content-type"{print $2}'; }
+printf 'x' > "$TMP/public/f.woff2"
+printf 'x' > "$TMP/public/m.wasm"
+printf 'x' > "$TMP/public/i.webp"
+printf 'x' > "$TMP/public/UPPER.PNG"
+printf 'x' > "$TMP/public/v.mp4"
+printf 'x' > "$TMP/public/README"
+check "woff2 content-type"      "$(ctype f.woff2)"  "font/woff2"
+check "wasm content-type"       "$(ctype m.wasm)"   "application/wasm"
+check "webp content-type"       "$(ctype i.webp)"   "image/webp"
+check "mp4 content-type"        "$(ctype v.mp4)"    "video/mp4"
+check "uppercase .PNG resolves" "$(ctype UPPER.PNG)" "image/png"
+check "no extension is opaque"  "$(ctype README)"   "application/octet-stream"
+
+cachectl() { curl -s -o /dev/null -D - "$BASE/$1" | tr -d '\r' | awk -F': ' 'tolower($1)=="cache-control"{print $2}'; }
+contains "manifest is never cached"  "$(cachectl manifest.webmanifest)" "no-cache"
+contains "html revalidates under pwa" "$(cachectl '')" "no-cache"
+contains "other assets stay cacheable" "$(cachectl app.css)" "max-age"
+
 echo
 echo "-- binary-safe outbound HTTP (the POSTFIELDSIZE regression) --"
 # A 300-byte body starting with 0x00. Before CURLOPT_POSTFIELDSIZE was set,
