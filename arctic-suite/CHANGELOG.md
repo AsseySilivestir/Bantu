@@ -6,6 +6,19 @@ tracks granular per-phase progress, including feature- and stress-test results.
 
 ## [Unreleased]
 
+### 2026-09-07 — Follow-up: in-place list-field mutation fix (interpreter)
+- **[bug fix]** Mutating a **list field of a class instance in place** now persists:
+  `this.list[i] = x`, `this.list[len(this.list)] = x` (append), `this.list.push(x)` / `.pop()`,
+  2-D `this.grid[i][j] = x`, chained `add()` returning `this`, and grow-by-index. Root cause:
+  `resolveLValue` didn't resolve a member base that is a **class instance** (only dicts, which
+  happened to alias through a shared_ptr), and `evalIndexAssign` mutated a *copy* of the field and
+  only wrote it back for plain-variable targets — so list-field writes were silently lost. Fix:
+  `resolveLValue` returns a pointer to the instance's actual stored property; `evalIndexAssign`
+  mutates through `resolveLValue`. Dict-field assignment and local-list assignment unchanged.
+  Regression guard: `tests/lang_oop_test.b` (15/15, also covers the cross-instance `this` fix). Full
+  regression green on default and Arrow builds. (This retires the "arctic sidesteps it with immutable
+  rebuilds" caveat — the rebuilds still work, just no longer required.)
+
 ### 2026-09-07 — Performance push (combined effort): fast CSV · datetime/categorical · lazy · Arrow/Parquet
 
 #### Phase A — two-pass fast CSV reader — ✅ `tests/arctic_csv2_test.b` 34/34

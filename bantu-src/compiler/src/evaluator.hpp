@@ -959,31 +959,30 @@ private:
     Value evalIndexAssign(IndexAssignNode* n) {
         Value val = evalNode(n->value);
 
-        // Fast path: direct variable access (avoids copying entire list)
-        if (auto varNode = dynamic_cast<VariableNode*>(n->object.get())) {
-            if (env_->has(varNode->name)) {
-                Value& obj = env_->getRef(varNode->name);
-                Value idx = evalNode(n->index);
-
-                if (obj.isList()) {
-                    int i = (int)idx.numberVal;
-                    if (i < 0) {
-                        ErrorHandler::throwRuntimeError("Index out of bounds: " + std::to_string(i), n->line, n->col);
-                        return Value();
-                    }
-                    if (i >= (int)obj.listVal.size()) {
-                        obj.listVal.resize(i + 1, Value(0.0));
-                    }
-                    obj.listVal[i] = val;
-                    return val;
+        // Preferred path: resolve the container to its real storage location and
+        // mutate in place. Handles a plain variable, a dict/list field of a class
+        // instance (`this.list[i] = x`), a nested member (`this.a.b[i] = x`), and
+        // dict entries — anything resolveLValue can address — so the write always
+        // persists (lists are stored by value, so a copy would be lost).
+        if (Value* base = resolveLValue(n->object.get())) {
+            Value idx = evalNode(n->index);
+            if (base->isList()) {
+                int i = (int)idx.numberVal;
+                if (i < 0) {
+                    ErrorHandler::throwRuntimeError("Index out of bounds: " + std::to_string(i), n->line, n->col);
+                    return Value();
                 }
-
-                if (obj.isObject()) {
-                    std::string key = idx.toString();
-                    (*obj.objectVal)[key] = val;
-                    return val;
+                if (i >= (int)base->listVal.size()) {
+                    base->listVal.resize(i + 1, Value(0.0));
                 }
+                base->listVal[i] = val;
+                return val;
             }
+            if (base->isObject()) {
+                (*base->objectVal)[idx.toString()] = val;
+                return val;
+            }
+            // resolvable but not indexable → fall through to the error/slow path
         }
 
         // Slow path: evaluate expression and update
@@ -1715,6 +1714,12 @@ private:
         if (auto dot = dynamic_cast<DotAccessNode*>(node)) {
             Value* base = resolveLValue(dot->object.get());
             if (base && base->isObject()) return &(*base->objectVal)[dot->property];
+            // A class instance stores its fields by value, so return a pointer to
+            // the actual stored field. Without this, `this.list[i] = x` and
+            // `this.list.push(x)` would mutate a *copy* and silently do nothing
+            // (dicts escaped this only because their map is shared via shared_ptr).
+            if (base && base->isClassInstance() && base->classInstanceVal)
+                return &base->classInstanceVal->properties[dot->property];
             return nullptr;
         }
         return nullptr;
