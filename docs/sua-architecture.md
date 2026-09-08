@@ -348,9 +348,14 @@ Two correctness bugs fell out of the same work, both of which had been corruptin
 - **Continuation frames were not reassembled at all.** Fragmented messages are now joined,
   bounded by `max_ws_message_bytes`.
 
-Still outstanding for Phase 2, because they need the loop's connection ownership: per-IP
-connection caps, write backpressure, and the idle timeout (a receive timeout is a blunt
-substitute).
+Write backpressure (a 4 MiB per-connection cap, so a client that stops reading cannot make the
+server buffer without bound) and the idle timeout both landed with the loop in Phase 2.
+
+**Still outstanding: per-IP connection caps.** `max_connections` is process-wide, so a single
+address can still occupy the whole table — cheaply, since each connection now costs its buffers
+rather than a thread. Under `sua.server.workers(n)` the cap is also per-worker, making the effective
+process-group limit n x max_connections. Neither is a regression on anything that shipped, but
+neither is finished.
 
 ---
 
