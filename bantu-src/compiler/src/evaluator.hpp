@@ -32,6 +32,7 @@
 #include <random>
 #include <algorithm>
 #include <cstring>
+#include <csignal>
 #include <cstdlib>
 #include <cstdint>
 #include <set>
@@ -2826,6 +2827,20 @@ private:
 #ifdef _WIN32
         WSADATA wsa;
         WSAStartup(MAKEWORD(2, 2), &wsa);
+#else
+        // A client that sends a request and then closes without reading the
+        // reply makes the server's next send() raise SIGPIPE, whose default
+        // action is to terminate the process. That is an unauthenticated,
+        // one-packet remote kill, and it long predates the event loop -- v1.3.0
+        // dies to it identically (exit 141 = 128 + SIGPIPE).
+        //
+        // Ignoring the signal turns the same condition into send() returning
+        // EPIPE, which the loop already handles by closing the connection.
+        //
+        // Scoped to the server rather than set process-wide at startup, so that
+        // `bantu run script.b | head` still terminates on a closed pipe the way
+        // every other CLI program does.
+        signal(SIGPIPE, SIG_IGN);
 #endif
         int sock = (int)socket(AF_INET, SOCK_STREAM, 0);
         if (sock < 0) {

@@ -10,6 +10,7 @@
 #    * single-recv frame parsing -> frames silently truncated at one TCP
 #                                   segment (voice data corrupted constantly)
 #    * 16KB single-recv headers  -> truncated header blocks
+#    * unhandled SIGPIPE         -> one abrupt disconnect killed the server
 #
 #  Run:  BANTU=./bantu-src/compiler/build/bantu bash tests/sua_ws_security_test.sh
 # ════════════════════════════════════════════════════════════════════════
@@ -131,6 +132,29 @@ def split(s):
     s.sendall(b"X-Late: yes\r\n\r\n")
 check("oversized header block -> 431", run(lambda: hdr(big)), "431")
 check("header split across segments",  run(lambda: hdr(split)), "200")
+
+# ── abrupt disconnect (SIGPIPE remote kill) ──────────────────────────
+# A client that requests a body and closes without reading it makes the
+# server's next send() raise SIGPIPE. The default action terminates the
+# process, so ONE unauthenticated request killed the whole server. This
+# predates the event loop: v1.3.0 dies to it identically, exit 141.
+print("\n-- abrupt disconnect --")
+def slam(n):
+    for _ in range(n):
+        c=socket.socket(); c.connect(("127.0.0.1",PORT))
+        c.sendall(b"GET /ping HTTP/1.1\r\nHost: x\r\n\r\n")
+        # SO_LINGER 0 => RST rather than a graceful FIN, the hostile case.
+        c.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii",1,0))
+        c.close()
+    return "sent"
+check("200 abrupt disconnects accepted", run(lambda: slam(200)), "sent")
+# The real assertion: the server is still alive and serving afterwards.
+def alive():
+    c=socket.create_connection(("127.0.0.1",PORT),5); c.settimeout(5)
+    c.sendall(b"GET /ping HTTP/1.1\r\nHost: x\r\n\r\n")
+    line=c.recv(200).split(b"\r\n")[0].decode(); c.close()
+    return line.split(" ")[1]
+check("server survives abrupt disconnects", run(alive), "200")
 
 print("\n========================================")
 print("  PASS: %d   FAIL: %d" % (P,F))
