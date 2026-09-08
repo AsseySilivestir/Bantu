@@ -5,8 +5,8 @@ each decision was made. Read this before changing `event_loop.hpp` or the server
 `evaluator.hpp`. Where a decision rejected an obvious alternative, the reason is recorded — those
 notes are the point of this document.
 
-**Status:** Phase 1 (correctness scaffolding) and Phase 3 (security hardening) landed.
-Phase 2 (the event loop) next. The staging is in §8.
+**Status:** Phases 1, 2 and 3 landed — the event loop is live and the Phase 1 locks are gone.
+Phase 4 (SO_REUSEPORT, non-blocking I/O builtins) next. The staging is in §8.
 
 ---
 
@@ -185,6 +185,43 @@ improvement per connection.
 - **100k devices:** comfortably one machine.
 - **Millions:** multiple machines plus a pub/sub bus for cross-worker and cross-machine broadcast.
 
+### 5.4 Measured, not assumed
+
+Same machine, same workload, event loop vs the thread-per-connection build it replaced
+(commit `d306c8f`, built in a worktree so both were measured on equal terms).
+
+**3,000 idle WebSocket connections:**
+
+| | event loop | thread-per-connection |
+|---|---|---|
+| RSS growth | 4.05 → 5.80 MB | 3.99 → 69.8 MB |
+| per connection | **0.6 KB** | 21.9 KB |
+| OS threads | **1** | 1,647 |
+
+**36× less memory per connection**, and one thread instead of sixteen hundred. (macOS commits
+thread stacks lazily, so the threaded build's RSS is far below its 8 MB-per-thread reservation —
+the address space and scheduler pressure are the harder limits.)
+
+**Latency, 2,000 idle connections + one probe:** p50 0.05 ms, p99 0.10 ms — against 0.04/0.08 ms
+threaded. **Equivalent, not better**, and worth stating plainly: an idle thread blocked in `recv`
+costs nothing, so there is no context-switch storm to win against until the connections are busy.
+
+**300 concurrently active clients, 4 s:**
+
+| | event loop | thread-per-connection |
+|---|---|---|
+| messages echoed | **134,964** | 120,090 |
+| probe p50 | **14.9 ms** | 16.5 ms |
+| probe p99 | 57.5 ms | **45.5 ms** |
+| probe max | **73.3 ms** | 207.6 ms |
+
+12% more throughput and a **2.8× better worst case** — no connection gets starved waiting for the
+scheduler. The event loop's p99 is slightly worse, which is the honest cost of strict FIFO fairness:
+threads let a lucky request jump ahead, which flatters p99 while producing that 207 ms tail.
+
+The headline is not latency. It is that the same box now holds 36× the connections, on one thread,
+with no locks anywhere — and the correctness properties that follow from that.
+
 ### 5.3 Cross-worker broadcast
 
 `sua.ws.broadcast` reaches only the clients on the calling worker. Once `SO_REUSEPORT` lands, a
@@ -242,7 +279,7 @@ handler stalls a thread *and* corrupts other requests' scopes.
 |---|---|---|
 | 0 | This document | done |
 | 1 | Correctness scaffolding: recursive-mutex interpreter lock, WS table mutex, atomic counters, race reproducer as a committed test | done |
-| 2 | `event_loop.hpp` + non-blocking rewrite of the three server functions; **Phase 1 locks deleted** | next |
+| 2 | `event_loop.hpp` + non-blocking rewrite of the three server functions; **Phase 1 locks deleted** | done — see §5.4 |
 | 3 | Security hardening (§9), each item with a test | done — `tests/sua_ws_security_test.sh` 13/13 |
 | 4 | `SO_REUSEPORT` workers; curl-multi `sua.http.*`; broadcast bus | |
 | 5 | Upstream PR to `AsseySilivestir/Bantu` with reproducer and fix | |

@@ -18,6 +18,7 @@
 #include "dataframe_native.hpp" // native column primitives for the arctic data-science suite
 #include "dataframe_arrow.hpp"  // Parquet + Feather/Arrow-IPC I/O (opt-in: -DBANTU_ARROW)
 #include "mime_types.hpp"       // extension -> Content-Type for the static file server
+#include "event_loop.hpp"       // kqueue/epoll/poll readiness loop for the sua server
 #include "pwa_native.hpp"       // manifest / service worker / offline rendering for sua.pwa
 #include "webpush.hpp"          // RFC 8188/8291/8292 Web Push (pulls in p256.hpp + aes_gcm.hpp)
 #include <iostream>
@@ -25,7 +26,6 @@
 #include <sstream>
 #include <chrono>
 #include <thread>
-#include <mutex>
 #include <atomic>
 #include <type_traits>
 #include <functional>
@@ -165,31 +165,10 @@ struct BantuServerRoute {
     Value handler;  // Bantu function (or null if none)
 };
 
-// ─── PHASE 1 SCAFFOLDING — deleted when the event loop lands ───────────────
-// See docs/sua-architecture.md §2.4 and §8.
-//
-// Upstream's accept loop hands every connection to its own detached thread, but
-// the Evaluator has ONE shared env_ that bantuCallFunction mutates
-// (env_ = callEnv; ... env_ = prevEnv;). Concurrent requests therefore tore each
-// other's scope out from under them: measured at 16 handler errors and 17
-// corrupted replies across 20 concurrent requests.
-//
-// This serialises Bantu execution while leaving socket I/O parallel, so a slow
-// WebSocket client still cannot block new connections. It is a safety belt, not
-// the fix — the event loop removes the shared state entirely and this goes away.
-//
-// RECURSIVE because a WebSocket callback can fire while the same thread is
-// already inside the interpreter; a plain mutex would self-deadlock.
-//
-// LOCK ORDER: this lock, THEN bantuWsTableMutex. Never the reverse, and never
-// hold the table lock across a bantuWsCallback call.
-static std::recursive_mutex bantuInterpreterMutex;
-
 // ─── Server resource limits ───────────────────────────────────────────────
-// Every one of these existed as "unbounded" before, which is the difference
-// between a server and a denial-of-service target. See
-// docs/sua-architecture.md §9. Configure with sua.server.limits({...});
-// the defaults are the safe ones.
+// Every one of these was "unbounded" before, which is the difference between a
+// server and a denial-of-service target. See docs/sua-architecture.md §9.
+// Configure with sua.server.limits({...}); the defaults are the safe ones.
 struct BantuServerLimits {
     size_t maxHeaderBytes   = 64 * 1024;        // request header block
     size_t maxBodyBytes     = 8 * 1024 * 1024;  // request body
@@ -203,15 +182,97 @@ struct BantuServerLimits {
 };
 static BantuServerLimits bantuLimits;
 
-// Live connection count, for the cap. Incremented on accept, decremented when
-// the connection thread finishes (RAII below, so an early return or a thrown
-// handler cannot leak a slot).
-static std::atomic<int> bantuLiveConnections{0};
-struct BantuConnectionSlot {
-    bool held = false;
-    explicit BantuConnectionSlot(bool h) : held(h) {}
-    ~BantuConnectionSlot() { if (held) bantuLiveConnections--; }
+// Mirrors the evaluator's --quiet flag for code outside the class (setQuiet
+// keeps them in step), so diagnostics honour `bantu -q` like everything else.
+static bool bantuQuietMode = false;
+
+// ─── Event-loop connection state ───────────────────────────────────────────
+// One of these per open socket, replacing one OS thread per open socket. A
+// thread costs ~8MB of stack; this costs its buffers. That difference is what
+// takes the server from a few thousand connections to a hundred thousand.
+//
+// Everything here is touched ONLY by the loop thread, which is why none of it
+// needs a lock -- and why the interpreter lock could be deleted with the
+// threads that made it necessary.
+struct BantuConn {
+    int         fd = -1;
+    bool        isWs = false;
+    std::string in;              // bytes read, not yet consumed
+    std::string out;             // bytes to write, not yet sent
+    size_t      outPos = 0;      // how much of `out` has gone to the kernel
+    bool        closing = false; // close once `out` drains
+    bool        wantWrite = false;
+    uint64_t    lastActive = 0;
+    // WebSocket only
+    int         wsId = 0;
+    std::string fragment;        // reassembled continuation frames
+    uint8_t     fragOpcode = 0;
 };
+static std::unordered_map<int, BantuConn> bantuConns;
+static bantu_loop::Backend* bantuLoopBackend = nullptr;
+
+// Watch this fd for writability iff it has pending output.
+static void bantuConnSyncInterest(BantuConn& c) {
+    bool want = (c.outPos < c.out.size());
+    if (want != c.wantWrite && bantuLoopBackend) {
+        bantuLoopBackend->mod(c.fd, true, want);
+        c.wantWrite = want;
+    }
+}
+
+// Queue bytes for a connection instead of blocking in send().
+//
+// This is the change that lets the existing request-handling code run on the
+// loop unmodified: every send(sock, ...) becomes an append here. If the fd is
+// not a loop connection (a test harness, anything pre-loop) it falls back to a
+// real send so nothing else has to care.
+static void bantuConnWriteN(int fd, const char* data, size_t n) {
+    auto it = bantuConns.find(fd);
+    if (it == bantuConns.end()) { send(fd, data, (int)n, 0); return; }
+    BantuConn& c = it->second;
+
+    // Backpressure. A client that stops reading must not be able to make the
+    // server buffer without bound -- that is memory exhaustion requiring no
+    // packets beyond opening the socket and going quiet.
+    if (c.out.size() - c.outPos + n > (size_t)(4 * 1024 * 1024)) {
+        c.closing = true;
+        return;
+    }
+    c.out.append(data, n);
+    bantuConnSyncInterest(c);
+}
+static void bantuConnWrite(int fd, const std::string& sv) { bantuConnWriteN(fd, sv.data(), sv.size()); }
+
+// Content-Length from an already-complete header block, 0 when absent or
+// malformed. Digits are parsed by hand rather than with stoull, matching
+// bantuReadBody -- that avoids a glibc 2.38 symbol dependency the project
+// deliberately does not take.
+static size_t bantuContentLengthOf(const std::string& buf, size_t headerEnd) {
+    std::string h = buf.substr(0, headerEnd);
+    for (auto& ch : h) ch = (char)std::tolower((unsigned char)ch);
+    size_t at = h.find("content-length:");
+    if (at == std::string::npos) return 0;
+    size_t i = at + 15;
+    while (i < h.size() && (h[i] == ' ' || h[i] == '\t')) i++;
+    size_t v = 0; bool any = false;
+    for (; i < h.size() && h[i] >= '0' && h[i] <= '9'; i++) {
+        v = v * 10 + (size_t)(h[i] - '0');
+        any = true;
+        if (v > ((size_t)1 << 40)) return ((size_t)1 << 40);   // absurd; caller rejects
+    }
+    return any ? v : 0;
+}
+
+// Graceful close: finish writing what is queued, then drop.
+static void bantuConnClose(int fd) {
+    auto it = bantuConns.find(fd);
+    if (it == bantuConns.end()) { CLOSE_SOCKET(fd); return; }
+    it->second.closing = true;
+}
+
+// Live connection count, for the cap. Incremented on accept, decremented when
+// the loop drops the connection.
+static std::atomic<int> bantuLiveConnections{0};
 
 static std::vector<BantuServerRoute> bantuServerRoutes;
 static int bantuServerPort = 3000;
@@ -589,21 +650,18 @@ static std::unordered_map<int, BantuWsClient>& bantuWsTable() {
 // Guards bantuWsTable(). Connection threads insert/erase; sua.ws.* builtins
 // read. Concurrent insert/erase on an unordered_map is undefined behaviour.
 // Held only across map access, NEVER across a send or a Bantu callback.
-static std::mutex bantuWsTableMutex;
 
 // Snapshot helpers. The sua.ws.* builtins copy what they need out of the table
 // under the lock, then send with the lock released — holding a mutex across a
 // blocking socket write would let one slow reader stall every connect and
 // disconnect on the server.
 static std::vector<int> bantuWsLiveFds() {
-    std::lock_guard<std::mutex> g(bantuWsTableMutex);
     std::vector<int> fds;
     for (const auto& kv : bantuWsTable())
         if (kv.second.fd >= 0 && kv.second.alive) fds.push_back(kv.second.fd);
     return fds;
 }
 static std::vector<std::string> bantuWsLiveIds() {
-    std::lock_guard<std::mutex> g(bantuWsTableMutex);
     std::vector<std::string> ids;
     for (const auto& kv : bantuWsTable())
         if (kv.second.fd >= 0) ids.push_back(kv.second.id);
@@ -611,7 +669,6 @@ static std::vector<std::string> bantuWsLiveIds() {
 }
 // -1 when the client is unknown or already gone.
 static int bantuWsFdFor(const std::string& clientId) {
-    std::lock_guard<std::mutex> g(bantuWsTableMutex);
     for (const auto& kv : bantuWsTable())
         if (kv.second.id == clientId && kv.second.fd >= 0) return kv.second.fd;
     return -1;
@@ -652,7 +709,9 @@ static void bantuWsSend(int fd, const std::string& message) {
         }
     }
     frame.insert(frame.end(), message.begin(), message.end());
-    send(fd, (const char*)frame.data(), (int)frame.size(), 0);
+    // Queued, not sent: a blocking send() to one slow client would stall every
+    // other connection this thread owns.
+    bantuConnWriteN(fd, (const char*)frame.data(), frame.size());
 }
 
 // ─── Send a WebSocket BINARY frame to a client (for voice/audio) ───
@@ -676,7 +735,7 @@ static void bantuWsSendBinary(int fd, const std::vector<uint8_t>& data) {
         }
     }
     frame.insert(frame.end(), data.begin(), data.end());
-    send(fd, (const char*)frame.data(), (int)frame.size(), 0);
+    bantuConnWriteN(fd, (const char*)frame.data(), frame.size());
 }
 
 // ─── WebSocket framing helpers (RFC 6455) ──────────────────────────
@@ -704,7 +763,7 @@ static void bantuWsClose(int sock, uint16_t code, const std::string& reason = ""
     frame.push_back(0x88);                       // FIN + close
     frame.push_back((uint8_t)payload.size());    // control frames are always < 126
     frame.insert(frame.end(), payload.begin(), payload.end());
-    send(sock, (const char*)frame.data(), (int)frame.size(), 0);
+    bantuConnWriteN(sock, (const char*)frame.data(), frame.size());
 }
 
 // RFC 6455 §8.1 requires text frames to be valid UTF-8. Rejecting invalid
@@ -738,33 +797,37 @@ static bool bantuValidUtf8(const std::string& s) {
 // ─── Handle a WebSocket connection (after upgrade) ─────────────────
 // Runs in the same thread that accepted the HTTP connection — blocks
 // until the WS client disconnects.
-static void bantuHandleWebSocket(int sock, const std::string& wsKey) {
-    // Compute the accept value: SHA1(key + GUID) → base64
+// ─── WebSocket on the event loop ───────────────────────────────────
+// The connection no longer owns a thread. Upgrade registers the client and
+// returns immediately; each later readable event feeds bantuWsProcess, which
+// consumes whatever COMPLETE frames are in the buffer and leaves a partial one
+// for the next wakeup. That incremental parse is also what makes frame
+// truncation at TCP segment boundaries structurally impossible.
+static void bantuWsUpgrade(int sock, const std::string& wsKey) {
     BantuSha1 sha;
     sha.update(wsKey);
     sha.update(std::string("258EAFA5-E914-47DA-95CA-C5AB0DC85B11"));
     std::string acceptVal = bantuBase64Encode(sha.final_());
 
-    // Send 101 Switching Protocols
     std::string resp = "HTTP/1.1 101 Switching Protocols\r\n"
                        "Upgrade: websocket\r\n"
                        "Connection: Upgrade\r\n"
                        "Sec-WebSocket-Accept: " + acceptVal + "\r\n"
                        "\r\n";
-    send(sock, resp.c_str(), (int)resp.size(), 0);
+    bantuConnWrite(sock, resp);
 
-    // Register the client
     int wsId = bantuNextWsId++;
     BantuWsClient client;
     client.fd = sock;
     client.id = "ws-" + std::to_string(wsId);
-    {
-        std::lock_guard<std::mutex> g(bantuWsTableMutex);
-        bantuWsTable()[wsId] = client;
-    }
-    std::cout << "  [WS] Client connected: " << client.id << " (fd=" << sock << ")\n";
+    bantuWsTable()[wsId] = client;
 
-    // Call the Bantu-level onConnect handler if registered
+    auto it = bantuConns.find(sock);
+    if (it != bantuConns.end()) { it->second.isWs = true; it->second.wsId = wsId; }
+
+    if (!bantuQuietMode)
+        std::cout << "  [WS] Client connected: " << client.id << " (fd=" << sock << ")\n";
+
     if (bantuWsOnConnect.isFunction() || bantuWsOnConnect.isNativeFn()) {
         ObjectMap cliObj;
         cliObj["id"] = Value(client.id);
@@ -774,111 +837,101 @@ static void bantuHandleWebSocket(int sock, const std::string& wsKey) {
             catch (const std::exception& e) { std::cerr << "  [WS] onConnect error: " << e.what() << "\n"; }
         }
     }
+}
 
-    // WebSocket message loop.
-    //
-    // Rewritten to read WHOLE frames. The previous version parsed whatever one
-    // recv() returned, so any frame spanning more than one TCP segment was
-    // silently truncated, and it never validated masking or bounded the payload
-    // length it read from the wire.
-    bool running = true;
-    std::string fragment;        // reassembled continuation frames
-    uint8_t fragOpcode = 0;      // opcode of the message being reassembled
-    while (running) {
-        uint8_t hdr[2];
-        if (!bantuRecvExact(sock, hdr, 2)) break;
+// Consume every complete frame currently buffered. Returns false when the
+// connection must close: a protocol violation (already answered with a close
+// frame) or a close frame from the peer.
+static bool bantuWsProcess(BantuConn& c) {
+    const int sock = c.fd;
+    std::string clientId;
+    {
+        auto t = bantuWsTable().find(c.wsId);
+        if (t != bantuWsTable().end()) clientId = t->second.id;
+    }
 
-        bool fin        = (hdr[0] & 0x80) != 0;
-        uint8_t rsv     = hdr[0] & 0x70;
-        uint8_t opcode  = hdr[0] & 0x0F;
-        bool masked     = (hdr[1] & 0x80) != 0;
-        uint64_t payloadLen = hdr[1] & 0x7F;
+    size_t pos = 0;
+    bool keep = true;
+    while (keep) {
+        size_t avail = c.in.size() - pos;
+        if (avail < 2) break;
+        const uint8_t* p = (const uint8_t*)c.in.data() + pos;
 
-        // RFC 6455 §5.2: reserved bits must be zero unless an extension
-        // negotiated them, and we negotiate none.
-        if (rsv) { bantuWsClose(sock, 1002, "RSV bit set"); break; }
+        bool     fin    = (p[0] & 0x80) != 0;
+        uint8_t  rsv    =  p[0] & 0x70;
+        uint8_t  opcode =  p[0] & 0x0F;
+        bool     masked = (p[1] & 0x80) != 0;
+        uint64_t len    =  p[1] & 0x7F;
+        size_t   hdrLen = 2;
 
-        if (payloadLen == 126) {
-            uint8_t ext[2];
-            if (!bantuRecvExact(sock, ext, 2)) break;
-            payloadLen = ((uint64_t)ext[0] << 8) | ext[1];
-        } else if (payloadLen == 127) {
-            uint8_t ext[8];
-            if (!bantuRecvExact(sock, ext, 8)) break;
-            payloadLen = 0;
-            for (int i = 0; i < 8; i++) payloadLen = (payloadLen << 8) | ext[i];
+        if (len == 126) {
+            if (avail < 4) break;
+            len = ((uint64_t)p[2] << 8) | p[3];
+            hdrLen = 4;
+        } else if (len == 127) {
+            if (avail < 10) break;
+            len = 0;
+            for (int i = 0; i < 8; i++) len = (len << 8) | p[2 + i];
+            hdrLen = 10;
         }
+        if (masked) hdrLen += 4;
 
+        // Validate before trusting `len` to size anything.
+        if (rsv) { bantuWsClose(sock, 1002, "RSV bit set"); return false; }
         bool isControl = (opcode & 0x08) != 0;
-        // §5.5: control frames carry at most 125 octets and are never fragmented.
-        if (isControl && (payloadLen > 125 || !fin)) {
-            bantuWsClose(sock, 1002, "bad control frame"); break;
-        }
-        // §5.1: a client MUST mask. Accepting unmasked frames enables
-        // cache-poisoning attacks through intermediaries.
-        if (!masked) { bantuWsClose(sock, 1002, "unmasked client frame"); break; }
-        // Bound what we are willing to allocate from an attacker-supplied length.
-        if (payloadLen > bantuLimits.maxWsFrameBytes) {
-            bantuWsClose(sock, 1009, "frame too large"); break;
-        }
+        if (isControl && (len > 125 || !fin)) { bantuWsClose(sock, 1002, "bad control frame"); return false; }
+        if (!masked) { bantuWsClose(sock, 1002, "unmasked client frame"); return false; }
+        if (len > bantuLimits.maxWsFrameBytes) { bantuWsClose(sock, 1009, "frame too large"); return false; }
 
-        uint8_t mask[4];
-        if (!bantuRecvExact(sock, mask, 4)) break;
+        if (avail < hdrLen + (size_t)len) break;      // partial frame: wait
 
-        std::string payload;
-        if (payloadLen) {
-            payload.resize((size_t)payloadLen);
-            if (!bantuRecvExact(sock, (uint8_t*)&payload[0], (size_t)payloadLen)) break;
-            for (size_t i = 0; i < payload.size(); i++) payload[i] ^= (char)mask[i % 4];
-        }
+        const uint8_t* mask = p + hdrLen - 4;
+        std::string payload((const char*)p + hdrLen, (size_t)len);
+        for (size_t i = 0; i < payload.size(); i++) payload[i] ^= (char)mask[i % 4];
+        pos += hdrLen + (size_t)len;
 
-        // Reassemble fragments (opcode 0x0 continues the previous message).
+        // Reassemble continuation frames (opcode 0x0 continues the previous).
         if (!isControl) {
             if (opcode == 0x0) {
-                if (fragOpcode == 0) { bantuWsClose(sock, 1002, "unexpected continuation"); break; }
-                if (fragment.size() + payload.size() > bantuLimits.maxWsMessageBytes) {
-                    bantuWsClose(sock, 1009, "message too large"); break;
+                if (c.fragOpcode == 0) { bantuWsClose(sock, 1002, "unexpected continuation"); return false; }
+                if (c.fragment.size() + payload.size() > bantuLimits.maxWsMessageBytes) {
+                    bantuWsClose(sock, 1009, "message too large"); return false;
                 }
-                fragment += payload;
+                c.fragment += payload;
             } else {
-                if (fragOpcode != 0) { bantuWsClose(sock, 1002, "interleaved message"); break; }
-                if (!fin) { fragOpcode = opcode; fragment = payload; }
+                if (c.fragOpcode != 0) { bantuWsClose(sock, 1002, "interleaved message"); return false; }
+                if (!fin) { c.fragOpcode = opcode; c.fragment = payload; }
             }
-            if (!fin) continue;                  // wait for the rest
-            if (fragOpcode != 0) {               // final fragment of a split message
-                payload = fragment;
-                opcode  = fragOpcode;
-                fragment.clear();
-                fragOpcode = 0;
+            if (!fin) continue;                        // more fragments coming
+            if (c.fragOpcode != 0) {                   // final fragment
+                payload = c.fragment;
+                opcode  = c.fragOpcode;
+                c.fragment.clear();
+                c.fragOpcode = 0;
             }
         }
 
-        // §8.1: text frames must be valid UTF-8.
         if (opcode == 0x1 && !bantuValidUtf8(payload)) {
-            bantuWsClose(sock, 1007, "invalid UTF-8"); break;
+            bantuWsClose(sock, 1007, "invalid UTF-8"); return false;
         }
 
-        if (opcode == 0x8) {  // Close
-            break;
-        }
-        if (opcode == 0x9) {  // Ping → respond with Pong
+        if (opcode == 0x8) { keep = false; break; }                 // close
+        if (opcode == 0x9) {                                        // ping -> pong
             uint8_t pong[2] = {0x8A, 0x00};
-            send(sock, (const char*)pong, 2, 0);
+            bantuConnWriteN(sock, (const char*)pong, 2);
             continue;
         }
-        if (opcode == 0xA) {  // Pong — ignore
-            continue;
-        }
-        if (opcode == 0x2) {  // Binary message (voice/audio data)
-            // Call the onMessage handler with isBinary=true and raw bytes
+        if (opcode == 0xA) continue;                                // pong
+
+        if (opcode == 0x2) {                                        // binary
             if (bantuWsOnMessage.isFunction() || bantuWsOnMessage.isNativeFn()) {
                 ObjectMap msgObj;
-                msgObj["data"] = Value(payload);   // raw string (may contain nulls)
-                msgObj["client"] = Value(client.id);
+                msgObj["data"]   = Value(payload);
+                msgObj["client"] = Value(clientId);
                 msgObj["binary"] = Value(true);
-                // Also pass as a byte list for Bantu-side processing
                 std::vector<Value> byteList;
-                for (char c : payload) byteList.push_back(Value((double)(uint8_t)c));
+                byteList.reserve(payload.size());
+                for (char ch : payload) byteList.push_back(Value((double)(uint8_t)ch));
                 msgObj["bytes"] = Value(std::move(byteList));
                 if (bantuWsCallback) {
                     try { bantuWsCallback(bantuWsOnMessage, {Value(std::move(msgObj))}); }
@@ -886,21 +939,17 @@ static void bantuHandleWebSocket(int sock, const std::string& wsKey) {
                 }
             }
         }
-        if (opcode == 0x1) {  // Text message
-            std::cout << "  [WS] Message from " << client.id << ": " << payload << "\n";
-
-            // Call the Bantu-level onMessage handler if registered
+        if (opcode == 0x1) {                                        // text
+            if (!bantuQuietMode)
+                std::cout << "  [WS] Message from " << clientId << ": " << payload << "\n";
             if (bantuWsOnMessage.isFunction() || bantuWsOnMessage.isNativeFn()) {
                 ObjectMap msgObj;
-                msgObj["data"] = Value(payload);
-                msgObj["client"] = Value(client.id);
-                // Also try to parse as JSON — if it succeeds, pass the parsed value
-                Value parsed = Value();
+                msgObj["data"]   = Value(payload);
+                msgObj["client"] = Value(clientId);
                 if (!payload.empty() && (payload[0] == '{' || payload[0] == '[')) {
                     try {
-                        size_t pos = 0;
-                        parsed = bantuJsonParse(payload, pos);
-                        msgObj["json"] = parsed;
+                        size_t jp = 0;
+                        msgObj["json"] = bantuJsonParse(payload, jp);
                     } catch (...) {}
                 }
                 if (bantuWsCallback) {
@@ -910,22 +959,26 @@ static void bantuHandleWebSocket(int sock, const std::string& wsKey) {
             }
         }
     }
+    c.in.erase(0, pos);
+    return keep;
+}
 
-    // Cleanup
-    std::cout << "  [WS] Client disconnected: " << client.id << "\n";
+// onDisconnect + deregister. Called once, when the loop drops the connection.
+static void bantuWsTeardown(int wsId) {
+    std::string id;
+    auto t = bantuWsTable().find(wsId);
+    if (t == bantuWsTable().end()) return;
+    id = t->second.id;
+    if (!bantuQuietMode) std::cout << "  [WS] Client disconnected: " << id << "\n";
     if (bantuWsOnDisconnect.isFunction() || bantuWsOnDisconnect.isNativeFn()) {
         ObjectMap cliObj;
-        cliObj["id"] = Value(client.id);
+        cliObj["id"] = Value(id);
         if (bantuWsCallback) {
             try { bantuWsCallback(bantuWsOnDisconnect, {Value(std::move(cliObj))}); }
             catch (...) {}
         }
     }
-    {
-        std::lock_guard<std::mutex> g(bantuWsTableMutex);
-        bantuWsTable().erase(wsId);
-    }
-    CLOSE_SOCKET(sock);
+    bantuWsTable().erase(wsId);
 }
 
 // Helper: parse "host:port" → (host, port). Supports IPv6 brackets [::1]:53.
@@ -1324,10 +1377,6 @@ static std::string httpStatusText(int code) {
 }
 
 // ─── cURL HTTP Request Helper ───
-
-// Mirrors the evaluator's --quiet flag for code outside the class (setQuiet
-// keeps them in step), so diagnostics honour `bantu -q` like everything else.
-static bool bantuQuietMode = false;
 
 // Global TLS opt-out for the convenience helpers (sua.http.get/post/...), which
 // take no options object. Set with sua.http.insecure(true). Per-request
@@ -1831,9 +1880,6 @@ public:
             // Switch to the global environment so the handler can access
             // 'sua' and other globals. The WS handler may be called from
             // a different call stack than a normal HTTP request.
-            // Serialised against every other connection thread — see the note
-            // on bantuInterpreterMutex.
-            std::lock_guard<std::recursive_mutex> gil(bantuInterpreterMutex);
             auto savedEnv = this->env_;
             this->env_ = this->globalEnv_;
             auto result = this->bantuCallFunction(callee, std::move(args));
@@ -2484,62 +2530,24 @@ private:
             resp << "Cache-Control: " << (noCache ? "no-cache" : "public, max-age=300") << "\r\n";
             resp << "Server: Bantu-Sua/1.2\r\n";
             resp << "\r\n" << content;
-            std::string respStr = resp.str();
-            send(sock, respStr.c_str(), respStr.size(), 0);
+            bantuConnWrite(sock, resp.str());
             return true;
         }
         return false;
     }
 
     // Handle a single HTTP request — parse, route, call Bantu handler, respond.
-    void bantuHandleHttpRequest(int sock) {
-        // Read until the header block is complete.
-        //
-        // This used to be a single 16 KB recv(): a header block split across TCP
-        // segments was parsed half-formed, and one larger than 16 KB was silently
-        // truncated -- which with a Content-Length still in the tail is the shape
-        // of a request-smuggling bug, not just a size limit.
-        //
-        // A receive timeout bounds how long a client may dribble bytes, which is
-        // the Slowloris defence: without it a handful of sockets sending one
-        // octet a minute would each pin a thread indefinitely.
-#ifdef _WIN32
-        DWORD rcvTimeout = (DWORD)bantuLimits.headerTimeoutMs;
-        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&rcvTimeout, sizeof(rcvTimeout));
-#else
-        struct timeval rcvTimeout;
-        rcvTimeout.tv_sec  = bantuLimits.headerTimeoutMs / 1000;
-        rcvTimeout.tv_usec = (bantuLimits.headerTimeoutMs % 1000) * 1000;
-        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &rcvTimeout, sizeof(rcvTimeout));
-#endif
-        std::string request;
-        char buf[8192];
-        size_t headerEndPos = std::string::npos;
-        while (true) {
-            ssize_t n = recv(sock, buf, sizeof(buf), 0);
-            if (n <= 0) { CLOSE_SOCKET(sock); return; }
-            request.append(buf, (size_t)n);
-            headerEndPos = request.find("\r\n\r\n");
-            if (headerEndPos != std::string::npos) break;
-            if (request.size() > bantuLimits.maxHeaderBytes) {
-                static const char* tooBig =
-                    "HTTP/1.1 431 Request Header Fields Too Large\r\n"
-                    "Content-Length: 0\r\nConnection: close\r\n\r\n";
-                send(sock, tooBig, (int)strlen(tooBig), 0);
-                CLOSE_SOCKET(sock);
-                return;
-            }
-        }
-        ssize_t n = (ssize_t)request.size();
-        (void)n;
+    // Handle ONE complete request. The event loop has already read the whole
+    // header block (and body, if any) into `request`, so nothing here blocks --
+    // which is what allows a single thread to serve every connection.
+    void bantuDispatchRequest(int sock, const std::string& request) {
 
         // Parse request line: METHOD PATH HTTP/1.1
         size_t firstSp = request.find(' ');
         size_t secondSp = request.find(' ', firstSp + 1);
         if (firstSp == std::string::npos || secondSp == std::string::npos) {
-            std::string resp = "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n";
-            send(sock, resp.c_str(), resp.size(), 0);
-            CLOSE_SOCKET(sock);
+            bantuConnWrite(sock, std::string("HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n"));
+            bantuConnClose(sock);
             return;
         }
         std::string method = request.substr(0, firstSp);
@@ -2642,14 +2650,14 @@ private:
                         "HTTP/1.1 403 Forbidden\r\n"
                         "Content-Length: 0\r\n"
                         "Connection: close\r\n\r\n";
-                    send(sock, deny.c_str(), (int)deny.size(), 0);
-                    CLOSE_SOCKET(sock);
+                    bantuConnWrite(sock, deny);
+                    bantuConnClose(sock);
                     return;
                 }
             }
 
             if (!wsKey.empty() && originOk) {
-                bantuHandleWebSocket(sock, wsKey);
+                bantuWsUpgrade(sock, wsKey);
                 return;
             }
         }
@@ -2709,7 +2717,7 @@ private:
         if (!found && method == "GET") {
             // Try static files first — if served, we're done.
             if (bantuServeStaticFile(sock, path)) {
-                CLOSE_SOCKET(sock);
+                bantuConnClose(sock);
                 return;
             }
         }
@@ -2752,10 +2760,6 @@ private:
         // Call the handler (if any)
         if (found && (matchedHandler.isFunction() || matchedHandler.isNativeFn())) {
             try {
-                // Serialised — see the note on bantuInterpreterMutex. Only the
-                // handler runs under the lock; the socket read above and the
-                // response write below stay parallel.
-                std::lock_guard<std::recursive_mutex> gil(bantuInterpreterMutex);
                 bantuCallFunction(matchedHandler, {reqVal, resVal});
             } catch (const std::exception& e) {
                 std::cerr << "  [SERVER] Handler exception: " << e.what() << "\n";
@@ -2790,9 +2794,8 @@ private:
         }
         resp << "Server: Bantu-Sua/1.2\r\n";
         resp << "\r\n" << state->body;
-        std::string respStr = resp.str();
-        send(sock, respStr.c_str(), respStr.size(), 0);
-        CLOSE_SOCKET(sock);
+        bantuConnWrite(sock, resp.str());
+        bantuConnClose(sock);
     }
 
     // Helper: HTTP status text
@@ -2849,41 +2852,174 @@ private:
             CLOSE_SOCKET(sock);
             return;
         }
-        std::cout << "  [SERVER] Listening on 0.0.0.0:" << port << " (real HTTP server)\n";
+        if (!bantu_loop::setNonBlocking(sock)) {
+            std::cerr << "  [SERVER] FATAL: could not set the listener non-blocking\n";
+            CLOSE_SOCKET(sock);
+            return;
+        }
+
+        auto backend = bantu_loop::makeBackend();
+        bantuLoopBackend = backend.get();
+        backend->add(sock, true, false);
+
+        std::cout << "  [SERVER] Listening on 0.0.0.0:" << port
+                  << " (event loop: " << backend->name() << ")\n";
         std::cout.flush();
 
-        // Accept loop — runs forever
-        while (true) {
-            struct sockaddr_in clientAddr;
-            socklen_t clientLen = sizeof(clientAddr);
-            int clientSock = (int)accept(sock, (struct sockaddr*)&clientAddr, &clientLen);
-            if (clientSock < 0) {
-                if (errno == EINTR) continue;
-                std::cerr << "  [SERVER] accept() failed: " << strerror(errno) << "\n";
-                continue;
-            }
-            // Cap concurrent connections. Every connection costs a thread
-            // (~8MB of stack) until the event loop lands, so an unbounded accept
-            // loop is a one-line denial of service: open sockets until the box
-            // runs out of memory. Shed load with 503 instead of dying.
-            if (bantuLiveConnections.load() >= bantuLimits.maxConnections) {
-                static const char* busy =
-                    "HTTP/1.1 503 Service Unavailable\r\n"
-                    "Content-Length: 0\r\nConnection: close\r\n"
-                    "Retry-After: 1\r\n\r\n";
-                send(clientSock, busy, (int)strlen(busy), 0);
-                CLOSE_SOCKET(clientSock);
-                continue;
-            }
-            bantuLiveConnections++;
+        // ─── The event loop ────────────────────────────────────────────
+        // One thread, every connection. A connection costs its buffers rather
+        // than an 8MB thread stack, and because all Bantu code runs here there
+        // is no shared interpreter state to race on -- the Phase 1 locks were
+        // deleted along with the threads.
+        std::vector<bantu_loop::Event> events;
+        std::vector<int> doomed;
+        const int tickMs = 1000;
 
-            // Handle each connection in its own thread so WebSocket
-            // clients don't block new connections.
-            std::thread([this, clientSock]() {
-                BantuConnectionSlot slot(true);   // releases the slot on any exit
-                bantuHandleHttpRequest(clientSock);
-            }).detach();
+        auto dropConn = [&](int fd) {
+            auto it = bantuConns.find(fd);
+            if (it == bantuConns.end()) return;
+            if (it->second.isWs) bantuWsTeardown(it->second.wsId);
+            backend->del(fd);
+            bantuConns.erase(it);
+            CLOSE_SOCKET(fd);
+            bantuLiveConnections--;
+        };
+
+        while (true) {
+            int n = backend->wait(events, tickMs);
+            if (n < 0) {
+                std::cerr << "  [SERVER] event wait failed: " << strerror(errno) << "\n";
+                break;
+            }
+            uint64_t now = bantu_loop::nowMs();
+
+            for (const auto& ev : events) {
+                // ── the listener ──
+                if (ev.fd == sock) {
+                    // Drain the accept queue; one wakeup can cover many pending
+                    // connections and leaving them queued adds latency.
+                    for (;;) {
+                        struct sockaddr_in ca;
+                        socklen_t cl = sizeof(ca);
+                        int cfd = (int)accept(sock, (struct sockaddr*)&ca, &cl);
+                        if (cfd < 0) break;
+
+                        if (bantuLiveConnections.load() >= bantuLimits.maxConnections) {
+                            static const char* busy =
+                                "HTTP/1.1 503 Service Unavailable\r\n"
+                                "Content-Length: 0\r\nConnection: close\r\n"
+                                "Retry-After: 1\r\n\r\n";
+                            send(cfd, busy, (int)strlen(busy), 0);
+                            CLOSE_SOCKET(cfd);
+                            continue;
+                        }
+                        bantu_loop::setNonBlocking(cfd);
+                        BantuConn c;
+                        c.fd = cfd;
+                        c.lastActive = now;
+                        bantuConns[cfd] = std::move(c);
+                        backend->add(cfd, true, false);
+                        bantuLiveConnections++;
+                    }
+                    continue;
+                }
+
+                auto it = bantuConns.find(ev.fd);
+                if (it == bantuConns.end()) { backend->del(ev.fd); continue; }
+                BantuConn& c = it->second;
+                c.lastActive = now;
+
+                // ── readable ──
+                if (ev.readable) {
+                    char buf[16384];
+                    bool peerClosed = false;
+                    for (;;) {
+                        ssize_t r = recv(c.fd, buf, sizeof(buf), 0);
+                        if (r > 0) { c.in.append(buf, (size_t)r); continue; }
+                        if (r == 0) { peerClosed = true; break; }
+                        if (bantu_loop::wouldBlock()) break;
+                        peerClosed = true; break;
+                    }
+
+                    if (c.isWs) {
+                        if (!bantuWsProcess(c)) c.closing = true;
+                    } else {
+                        // An HTTP request is dispatched only once the whole
+                        // header block (and any declared body) has arrived --
+                        // the fix for header blocks split across segments.
+                        size_t he = c.in.find("\r\n\r\n");
+                        // The size cap applies whether or not the terminator has
+                        // arrived. Checking only while still searching would let
+                        // an oversized-but-complete header block straight
+                        // through, which is exactly how this regressed.
+                        if (he != std::string::npos && he > bantuLimits.maxHeaderBytes)
+                            he = std::string::npos;
+                        if (he == std::string::npos) {
+                            if (c.in.size() > bantuLimits.maxHeaderBytes) {
+                                bantuConnWrite(c.fd, std::string(
+                                    "HTTP/1.1 431 Request Header Fields Too Large\r\n"
+                                    "Content-Length: 0\r\nConnection: close\r\n\r\n"));
+                                c.closing = true;
+                            }
+                        } else {
+                            size_t need = he + 4 + bantuContentLengthOf(c.in, he);
+                            if (need > bantuLimits.maxBodyBytes + he + 4) {
+                                bantuConnWrite(c.fd, std::string(
+                                    "HTTP/1.1 413 Payload Too Large\r\n"
+                                    "Content-Length: 0\r\nConnection: close\r\n\r\n"));
+                                c.closing = true;
+                            } else if (c.in.size() >= need) {
+                                std::string request = c.in.substr(0, need);
+                                c.in.erase(0, need);
+                                bantuDispatchRequest(c.fd, request);
+                                // bantuConns may have rehashed while the handler
+                                // ran (a handler can open connections), so the
+                                // reference above is no longer safe to use.
+                                auto again = bantuConns.find(ev.fd);
+                                if (again == bantuConns.end()) continue;
+                                again->second.lastActive = now;
+                            }
+                        }
+                    }
+                    if (peerClosed) {
+                        auto again = bantuConns.find(ev.fd);
+                        if (again != bantuConns.end()) again->second.closing = true;
+                    }
+                }
+
+                // ── writable ──
+                auto cur = bantuConns.find(ev.fd);
+                if (cur == bantuConns.end()) continue;
+                BantuConn& cc = cur->second;
+                if (ev.writable || cc.outPos < cc.out.size()) {
+                    while (cc.outPos < cc.out.size()) {
+                        ssize_t w = send(cc.fd, cc.out.data() + cc.outPos,
+                                         (int)(cc.out.size() - cc.outPos), 0);
+                        if (w > 0) { cc.outPos += (size_t)w; continue; }
+                        if (bantu_loop::wouldBlock()) break;
+                        cc.closing = true; break;
+                    }
+                    if (cc.outPos >= cc.out.size()) { cc.out.clear(); cc.outPos = 0; }
+                    bantuConnSyncInterest(cc);
+                }
+
+                if (ev.error && cc.outPos >= cc.out.size()) cc.closing = true;
+                if (cc.closing && cc.outPos >= cc.out.size()) doomed.push_back(cc.fd);
+            }
+
+            // ── timers: reap idle connections ──
+            for (auto& kv : bantuConns) {
+                BantuConn& c = kv.second;
+                if (c.closing && c.outPos >= c.out.size()) { doomed.push_back(c.fd); continue; }
+                uint64_t limit = c.isWs ? (uint64_t)bantuLimits.idleTimeoutMs
+                                        : (uint64_t)bantuLimits.headerTimeoutMs;
+                if (now - c.lastActive > limit) doomed.push_back(c.fd);
+            }
+            for (int fd : doomed) dropConn(fd);
+            doomed.clear();
         }
+
+        bantuLoopBackend = nullptr;
     }
 
     // ════════════════════════════════════════════════════════════
