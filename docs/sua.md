@@ -416,6 +416,78 @@ The path and query are omitted on purpose: they routinely carry API tokens, and 
 path *is* the subscription identifier. Set `BANTU_HTTP_DEBUG=1` for the full URL while debugging, or
 run under `bantu -q` to silence the trace entirely.
 
+### Many requests at once
+
+`sua.http.all(list, max_parallel?)` runs every request together and returns the responses **in
+request order**, whatever order they finish in. Each element takes exactly the same options as
+`sua.http.request`.
+
+```bantu
+$rs = sua.http.all([
+    {"url": "https://a.example/one"},
+    {"method": "POST", "url": "https://b.example/two", "body": {"n": 1}},
+    {"url": "https://c.example/three", "timeout": 3}
+]);
+each ($r in $rs) { print($r.status); }
+```
+
+Six 500 ms requests take ~506 ms rather than ~3 s. A malformed element still occupies its slot, so
+results always line up with inputs one for one.
+
+This does **not** make your handler non-blocking — the call still waits, just once instead of N
+times.
+
+`sua.push.send_all()` uses the same machinery internally, so push fan-out to many subscribers is
+already one wait rather than one round trip per subscriber. You do not have to do anything to get
+that.
+
+---
+
+## Concurrency and workers
+
+The server runs an **event loop**: one thread holds every connection, so an idle client costs its
+buffers rather than an 8 MB thread stack. Handlers stay synchronous — no callbacks, no async.
+
+```bantu
+sua.server.workers(0);   // one process per core
+sua.server.workers(4);   // exactly four
+sua.server.listen(3000);
+```
+
+Call it **before** `listen()`. The fork happens inside `listen`, once your routes are registered.
+
+### Globals are per-worker
+
+This is the one thing to understand before turning workers on:
+
+```bantu
+$hits = 0;
+sua.server.get("/hit", def($req, $res) { $hits = $hits + 1; $res.send(str($hits)); });
+sua.server.workers(4);
+```
+
+With 4 workers each process has **its own `$hits`**, so each counts roughly a quarter and they never
+meet. That is deliberate — no shared mutable state is what makes multi-worker safe — but it means
+shared state belongs in a database, not a global. `workers(1)` (the default) is unchanged.
+
+`sua.ws.broadcast` **does** cross workers: a broadcast reaches every client on every worker, not just
+the ones that happen to share your process. `sua.ws.send(id, …)` likewise finds a client on another
+worker. `sua.ws.clients()` lists only **this worker's** clients.
+
+Multi-worker mode is POSIX-only; on Windows it logs a notice and runs single-worker.
+
+### Limits and stats
+
+```bantu
+sua.server.limits({"max_connections": 50000, "idle_timeout_ms": 120000});
+$s = sua.server.stats();   // workers, worker, live_connections, ws_clients,
+                           // bus, bus_sent, bus_received, bus_dropped
+```
+
+`bus_dropped` above zero means broadcasts were shed to protect memory — the bus is saturated.
+
+---
+
 ## Databases
 
 ```bantu
@@ -437,20 +509,24 @@ sua.sqlite.close()
 
 These are real constraints of the current implementation, not oversights to work around silently.
 
-- **The server is single-threaded.** Requests are handled one at a time on the accept loop. A slow
-  handler blocks every other client, and a handler that makes an HTTP request *to its own server*
-  deadlocks. `sua.push.send_all()` blocks for the duration of the fan-out; for large subscriber
-  lists, send from a separate process.
+- **A blocking handler stalls its worker.** Each worker is one event loop on one thread, so a slow
+  handler delays the other clients *on that worker*, and a handler that makes an HTTP request to its
+  own worker deadlocks. `sua.server.workers(n)` reduces the blast radius to 1/n; `sua.http.all`
+  collapses a fan-out into a single wait. Making handlers genuinely non-blocking needs coroutines —
+  see [sua-architecture.md](sua-architecture.md) §12.4 for why, and for the two shortcuts that look
+  like they would work but reintroduce interpreter races.
 - **`sua.server.use()` registers middleware that never runs.** The dispatch loop contains no
   middleware step. Put shared logic in a function your handlers call.
 - **`sua.response.*` does not work.** It writes to globals the server never reads, and
   `sua.response.set`/`cookie` only print. Use the `$res` argument your handler receives.
 - **No cookie or session helper.** Set them by hand with `$res.set("Set-Cookie", …)`, one per
   response.
-- **Request headers are capped at 16 KB** (a single `recv`); a larger header block is truncated.
+- **Request headers are capped at 64 KB** (configurable via `sua.server.limits`). A larger header
+  block gets `431 Request Header Fields Too Large` — it is no longer silently truncated.
 - **No chunked transfer-encoding** on requests — only `Content-Length` is honoured.
 - **Unrecognised status codes render as `OK`** in the status line, though the numeric code is
   correct.
-- **No WebSocket or SSE.** `server.hpp` contains a WebSocket implementation that is never
-  instantiated and whose handshake is not spec-compliant.
+- **No SSE.** WebSockets *are* supported (`sua.ws.*`, RFC 6455: masking enforced, continuation
+  frames reassembled, UTF-8 validated, `Origin` checked on upgrade). The dead implementation in
+  `server.hpp` is unrelated and still unused.
 - Push notifications are **UTC only** and assume a single record per message.

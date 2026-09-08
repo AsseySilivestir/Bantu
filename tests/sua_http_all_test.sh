@@ -62,6 +62,7 @@ if ! curl -s -o /dev/null "http://127.0.0.1:$PORT/x" 2>/dev/null; then
     echo "  FAIL  backend did not start"; cat "$TMP/backend.log"; exit 1
 fi
 
+PUSHDB="$TMP/push.db"
 cat > "$TMP/t.b" <<BEOF
 \$P = "http://127.0.0.1:$PORT";
 // Counters live in an OBJECT: a bare global assigned from inside def() writes
@@ -127,6 +128,37 @@ print("-- binary-safe bodies --");
 ]);
 ok(contains(\$rs4[0].body, "\\"len\\": 8") || contains(\$rs4[0].body, "\\"len\\":8"),
    "8-byte body with leading NUL arrived whole");
+
+print("");
+print("-- push fan-out is parallel --");
+// sua.push.send_all() runs on the same machinery. Six subscriptions pointed at
+// a black-holed address: each connect burns the full 5s connect timeout, so
+// sequential would be ~30s and parallel ~5s. This is the workload the whole
+// feature exists for -- N independent HTTPS POSTs to N push services.
+\$vk = sua.push.vapid_keys();
+sua.push.configure({
+    "public_key": \$vk.public_key,
+    "private_key": \$vk.private_key,
+    "subject": "mailto:test@example.com",
+    "db": "$PUSHDB"
+});
+\$i = 0;
+while (\$i < 6) {
+    \$kp = webpush_keygen();
+    sua.push.save({
+        "endpoint": "https://10.255.255.1/push/" + str(\$i),
+        "keys": {"p256dh": \$kp.public_key, "auth": b64url_encode(randbytes(16))}
+    });
+    \$i = \$i + 1;
+}
+ok(sua.push.count() == 6, "six subscriptions stored");
+\$pt0 = clock();
+\$pr = sua.push.send_all({"head": "hi", "body": "there"});
+\$pel = clock() - \$pt0;
+print("        6 unreachable endpoints took " + str(\$pel) + "ms (sequential would be ~30000ms)");
+ok(len(\$pr.results) == 6, "a result per subscription");
+ok(\$pr.failed == 6, "all six failed to connect, as intended");
+ok(\$pel < 15000, "fan-out was parallel, not sequential");
 
 print("");
 print("-- empty and single --");

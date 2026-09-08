@@ -1954,13 +1954,24 @@ static Value bantuPushList(const std::string& tag) {
 
 // ── sending ─────────────────────────────────────────────────────────────────
 
-static Value bantuPushSendOne(const Value& sub, const Value& payload, const Value& opts) {
+// Build the encrypted, VAPID-signed POST for one subscription -- everything up
+// to but not including the network. Split out of bantuPushSendOne so that
+// send_all can prepare N of these and hand them to bantuHttpAll in ONE wait
+// instead of N sequential round trips. Push fan-out is the workload this
+// matters for most.
+//
+// Returns true with `spec` filled; false with `errOut` holding the result
+// object the caller should report for this subscription.
+static bool bantuPushPrepare(const Value& sub, const Value& payload, const Value& opts,
+                             BantuHttpSpec& spec, std::string& endpointOut,
+                             size_t& encryptedSize, Value& errOut) {
     ObjectMap out;
     auto fail = [&](const std::string& msg, int status = 0) {
         out["ok"] = Value(false);
         out["status"] = Value((double)status);
         out["error"] = Value(msg);
-        return Value(std::move(out));
+        errOut = Value(std::move(out));
+        return false;
     };
 
     if (!bantu_webpush::selftest().ok)
@@ -2032,9 +2043,19 @@ static Value bantuPushSendOne(const Value& sub, const Value& payload, const Valu
     if (!urgency.empty()) hopt.headers.emplace_back("Urgency", urgency);
     if (!topic.empty())   hopt.headers.emplace_back("Topic", topic);
 
-    std::string raw((const char*)encrypted.data(), encrypted.size());
-    Value resp = bantuHttpRequestEx("POST", endpoint, raw, "application/octet-stream", hopt);
+    spec.method      = "POST";
+    spec.url         = endpoint;
+    spec.body.assign((const char*)encrypted.data(), encrypted.size());
+    spec.contentType = "application/octet-stream";
+    spec.opt         = hopt;
+    endpointOut      = endpoint;
+    encryptedSize    = encrypted.size();
+    return true;
+}
 
+// Turn the push service's HTTP response into the per-subscription result.
+static Value bantuPushResult(const Value& resp, const std::string& endpoint, size_t encryptedSize) {
+    ObjectMap out;
     int status = 0;
     std::string respBody, err;
     if (resp.isObject()) {
@@ -2046,7 +2067,7 @@ static Value bantuPushSendOne(const Value& sub, const Value& payload, const Valu
     out["ok"] = Value(status >= 200 && status < 300);
     out["status"] = Value((double)status);
     out["endpoint"] = Value(endpoint);
-    out["bytes"] = Value((double)encrypted.size());
+    out["bytes"] = Value((double)encryptedSize);
     if (!respBody.empty()) out["body"] = Value(respBody);
     if (!err.empty()) out["error"] = Value(err);
     // 404/410 mean the subscription is permanently gone; send_all prunes on this.
@@ -2057,6 +2078,18 @@ static Value bantuPushSendOne(const Value& sub, const Value& payload, const Valu
                                          "(check `subject` and that the public key matches "
                                          "the one the browser subscribed with)"));
     return Value(std::move(out));
+}
+
+// One subscription, one round trip. Unchanged in behaviour -- it is now
+// prepare + send + interpret, with the first and last shared with send_all.
+static Value bantuPushSendOne(const Value& sub, const Value& payload, const Value& opts) {
+    BantuHttpSpec spec;
+    std::string endpoint;
+    size_t encSize = 0;
+    Value err;
+    if (!bantuPushPrepare(sub, payload, opts, spec, endpoint, encSize, err)) return err;
+    Value resp = bantuHttpRequestEx(spec.method, spec.url, spec.body, spec.contentType, spec.opt);
+    return bantuPushResult(resp, endpoint, encSize);
 }
 
 // POST <subscribe_url> — store what /pwa.js sends after PushManager.subscribe().
@@ -6509,8 +6542,39 @@ private:
             int sent = 0, failed = 0, pruned = 0;
             std::vector<Value> results;
             if (subs.isList()) {
-                for (auto& s : subs.listVal) {
-                    Value r = bantuPushSendOne(s, a[0], opts);
+                // Encrypt and sign every subscription first, then put them ALL
+                // on the wire together. Sequentially this was N HTTPS round
+                // trips to N different push services -- the single likeliest
+                // way to stall a worker. Preparation is local CPU work; only
+                // the network part is worth parallelising.
+                size_t n = subs.listVal.size();
+                results.assign(n, Value());
+                std::vector<BantuHttpSpec> specs;
+                std::vector<size_t>        slot;       // specs[k] -> subscription index
+                std::vector<std::string>   endpoints;
+                std::vector<size_t>        sizes;
+                specs.reserve(n);
+                for (size_t i = 0; i < n; i++) {
+                    BantuHttpSpec spec;
+                    std::string ep;
+                    size_t encSize = 0;
+                    Value err;
+                    if (!bantuPushPrepare(subs.listVal[i], a[0], opts, spec, ep, encSize, err)) {
+                        results[i] = err;                 // never reached the network
+                        continue;
+                    }
+                    specs.push_back(std::move(spec));
+                    slot.push_back(i);
+                    endpoints.push_back(ep);
+                    sizes.push_back(encSize);
+                }
+
+                std::vector<Value> resp = bantuHttpAll(specs, 32);
+                for (size_t k = 0; k < slot.size() && k < resp.size(); k++)
+                    results[slot[k]] = bantuPushResult(resp[k], endpoints[k], sizes[k]);
+
+                for (size_t i = 0; i < n; i++) {
+                    const Value& r = results[i];
                     bool ok = false;
                     int status = 0;
                     if (r.isObject()) {
@@ -6524,14 +6588,14 @@ private:
                         failed++;
                         if (status == 404 || status == 410) {   // subscription is dead
                             std::string ep;
-                            if (s.isObject()) {
-                                auto e = s.objectVal->find("endpoint");
-                                if (e != s.objectVal->end()) ep = e->second.toString();
+                            const Value& sv = subs.listVal[i];
+                            if (sv.isObject()) {
+                                auto e = sv.objectVal->find("endpoint");
+                                if (e != sv.objectVal->end()) ep = e->second.toString();
                             }
                             if (!ep.empty() && bantuPushForget(ep)) pruned++;
                         }
                     }
-                    results.push_back(r);
                 }
             }
             ObjectMap out;
