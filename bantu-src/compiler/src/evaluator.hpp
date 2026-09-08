@@ -27,6 +27,7 @@
 #include <thread>
 #include <mutex>
 #include <atomic>
+#include <type_traits>
 #include <functional>
 #include <random>
 #include <algorithm>
@@ -183,6 +184,34 @@ struct BantuServerRoute {
 // LOCK ORDER: this lock, THEN bantuWsTableMutex. Never the reverse, and never
 // hold the table lock across a bantuWsCallback call.
 static std::recursive_mutex bantuInterpreterMutex;
+
+// ─── Server resource limits ───────────────────────────────────────────────
+// Every one of these existed as "unbounded" before, which is the difference
+// between a server and a denial-of-service target. See
+// docs/sua-architecture.md §9. Configure with sua.server.limits({...});
+// the defaults are the safe ones.
+struct BantuServerLimits {
+    size_t maxHeaderBytes   = 64 * 1024;        // request header block
+    size_t maxBodyBytes     = 8 * 1024 * 1024;  // request body
+    int    maxConnections   = 10000;            // concurrent, process-wide
+    int    headerTimeoutMs  = 10000;            // slowloris defence
+    int    idleTimeoutMs    = 300000;           // reap dead peers
+    size_t maxWsFrameBytes  = 1024 * 1024;      // single WebSocket frame
+    size_t maxWsMessageBytes= 8 * 1024 * 1024;  // reassembled, across continuations
+    bool   wsCheckOrigin    = true;             // reject cross-site WS upgrades
+    std::vector<std::string> wsAllowedOrigins;  // empty + check on = same-origin only
+};
+static BantuServerLimits bantuLimits;
+
+// Live connection count, for the cap. Incremented on accept, decremented when
+// the connection thread finishes (RAII below, so an early return or a thrown
+// handler cannot leak a slot).
+static std::atomic<int> bantuLiveConnections{0};
+struct BantuConnectionSlot {
+    bool held = false;
+    explicit BantuConnectionSlot(bool h) : held(h) {}
+    ~BantuConnectionSlot() { if (held) bantuLiveConnections--; }
+};
 
 static std::vector<BantuServerRoute> bantuServerRoutes;
 static int bantuServerPort = 3000;
@@ -650,6 +679,62 @@ static void bantuWsSendBinary(int fd, const std::vector<uint8_t>& data) {
     send(fd, (const char*)frame.data(), (int)frame.size(), 0);
 }
 
+// ─── WebSocket framing helpers (RFC 6455) ──────────────────────────
+// Read exactly n octets, or fail. The previous frame reader took whatever a
+// single recv() returned and silently truncated anything larger -- so any
+// message bigger than one TCP segment arrived corrupted. Voice frames hit that
+// constantly.
+static bool bantuRecvExact(int sock, uint8_t* buf, size_t n) {
+    size_t got = 0;
+    while (got < n) {
+        ssize_t r = recv(sock, (char*)buf + got, (int)(n - got), 0);
+        if (r <= 0) return false;
+        got += (size_t)r;
+    }
+    return true;
+}
+
+// Close with a status code (RFC 6455 §5.5.1), then the caller closes the fd.
+static void bantuWsClose(int sock, uint16_t code, const std::string& reason = "") {
+    std::string payload;
+    payload.push_back((char)(code >> 8));
+    payload.push_back((char)(code & 0xFF));
+    payload += reason.substr(0, 123);
+    std::vector<uint8_t> frame;
+    frame.push_back(0x88);                       // FIN + close
+    frame.push_back((uint8_t)payload.size());    // control frames are always < 126
+    frame.insert(frame.end(), payload.begin(), payload.end());
+    send(sock, (const char*)frame.data(), (int)frame.size(), 0);
+}
+
+// RFC 6455 §8.1 requires text frames to be valid UTF-8. Rejecting invalid
+// sequences also stops overlong encodings and surrogates reaching Bantu strings.
+static bool bantuValidUtf8(const std::string& s) {
+    size_t i = 0, n = s.size();
+    while (i < n) {
+        unsigned char c = (unsigned char)s[i];
+        size_t len; unsigned int cp;
+        if (c < 0x80)                  { i++; continue; }
+        else if ((c & 0xE0) == 0xC0)   { len = 2; cp = c & 0x1F; }
+        else if ((c & 0xF0) == 0xE0)   { len = 3; cp = c & 0x0F; }
+        else if ((c & 0xF8) == 0xF0)   { len = 4; cp = c & 0x07; }
+        else return false;
+        if (i + len > n) return false;
+        for (size_t k = 1; k < len; k++) {
+            unsigned char cc = (unsigned char)s[i + k];
+            if ((cc & 0xC0) != 0x80) return false;
+            cp = (cp << 6) | (cc & 0x3F);
+        }
+        if (len == 2 && cp < 0x80) return false;            // overlong
+        if (len == 3 && cp < 0x800) return false;           // overlong
+        if (len == 4 && cp < 0x10000) return false;         // overlong
+        if (cp > 0x10FFFF) return false;                    // out of range
+        if (cp >= 0xD800 && cp <= 0xDFFF) return false;     // surrogate half
+        i += len;
+    }
+    return true;
+}
+
 // ─── Handle a WebSocket connection (after upgrade) ─────────────────
 // Runs in the same thread that accepted the HTTP connection — blocks
 // until the WS client disconnects.
@@ -690,43 +775,87 @@ static void bantuHandleWebSocket(int sock, const std::string& wsKey) {
         }
     }
 
-    // WebSocket message loop
-    uint8_t buffer[65536];
+    // WebSocket message loop.
+    //
+    // Rewritten to read WHOLE frames. The previous version parsed whatever one
+    // recv() returned, so any frame spanning more than one TCP segment was
+    // silently truncated, and it never validated masking or bounded the payload
+    // length it read from the wire.
     bool running = true;
+    std::string fragment;        // reassembled continuation frames
+    uint8_t fragOpcode = 0;      // opcode of the message being reassembled
     while (running) {
-        ssize_t n = recv(sock, (char*)buffer, sizeof(buffer), 0);
-        if (n <= 0) break;
+        uint8_t hdr[2];
+        if (!bantuRecvExact(sock, hdr, 2)) break;
 
-        if (n < 2) continue;
-        uint8_t opcode = buffer[0] & 0x0F;
-        bool masked = (buffer[1] & 0x80) != 0;
-        uint64_t payloadLen = buffer[1] & 0x7F;
-        size_t offset = 2;
+        bool fin        = (hdr[0] & 0x80) != 0;
+        uint8_t rsv     = hdr[0] & 0x70;
+        uint8_t opcode  = hdr[0] & 0x0F;
+        bool masked     = (hdr[1] & 0x80) != 0;
+        uint64_t payloadLen = hdr[1] & 0x7F;
+
+        // RFC 6455 §5.2: reserved bits must be zero unless an extension
+        // negotiated them, and we negotiate none.
+        if (rsv) { bantuWsClose(sock, 1002, "RSV bit set"); break; }
 
         if (payloadLen == 126) {
-            if (n < 4) continue;
-            payloadLen = (buffer[2] << 8) | buffer[3];
-            offset = 4;
+            uint8_t ext[2];
+            if (!bantuRecvExact(sock, ext, 2)) break;
+            payloadLen = ((uint64_t)ext[0] << 8) | ext[1];
         } else if (payloadLen == 127) {
-            if (n < 10) continue;
+            uint8_t ext[8];
+            if (!bantuRecvExact(sock, ext, 8)) break;
             payloadLen = 0;
-            for (int i = 0; i < 8; i++) {
-                payloadLen = (payloadLen << 8) | buffer[offset + i];
-            }
-            offset = 10;
+            for (int i = 0; i < 8; i++) payloadLen = (payloadLen << 8) | ext[i];
         }
 
-        uint8_t mask[4] = {0};
-        if (masked && offset + 4 <= (size_t)n) {
-            memcpy(mask, buffer + offset, 4);
-            offset += 4;
+        bool isControl = (opcode & 0x08) != 0;
+        // §5.5: control frames carry at most 125 octets and are never fragmented.
+        if (isControl && (payloadLen > 125 || !fin)) {
+            bantuWsClose(sock, 1002, "bad control frame"); break;
         }
+        // §5.1: a client MUST mask. Accepting unmasked frames enables
+        // cache-poisoning attacks through intermediaries.
+        if (!masked) { bantuWsClose(sock, 1002, "unmasked client frame"); break; }
+        // Bound what we are willing to allocate from an attacker-supplied length.
+        if (payloadLen > bantuLimits.maxWsFrameBytes) {
+            bantuWsClose(sock, 1009, "frame too large"); break;
+        }
+
+        uint8_t mask[4];
+        if (!bantuRecvExact(sock, mask, 4)) break;
 
         std::string payload;
-        for (uint64_t i = 0; i < payloadLen && offset + i < (size_t)n; i++) {
-            char c = buffer[offset + i];
-            if (masked) c ^= mask[i % 4];
-            payload += c;
+        if (payloadLen) {
+            payload.resize((size_t)payloadLen);
+            if (!bantuRecvExact(sock, (uint8_t*)&payload[0], (size_t)payloadLen)) break;
+            for (size_t i = 0; i < payload.size(); i++) payload[i] ^= (char)mask[i % 4];
+        }
+
+        // Reassemble fragments (opcode 0x0 continues the previous message).
+        if (!isControl) {
+            if (opcode == 0x0) {
+                if (fragOpcode == 0) { bantuWsClose(sock, 1002, "unexpected continuation"); break; }
+                if (fragment.size() + payload.size() > bantuLimits.maxWsMessageBytes) {
+                    bantuWsClose(sock, 1009, "message too large"); break;
+                }
+                fragment += payload;
+            } else {
+                if (fragOpcode != 0) { bantuWsClose(sock, 1002, "interleaved message"); break; }
+                if (!fin) { fragOpcode = opcode; fragment = payload; }
+            }
+            if (!fin) continue;                  // wait for the rest
+            if (fragOpcode != 0) {               // final fragment of a split message
+                payload = fragment;
+                opcode  = fragOpcode;
+                fragment.clear();
+                fragOpcode = 0;
+            }
+        }
+
+        // §8.1: text frames must be valid UTF-8.
+        if (opcode == 0x1 && !bantuValidUtf8(payload)) {
+            bantuWsClose(sock, 1007, "invalid UTF-8"); break;
         }
 
         if (opcode == 0x8) {  // Close
@@ -2364,11 +2493,45 @@ private:
 
     // Handle a single HTTP request — parse, route, call Bantu handler, respond.
     void bantuHandleHttpRequest(int sock) {
-        char buf[16384];
-        ssize_t n = recv(sock, buf, sizeof(buf) - 1, 0);
-        if (n <= 0) { CLOSE_SOCKET(sock); return; }
-        buf[n] = '\0';
-        std::string request(buf, n);
+        // Read until the header block is complete.
+        //
+        // This used to be a single 16 KB recv(): a header block split across TCP
+        // segments was parsed half-formed, and one larger than 16 KB was silently
+        // truncated -- which with a Content-Length still in the tail is the shape
+        // of a request-smuggling bug, not just a size limit.
+        //
+        // A receive timeout bounds how long a client may dribble bytes, which is
+        // the Slowloris defence: without it a handful of sockets sending one
+        // octet a minute would each pin a thread indefinitely.
+#ifdef _WIN32
+        DWORD rcvTimeout = (DWORD)bantuLimits.headerTimeoutMs;
+        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&rcvTimeout, sizeof(rcvTimeout));
+#else
+        struct timeval rcvTimeout;
+        rcvTimeout.tv_sec  = bantuLimits.headerTimeoutMs / 1000;
+        rcvTimeout.tv_usec = (bantuLimits.headerTimeoutMs % 1000) * 1000;
+        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &rcvTimeout, sizeof(rcvTimeout));
+#endif
+        std::string request;
+        char buf[8192];
+        size_t headerEndPos = std::string::npos;
+        while (true) {
+            ssize_t n = recv(sock, buf, sizeof(buf), 0);
+            if (n <= 0) { CLOSE_SOCKET(sock); return; }
+            request.append(buf, (size_t)n);
+            headerEndPos = request.find("\r\n\r\n");
+            if (headerEndPos != std::string::npos) break;
+            if (request.size() > bantuLimits.maxHeaderBytes) {
+                static const char* tooBig =
+                    "HTTP/1.1 431 Request Header Fields Too Large\r\n"
+                    "Content-Length: 0\r\nConnection: close\r\n\r\n";
+                send(sock, tooBig, (int)strlen(tooBig), 0);
+                CLOSE_SOCKET(sock);
+                return;
+            }
+        }
+        ssize_t n = (ssize_t)request.size();
+        (void)n;
 
         // Parse request line: METHOD PATH HTTP/1.1
         size_t firstSp = request.find(' ');
@@ -2446,7 +2609,46 @@ private:
             headers["upgrade"].toString().find("websocket") != std::string::npos) {
             std::string wsKey = headers.count("sec-websocket-key")
                 ? headers["sec-websocket-key"].toString() : "";
-            if (!wsKey.empty()) {
+
+            // Cross-Site WebSocket Hijacking defence.
+            //
+            // The same-origin policy does NOT apply to WebSocket upgrades, and
+            // the browser sends the user's cookies with them. Without this check
+            // any website could open an authenticated socket to a Bantu server
+            // on a visitor's behalf and read everything it publishes. The Origin
+            // header is the only signal available at upgrade time, so it has to
+            // be checked before we switch protocols.
+            //
+            // A missing Origin means a non-browser client (curl, a native app),
+            // which cannot be driven by a hostile page -- allowed. A present
+            // Origin must match the request's own Host, or be listed explicitly.
+            bool originOk = true;
+            if (bantuLimits.wsCheckOrigin && headers.count("origin")) {
+                std::string origin = headers["origin"].toString();
+                std::string host = headers.count("host") ? headers["host"].toString() : "";
+                originOk = false;
+                if (!host.empty()) {
+                    // Compare host:port against the origin's authority.
+                    size_t sep = origin.find("://");
+                    std::string oauth = (sep == std::string::npos) ? origin : origin.substr(sep + 3);
+                    if (oauth == host) originOk = true;
+                }
+                for (const auto& allowed : bantuLimits.wsAllowedOrigins) {
+                    if (allowed == "*" || allowed == origin) { originOk = true; break; }
+                }
+                if (!originOk) {
+                    std::cerr << "  [WS] rejected upgrade from origin: " << origin << "\n";
+                    std::string deny =
+                        "HTTP/1.1 403 Forbidden\r\n"
+                        "Content-Length: 0\r\n"
+                        "Connection: close\r\n\r\n";
+                    send(sock, deny.c_str(), (int)deny.size(), 0);
+                    CLOSE_SOCKET(sock);
+                    return;
+                }
+            }
+
+            if (!wsKey.empty() && originOk) {
                 bantuHandleWebSocket(sock, wsKey);
                 return;
             }
@@ -2660,9 +2862,25 @@ private:
                 std::cerr << "  [SERVER] accept() failed: " << strerror(errno) << "\n";
                 continue;
             }
+            // Cap concurrent connections. Every connection costs a thread
+            // (~8MB of stack) until the event loop lands, so an unbounded accept
+            // loop is a one-line denial of service: open sockets until the box
+            // runs out of memory. Shed load with 503 instead of dying.
+            if (bantuLiveConnections.load() >= bantuLimits.maxConnections) {
+                static const char* busy =
+                    "HTTP/1.1 503 Service Unavailable\r\n"
+                    "Content-Length: 0\r\nConnection: close\r\n"
+                    "Retry-After: 1\r\n\r\n";
+                send(clientSock, busy, (int)strlen(busy), 0);
+                CLOSE_SOCKET(clientSock);
+                continue;
+            }
+            bantuLiveConnections++;
+
             // Handle each connection in its own thread so WebSocket
             // clients don't block new connections.
             std::thread([this, clientSock]() {
+                BantuConnectionSlot slot(true);   // releases the slot on any exit
                 bantuHandleHttpRequest(clientSock);
             }).detach();
         }
@@ -5131,6 +5349,54 @@ private:
             routeInfo["path"] = Value(path);
             routeInfo["registered"] = Value(true);
             return Value(std::move(routeInfo));
+        });
+
+        // sua.server.limits({...}) — resource and security limits.
+        // Called with no argument it just reports the current settings.
+        serverObj["limits"] = makeNative([](std::vector<Value> args) -> Value {
+            if (!args.empty() && args[0].isObject()) {
+                const ObjectMap& o = *args[0].objectVal;
+                // decay_t matters: decltype(dst) is a REFERENCE type here, and
+                // casting a double to `size_t&` reinterprets its bits instead of
+                // converting it (1024.0 came back as 4652218415073722368).
+                auto num = [&](const char* k, auto& dst) {
+                    auto it = o.find(k);
+                    if (it == o.end()) return;
+                    using T = typename std::decay<decltype(dst)>::type;
+                    double v = it->second.numberVal;
+                    if (v < 0) v = 0;
+                    dst = static_cast<T>(v);
+                };
+                num("max_header_bytes",     bantuLimits.maxHeaderBytes);
+                num("max_body_bytes",       bantuLimits.maxBodyBytes);
+                num("max_connections",      bantuLimits.maxConnections);
+                num("header_timeout_ms",    bantuLimits.headerTimeoutMs);
+                num("idle_timeout_ms",      bantuLimits.idleTimeoutMs);
+                num("max_ws_frame_bytes",   bantuLimits.maxWsFrameBytes);
+                num("max_ws_message_bytes", bantuLimits.maxWsMessageBytes);
+                auto co = o.find("ws_check_origin");
+                if (co != o.end()) bantuLimits.wsCheckOrigin = co->second.isTruthy();
+                auto ao = o.find("ws_allowed_origins");
+                if (ao != o.end() && ao->second.isList()) {
+                    bantuLimits.wsAllowedOrigins.clear();
+                    for (const auto& v : ao->second.listVal)
+                        bantuLimits.wsAllowedOrigins.push_back(v.toString());
+                }
+            }
+            ObjectMap out;
+            out["max_header_bytes"]     = Value((double)bantuLimits.maxHeaderBytes);
+            out["max_body_bytes"]       = Value((double)bantuLimits.maxBodyBytes);
+            out["max_connections"]      = Value((double)bantuLimits.maxConnections);
+            out["header_timeout_ms"]    = Value((double)bantuLimits.headerTimeoutMs);
+            out["idle_timeout_ms"]      = Value((double)bantuLimits.idleTimeoutMs);
+            out["max_ws_frame_bytes"]   = Value((double)bantuLimits.maxWsFrameBytes);
+            out["max_ws_message_bytes"] = Value((double)bantuLimits.maxWsMessageBytes);
+            out["ws_check_origin"]      = Value(bantuLimits.wsCheckOrigin);
+            std::vector<Value> origins;
+            for (const auto& a : bantuLimits.wsAllowedOrigins) origins.push_back(Value(a));
+            out["ws_allowed_origins"]   = Value(std::move(origins));
+            out["live_connections"]     = Value((double)bantuLiveConnections.load());
+            return Value(std::move(out));
         });
 
         suaObj["server"] = Value(std::move(serverObj));

@@ -5,8 +5,8 @@ each decision was made. Read this before changing `event_loop.hpp` or the server
 `evaluator.hpp`. Where a decision rejected an obvious alternative, the reason is recorded — those
 notes are the point of this document.
 
-**Status:** Phase 1 (correctness scaffolding) landed. Phase 2 (the event loop) in progress.
-The staging is in §8.
+**Status:** Phase 1 (correctness scaffolding) and Phase 3 (security hardening) landed.
+Phase 2 (the event loop) next. The staging is in §8.
 
 ---
 
@@ -242,8 +242,8 @@ handler stalls a thread *and* corrupts other requests' scopes.
 |---|---|---|
 | 0 | This document | done |
 | 1 | Correctness scaffolding: recursive-mutex interpreter lock, WS table mutex, atomic counters, race reproducer as a committed test | done |
-| 2 | `event_loop.hpp` + non-blocking rewrite of the three server functions; **Phase 1 locks deleted** | in progress |
-| 3 | Security hardening (§9), each item with a test | |
+| 2 | `event_loop.hpp` + non-blocking rewrite of the three server functions; **Phase 1 locks deleted** | next |
+| 3 | Security hardening (§9), each item with a test | done — `tests/sua_ws_security_test.sh` 13/13 |
 | 4 | `SO_REUSEPORT` workers; curl-multi `sua.http.*`; broadcast bus | |
 | 5 | Upstream PR to `AsseySilivestir/Bantu` with reproducer and fix | |
 
@@ -276,7 +276,38 @@ the connection lifecycle explicitly is also what makes the rest of this enforcea
 | Write backpressure cap | 4 MiB | slow-reader memory growth |
 | UTF-8 validation on text frames | on | RFC 6455 §8.1 |
 
-All are configurable through `sua.server.limits({...})`; the defaults are the safe ones.
+All are configurable through `sua.server.limits({...})`; the defaults are the safe ones:
+
+```bantu
+sua.server.limits({
+    "max_connections":      10000,
+    "max_header_bytes":     65536,
+    "max_ws_frame_bytes":   1048576,
+    "max_ws_message_bytes": 8388608,
+    "header_timeout_ms":    10000,
+    "ws_check_origin":      true,
+    "ws_allowed_origins":   ["https://app.example.com"]   // [] = same-origin only
+});
+```
+
+Called with no argument it reports the current settings plus `live_connections`.
+
+**Landed in Phase 3** (`tests/sua_ws_security_test.sh`, 13/13): the `Origin` allowlist,
+masking enforcement, frame and message caps, control-frame rules, RSV rejection, UTF-8
+validation, the connection cap with 503 load shedding, the header-block cap with 431, and a
+receive timeout as the Slowloris defence.
+
+Two correctness bugs fell out of the same work, both of which had been corrupting data silently:
+
+- **WebSocket frames were parsed from whatever a single `recv()` returned**, so any frame
+  spanning more than one TCP segment was truncated. A 200 KB message now round-trips intact;
+  before, voice frames were being mangled routinely.
+- **Continuation frames were not reassembled at all.** Fragmented messages are now joined,
+  bounded by `max_ws_message_bytes`.
+
+Still outstanding for Phase 2, because they need the loop's connection ownership: per-IP
+connection caps, write backpressure, and the idle timeout (a receive timeout is a blunt
+substitute).
 
 ---
 
