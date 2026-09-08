@@ -165,7 +165,11 @@ half-built before this work started.
 ### 5.1 Within a machine: `SO_REUSEPORT`
 
 N worker processes, one per core, each with **its own event loop and its own interpreter**, all
-listening on the same port. The **kernel** load-balances accepts.
+listening on the same port.
+
+**On Linux** the kernel load-balances accepts across the workers' sockets. **It does not do this
+everywhere**, and the difference is invisible until measured — see §12.1, where four macOS workers
+all listened happily and every test connection went to worker 0.
 
 - Removes the thundering herd — each worker has its own listening socket rather than N workers
   contending on one.
@@ -224,8 +228,8 @@ with no locks anywhere — and the correctness properties that follow from that.
 
 ### 5.3 Cross-worker broadcast
 
-`sua.ws.broadcast` reaches only the clients on the calling worker. Once `SO_REUSEPORT` lands, a
-broadcast bus is required for correctness, not just scale. Phase 4.
+`sua.ws.broadcast` reaches only the clients on the calling worker, so a broadcast bus is required
+for correctness, not just scale. Designed and built in **§12.3**.
 
 ---
 
@@ -264,9 +268,11 @@ socket open in the background.
 **A blocking builtin stalls its worker's loop.** There are 8 blocking call sites reachable from a
 handler (`curl_easy_perform`, `sqlite3_step`, `sleep`).
 
-This is the same constraint Node has, and it is managed the same way: Phase 4 moves `sua.http.*` to
-curl-multi driven by the loop, and offloads long sqlite work. Until then it is documented, and
-`SO_REUSEPORT` limits the damage to one worker of N.
+This is the same constraint Node has. Phase 4 was expected to remove it by driving `sua.http.*`
+from the loop with curl-multi; **that turned out not to be achievable without coroutines, and §12.4
+records why, including the re-entrancy shortcut that must not be taken.** What Phase 4 does deliver
+is `sua.http.all` (many outbound requests in parallel within one call, so the stall is `max(t)` not
+`sum(t)`) and `SO_REUSEPORT`, which limits the damage to one worker of N.
 
 It is worth being clear that this is **strictly better than what it replaces**. Today a blocking
 handler stalls a thread *and* corrupts other requests' scopes.
@@ -281,7 +287,7 @@ handler stalls a thread *and* corrupts other requests' scopes.
 | 1 | Correctness scaffolding: recursive-mutex interpreter lock, WS table mutex, atomic counters, race reproducer as a committed test | done |
 | 2 | `event_loop.hpp` + non-blocking rewrite of the three server functions; **Phase 1 locks deleted** | done — see §5.4 |
 | 3 | Security hardening (§9), each item with a test | done — `tests/sua_ws_security_test.sh` 13/13 |
-| 4 | `SO_REUSEPORT` workers; curl-multi `sua.http.*`; broadcast bus | |
+| 4 | `SO_REUSEPORT` workers; broadcast bus; parallel `sua.http.all` | done — see §12 |
 | 5 | Upstream PR to `AsseySilivestir/Bantu` with reproducer and fix | |
 
 ### Phase 1's lock ordering (while it exists)
@@ -381,7 +387,162 @@ have learned before it.
 
 ---
 
-## 12. References
+## 12. Phase 4 — multi-core, and what a worker actually shares
+
+Phase 2 gave one loop that holds tens of thousands of connections on one thread. That thread is
+still **one core**. Phase 4 is about the other fifteen.
+
+### 12.1 The worker model
+
+`sua.server.workers(n)` forks `n` processes, each running its own loop and its own interpreter.
+
+**How they receive connections depends on the platform, and this was got wrong first.** The original
+design said "each worker creates its own listening socket with `SO_REUSEPORT`; the kernel
+load-balances across them." That is true on Linux and false on macOS. Measured: four workers, all
+four confirmed listening by `lsof`, and **all twelve test connections delivered to worker 0** while
+the other three sat idle. Linux 3.9+ hashes each connection's 4-tuple across the listening sockets;
+macOS and the BSDs allow the shared bind but wake one socket. FreeBSD later added a *separate*
+option, `SO_REUSEPORT_LB`, precisely because plain `SO_REUSEPORT` does not balance — and macOS has
+no equivalent.
+
+So there are two strategies, chosen by `bantu_workers::kernelBalancesAccepts()`:
+
+| | listener | distribution | cost |
+|---|---|---|---|
+| **Linux** | one socket **per worker**, `SO_REUSEPORT`, created after the fork | kernel hashes the 4-tuple | none — NGINX's model |
+| **macOS / BSD** | **one shared socket**, created before the fork and inherited | workers race to `accept()` | a mild thundering herd |
+
+The pre-fork shared listener is the classic Apache model. It trades a few wasted wakeups for
+actually using the cores, which is the right trade when the alternative is one busy worker and N-1
+idle ones. Measured after the fix, 400 concurrent requests across 4 macOS workers: **103 / 99 / 99 /
+99**. Under strictly *sequential* requests the same setup skews hard (183 / 11 / 6 / 0), because
+whichever worker wakes first always wins an uncontended race — that is expected, and it is also the
+load where distribution does not matter.
+
+The fork point is load-bearing: **after** the Bantu program has run (routes registered, handlers
+defined, globals initialised) and **before** anything is accepted. Every worker therefore starts
+from an identical, fully-configured interpreter, and no request has been served yet by anyone.
+
+```
+  bantu run app.b
+        │
+        ├── program executes: routes registered, $config loaded
+        │
+        └── sua.server.listen(3000)
+                 │
+                 ├── fork ──► worker 0 ── listener ── own loop ── own interpreter
+                 ├── fork ──► worker 1 ── listener ── own loop ── own interpreter
+                 ├── fork ──► worker N ...
+                 │            (Linux: one SO_REUSEPORT socket each.
+                 │             macOS/BSD: one shared socket, inherited.)
+                 │
+                 └── parent: never accepts. Supervises + relays the bus.
+```
+
+The parent deliberately **does not serve traffic**. It supervises (respawns a worker that dies) and
+relays the broadcast bus. Keeping it out of the accept path means a crash in request handling can
+never take down the thing that restarts request handling.
+
+### 12.2 What this costs you: global state is per-worker
+
+This is the one thing an app author must understand, so it is stated bluntly.
+
+```bantu
+$hits = 0;
+sua.server.get("/hit", def($req, $res) { $hits = $hits + 1; $res.send(str($hits)); });
+sua.server.workers(4);
+```
+
+With 4 workers this counts to roughly `$hits/4` per worker. **`$hits` is not shared.** After the
+fork each worker has its own copy, and writes never meet.
+
+That is not a defect to be patched later; it is the direct consequence of the property that makes
+the model safe — no shared mutable state means §2.1 and §2.2 cannot come back. Shared state belongs
+in something built for it: a database, or the broadcast bus below. **`workers(1)` (the default)
+keeps the single-process semantics**, so nothing changes for anyone who does not opt in.
+
+### 12.3 The broadcast bus
+
+With N workers, a WebSocket client is connected to exactly one of them. `sua.ws.broadcast` would
+otherwise reach a fraction of the room — a correctness bug, not a scaling limit. So each worker gets
+a `socketpair` to the parent, and the parent fans out:
+
+```
+   worker 1 ──┐                        ┌──► worker 0   deliver locally
+   (broadcast)└──► parent (relay) ─────┼──► worker 2   deliver locally
+                                       └──► worker 3   deliver locally
+```
+
+The originating worker delivers to its own clients directly and does **not** receive its own frame
+back. Wire format is deliberately dull:
+
+```
+  [u32 length BE][u8 type][payload]      type 1 text, 2 binary,
+                                              3 targeted text, 4 targeted binary
+  targeted payload: [u16 idLen BE][client id][data]
+```
+
+Both ends are non-blocking with their own outbound buffer, because the relay must never let one
+wedged worker stall every other worker's broadcasts. A worker whose bus buffer exceeds its cap
+**drops the message and counts the drop** (`sua.server.stats().bus_dropped`) rather than growing
+without bound — a broadcast storm must degrade, not OOM.
+
+No Redis, no message broker, no new dependency. Same discipline as the from-scratch P-256: a
+socketpair and 200 lines beat a service to operate. Cross-*machine* broadcast is where a real broker
+belongs, and that boundary is where it will be added.
+
+Client ids carry the worker index under multiple workers (`ws-2-7` rather than `ws-7`). The id
+counter is per-process, so without this **every worker minted `ws-1`** — and a targeted send routed
+over the bus would have been delivered to a different person's socket on another worker. Single-
+worker mode keeps the original `ws-N` form, so nothing existing changes.
+
+Known limit, recorded rather than hidden: `sua.ws.clients()` enumerates **this worker's** clients.
+A cross-worker roster needs a shared registry with its own consistency questions; it is not in this
+phase.
+
+### 12.4 `sua.http.*` and curl-multi — what is achievable, and what is not
+
+The plan said Phase 4 would "move `sua.http.*` to curl-multi driven by the loop" so that a handler
+waiting on an outbound request no longer stalls its worker. **On investigation that is not
+achievable without a language change, and it is worth writing down why.**
+
+`sua.http.get()` is a synchronous builtin: the C++ stack runs loop → dispatch → evaluator → builtin →
+`curl_easy_perform`. To return to the loop while that request is in flight, that stack has to be
+suspended. There are exactly three ways:
+
+1. **A thread per in-flight handler** — reintroduces concurrent interpreter execution, which is
+   precisely §2.1. Rejected.
+2. **Pump the event loop from inside the blocking builtin** — re-entrant handler execution: two
+   Bantu handlers live on one stack, interleaving `env_` swaps. This resurrects §2.1 in a form that
+   is *harder* to debug than the original. Rejected, and specifically warned against here because it
+   is the tempting shortcut.
+3. **Coroutines** — each handler on its own small stack, with `env_` saved and restored as part of
+   the context switch. This is the correct long-term answer (it is what Go does) and it preserves
+   the synchronous syntax that §11 promises app authors. It is also a real interpreter change, and
+   the plan explicitly put per-handler evaluator state out of scope.
+
+So Phase 4 ships the part that is safe and genuinely useful: **`sua.http.all([...])`**, which issues
+many requests concurrently through `curl_multi` inside a single builtin call and returns the
+responses in request order. The worker still blocks — but for `max(t)` instead of `sum(t)`.
+
+That is not a consolation prize. The heaviest outbound workload sua has is **Web Push fan-out**,
+which is N independent HTTPS POSTs to N subscribers; sequentially that is N round trips, and it is
+the operation most likely to stall a worker in practice. `sua.http.all` turns it into one.
+
+Coroutine-based handler suspension is recorded as the successor, with its prerequisite named:
+per-coroutine `env_` save/restore in the evaluator.
+
+### 12.5 Platform
+
+`fork` and `SO_REUSEPORT` are POSIX. On Windows, `sua.server.workers(n)` logs that multi-worker mode
+is unavailable and runs single-worker; every other guarantee is unchanged. Multi-worker Windows
+would need a different mechanism entirely (a shared listening handle passed to child processes),
+and single-worker Windows is not a regression against anything that shipped.
+
+
+---
+
+## 13. References
 
 - RFC 6455 — The WebSocket Protocol (§5.1 masking, §8.1 UTF-8, close codes)
 - RFC 8030 / 8291 / 8292 — Web Push, and the battery-correct background path (see

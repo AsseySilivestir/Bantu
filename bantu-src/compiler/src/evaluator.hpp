@@ -19,6 +19,7 @@
 #include "dataframe_arrow.hpp"  // Parquet + Feather/Arrow-IPC I/O (opt-in: -DBANTU_ARROW)
 #include "mime_types.hpp"       // extension -> Content-Type for the static file server
 #include "event_loop.hpp"       // kqueue/epoll/poll readiness loop for the sua server
+#include "worker_pool.hpp"      // SO_REUSEPORT workers + the cross-worker broadcast bus
 #include "pwa_native.hpp"       // manifest / service worker / offline rendering for sua.pwa
 #include "webpush.hpp"          // RFC 8188/8291/8292 Web Push (pulls in p256.hpp + aes_gcm.hpp)
 #include <iostream>
@@ -274,6 +275,49 @@ static void bantuConnClose(int fd) {
 // Live connection count, for the cap. Incremented on accept, decremented when
 // the loop drops the connection.
 static std::atomic<int> bantuLiveConnections{0};
+
+// ─── Cross-worker broadcast bus ────────────────────────────────────────────
+// With SO_REUSEPORT workers a WebSocket client is connected to exactly ONE
+// worker, so sua.ws.broadcast would otherwise reach a fraction of the room.
+// That is a correctness bug, not a scaling limit. Each worker holds a
+// socketpair to the parent, which fans out to the other workers; the sender
+// delivers to its own clients directly and never sees its own frame again.
+// See docs/sua-architecture.md §12.3.
+struct BantuBus {
+    int         fd = -1;
+    std::string in;              // partial inbound frame
+    std::string out;             // pending outbound
+    size_t      outPos = 0;
+    bool        wantWrite = false;
+};
+static BantuBus  bantuBus;
+static int       bantuWorkerIndex = 0;    // 0..workers-1
+static int       bantuWorkerCount = 1;    // 1 == single process, no bus
+static uint64_t  bantuBusSent = 0;
+static uint64_t  bantuBusReceived = 0;
+static uint64_t  bantuBusDropped = 0;     // over the buffer cap, or too large
+
+static void bantuBusSyncInterest() {
+    if (bantuBus.fd < 0 || !bantuLoopBackend) return;
+    bool want = (bantuBus.outPos < bantuBus.out.size());
+    if (want != bantuBus.wantWrite) {
+        bantuLoopBackend->mod(bantuBus.fd, true, want);
+        bantuBus.wantWrite = want;
+    }
+}
+
+// Queue a frame for the other workers. A wedged relay must degrade the bus,
+// never exhaust memory -- so past the cap the message is dropped and counted
+// rather than buffered.
+static void bantuBusPublish(uint8_t type, const char* data, size_t n) {
+    if (bantuBus.fd < 0) return;                     // single worker: no bus
+    if (n + 1 > bantu_workers::kBusMaxFrame) { bantuBusDropped++; return; }
+    if (bantuBus.out.size() - bantuBus.outPos + n + 5
+            > bantu_workers::kBusMaxBuffered) { bantuBusDropped++; return; }
+    bantu_workers::busEncode(bantuBus.out, type, data, n);
+    bantuBusSent++;
+    bantuBusSyncInterest();
+}
 
 static std::vector<BantuServerRoute> bantuServerRoutes;
 static int bantuServerPort = 3000;
@@ -739,20 +783,39 @@ static void bantuWsSendBinary(int fd, const std::vector<uint8_t>& data) {
     bantuConnWriteN(fd, (const char*)frame.data(), frame.size());
 }
 
-// ─── WebSocket framing helpers (RFC 6455) ──────────────────────────
-// Read exactly n octets, or fail. The previous frame reader took whatever a
-// single recv() returned and silently truncated anything larger -- so any
-// message bigger than one TCP segment arrived corrupted. Voice frames hit that
-// constantly.
-static bool bantuRecvExact(int sock, uint8_t* buf, size_t n) {
-    size_t got = 0;
-    while (got < n) {
-        ssize_t r = recv(sock, (char*)buf + got, (int)(n - got), 0);
-        if (r <= 0) return false;
-        got += (size_t)r;
+// Deliver a frame that arrived from another worker to THIS worker's clients.
+// Frames from the bus are already-decided sends: the originating worker made
+// the routing decision, so no Bantu handler runs here.
+static void bantuBusDeliver(uint8_t type, const std::string& payload) {
+    bantuBusReceived++;
+    switch (type) {
+        case bantu_workers::BUS_TEXT:
+            for (int fd : bantuWsLiveFds()) bantuWsSend(fd, payload);
+            break;
+        case bantu_workers::BUS_BINARY: {
+            std::vector<uint8_t> b(payload.begin(), payload.end());
+            for (int fd : bantuWsLiveFds()) bantuWsSendBinary(fd, b);
+            break;
+        }
+        case bantu_workers::BUS_TARGET_TEXT: {
+            std::string id, data;
+            if (!bantu_workers::busUnpackTarget(payload, id, data)) break;
+            int fd = bantuWsFdFor(id);           // -1 when the client is elsewhere
+            if (fd >= 0) bantuWsSend(fd, data);
+            break;
+        }
+        case bantu_workers::BUS_TARGET_BINARY: {
+            std::string id, data;
+            if (!bantu_workers::busUnpackTarget(payload, id, data)) break;
+            int fd = bantuWsFdFor(id);
+            if (fd >= 0) bantuWsSendBinary(fd, std::vector<uint8_t>(data.begin(), data.end()));
+            break;
+        }
+        default: break;                          // unknown type: ignore, stay compatible
     }
-    return true;
 }
+
+// ─── WebSocket framing helpers (RFC 6455) ──────────────────────────
 
 // Close with a status code (RFC 6455 §5.5.1), then the caller closes the fd.
 static void bantuWsClose(int sock, uint16_t code, const std::string& reason = "") {
@@ -820,7 +883,13 @@ static void bantuWsUpgrade(int sock, const std::string& wsKey) {
     int wsId = bantuNextWsId++;
     BantuWsClient client;
     client.fd = sock;
-    client.id = "ws-" + std::to_string(wsId);
+    // The counter is per-process, so under multiple workers every worker would
+    // otherwise mint "ws-1" -- colliding ids, and a targeted cross-worker send
+    // delivered to the WRONG client. The worker index disambiguates. Single
+    // worker keeps the original "ws-N" form, so nothing existing changes.
+    client.id = (bantuWorkerCount > 1)
+              ? ("ws-" + std::to_string(bantuWorkerIndex) + "-" + std::to_string(wsId))
+              : ("ws-" + std::to_string(wsId));
     bantuWsTable()[wsId] = client;
 
     auto it = bantuConns.find(sock);
@@ -1411,33 +1480,46 @@ static std::string bantuUrlOrigin(const std::string& url) {
     return origin;
 }
 
-static Value bantuHttpRequestEx(const std::string& method, const std::string& url,
-                                const std::string& body, const std::string& contentType,
-                                const BantuHttpOptions& opt) {
-    CURL* curl = curl_easy_init();
-    if (!curl) {
-        ObjectMap err;
-        err["error"] = Value(std::string("Failed to initialize HTTP client"));
-        err["status"] = Value(0.0);
-        err["ok"] = Value(false);
-        return Value(std::move(err));
-    }
+// ─── One configured transfer ───────────────────────────────────────────────
+// Everything needed to run a request and turn it back into a Bantu value.
+// Extracted so the single-request path and the parallel sua.http.all path
+// share ONE setup routine: the POSTFIELDSIZE rule below and TLS verification
+// must hold identically for both, and two copies would eventually drift.
+struct BantuHttpJob {
+    CURL*               easy    = nullptr;
+    struct curl_slist*  headers = nullptr;
+    std::string         responseBody;
+    std::string         responseHeaders;
+    std::string         method;
+    std::string         url;
+};
 
-    std::string responseBody;
-    std::string responseHeaders;
-    long responseCode = 0;
+// Build and configure the easy handle. Returns false only when libcurl cannot
+// allocate one. The response buffers live in the job, so it must not be moved
+// or copied once this has been called -- CURLOPT_WRITEDATA points into it.
+static bool bantuHttpConfigure(BantuHttpJob& j, const std::string& method,
+                               const std::string& url, const std::string& body,
+                               const std::string& contentType,
+                               const BantuHttpOptions& opt) {
+    j.easy = curl_easy_init();
+    if (!j.easy) return false;
+    j.method = method;
+    j.url    = url;
 
-    // Set URL
+    CURL* curl = j.easy;
     curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, bantuCurlWriteCallback);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &responseBody);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &j.responseBody);
     curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, bantuCurlHeaderCallback);
-    curl_easy_setopt(curl, CURLOPT_HEADERDATA, &responseHeaders);
+    curl_easy_setopt(curl, CURLOPT_HEADERDATA, &j.responseHeaders);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, opt.timeout);
     curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 5L);
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
     curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 5L);
     curl_easy_setopt(curl, CURLOPT_USERAGENT, "Bantu-Lang/1.1.0");
+    // Never let libcurl raise a signal: unsupported inside curl_multi, and in
+    // the server it would collide with the loop's own signal handling.
+    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
     // TLS peer/host verification is ON. Pass insecure:true per request to opt
     // out (self-signed development endpoints).
     curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, opt.verifyTls ? 1L : 0L);
@@ -1453,7 +1535,8 @@ static Value bantuHttpRequestEx(const std::string& method, const std::string& ur
     //
     // The ORDER below is load-bearing: the size must be set first. COPYPOSTFIELDS
     // (rather than POSTFIELDS) makes libcurl own the bytes, so `body` need not
-    // outlive the call.
+    // outlive the call — which is what lets sua.http.all queue many transfers
+    // whose bodies are temporaries.
     auto setBody = [&]() {
         curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE_LARGE, (curl_off_t)body.size());
         curl_easy_setopt(curl, CURLOPT_COPYPOSTFIELDS, body.data());
@@ -1500,12 +1583,15 @@ static Value bantuHttpRequestEx(const std::string& method, const std::string& ur
     }
 
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+    j.headers = headers;
+    return true;
+}
 
-    CURLcode res = curl_easy_perform(curl);
-    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &responseCode);
-
-    curl_slist_free_all(headers);
-    curl_easy_cleanup(curl);
+// Turn a finished transfer into the Bantu response object. Does not free the
+// handle -- the caller owns the job's lifetime.
+static Value bantuHttpFinish(BantuHttpJob& j, CURLcode res, const BantuHttpOptions& opt) {
+    long responseCode = 0;
+    curl_easy_getinfo(j.easy, CURLINFO_RESPONSE_CODE, &responseCode);
 
     ObjectMap response;
 
@@ -1513,7 +1599,7 @@ static Value bantuHttpRequestEx(const std::string& method, const std::string& ur
     // opts in to the full URL when you are actually debugging a request.
     const char* httpDebug = std::getenv("BANTU_HTTP_DEBUG");
     bool fullUrl = httpDebug && httpDebug[0] && httpDebug[0] != '0';
-    std::string traceTarget = fullUrl ? url : bantuUrlOrigin(url);
+    std::string traceTarget = fullUrl ? j.url : bantuUrlOrigin(j.url);
     bool trace = opt.verbose && !bantuQuietMode;
 
     if (res != CURLE_OK) {
@@ -1532,25 +1618,180 @@ static Value bantuHttpRequestEx(const std::string& method, const std::string& ur
         response["error"] = Value(err);
         response["status"] = Value(0.0);
         response["ok"] = Value(false);
-        response["url"] = Value(url);
-        response["method"] = Value(method);
+        response["url"] = Value(j.url);
+        response["method"] = Value(j.method);
         if (trace)
-            std::cerr << "  [HTTP] " << method << " " << traceTarget << " -> ERROR: "
+            std::cerr << "  [HTTP] " << j.method << " " << traceTarget << " -> ERROR: "
                       << curl_easy_strerror(res) << "\n";
     } else {
         response["status"] = Value((double)responseCode);
         response["statusText"] = Value(httpStatusText((int)responseCode));
         response["ok"] = Value(responseCode >= 200 && responseCode < 300);
-        response["body"] = Value(responseBody);
-        response["url"] = Value(url);
-        response["method"] = Value(method);
-        response["headers"] = Value(responseHeaders);
+        response["body"] = Value(j.responseBody);
+        response["url"] = Value(j.url);
+        response["method"] = Value(j.method);
+        response["headers"] = Value(j.responseHeaders);
         if (trace)
-            std::cerr << "  [HTTP] " << method << " " << traceTarget << " -> " << responseCode
+            std::cerr << "  [HTTP] " << j.method << " " << traceTarget << " -> " << responseCode
                       << " " << httpStatusText((int)responseCode) << "\n";
     }
-
     return Value(std::move(response));
+}
+
+static void bantuHttpJobFree(BantuHttpJob& j) {
+    if (j.headers) { curl_slist_free_all(j.headers); j.headers = nullptr; }
+    if (j.easy)    { curl_easy_cleanup(j.easy);      j.easy = nullptr; }
+}
+
+static Value bantuHttpRequestEx(const std::string& method, const std::string& url,
+                                const std::string& body, const std::string& contentType,
+                                const BantuHttpOptions& opt) {
+    BantuHttpJob j;
+    if (!bantuHttpConfigure(j, method, url, body, contentType, opt)) {
+        ObjectMap err;
+        err["error"] = Value(std::string("Failed to initialize HTTP client"));
+        err["status"] = Value(0.0);
+        err["ok"] = Value(false);
+        return Value(std::move(err));
+    }
+    CURLcode res = curl_easy_perform(j.easy);
+    Value out = bantuHttpFinish(j, res, opt);
+    bantuHttpJobFree(j);
+    return out;
+}
+
+// ─── Many requests at once (curl_multi) ────────────────────────────────────
+// One request per element, all in flight together, responses returned in
+// REQUEST order regardless of completion order.
+//
+// This does not make the caller non-blocking -- see docs/sua-architecture.md
+// §12.4 for why that needs coroutines rather than curl_multi, and for the
+// re-entrancy shortcut that must not be taken. What it does is turn N
+// sequential round trips into one: the wait becomes max(t) instead of sum(t).
+//
+// The workload that matters here is Web Push fan-out, which is N independent
+// HTTPS POSTs to N subscribers and is the operation most likely to stall a
+// worker in practice.
+struct BantuHttpSpec {
+    std::string method = "GET";
+    std::string url;
+    std::string body;
+    std::string contentType;
+    BantuHttpOptions opt;
+};
+
+// Parse one {method, url, headers, body, timeout, insecure, verbose,
+// content_type} object into a spec. Shared by sua.http.request and
+// sua.http.all so a request means the same thing in both -- particularly the
+// binary-safe body handling, which is where the NUL-truncation bug lived.
+// Returns false and fills `err` when the object is unusable.
+static bool bantuHttpSpecFrom(const ObjectMap& o, BantuHttpSpec& spec, std::string& err) {
+    auto opt_str = [&](const char* k, const std::string& dflt) {
+        auto it = o.find(k);
+        return (it == o.end() || it->second.isNull()) ? dflt : it->second.toString();
+    };
+    spec.method = opt_str("method", "GET");
+    for (auto& c : spec.method) c = (char)std::toupper((unsigned char)c);
+    spec.url = opt_str("url", "");
+    if (spec.url.empty()) { err = "url is required"; return false; }
+
+    auto bit = o.find("body");
+    if (bit != o.end() && !bit->second.isNull()) {
+        if (bit->second.isList()) {
+            std::vector<unsigned char> b = bantuToBytes(bit->second);
+            spec.body.assign(b.begin(), b.end());
+        } else if (bit->second.isObject()) {
+            spec.body = bantuJsonStringify(bit->second);
+        } else {
+            spec.body = bit->second.toString();
+        }
+    }
+
+    auto tit = o.find("timeout");
+    if (tit != o.end() && tit->second.isNumber()) spec.opt.timeout = (long)tit->second.numberVal;
+    auto iit = o.find("insecure");
+    if (iit != o.end()) spec.opt.verifyTls = !iit->second.isTruthy();
+    auto vit = o.find("verbose");
+    if (vit != o.end()) spec.opt.verbose = vit->second.isTruthy();
+
+    auto hit = o.find("headers");
+    if (hit != o.end() && hit->second.isObject()) {
+        for (auto& kv : *hit->second.objectVal)
+            spec.opt.headers.emplace_back(kv.first, kv.second.toString());
+    }
+    spec.contentType = opt_str("content_type", "");
+    return true;
+}
+
+static std::vector<Value> bantuHttpAll(std::vector<BantuHttpSpec>& specs, int maxParallel) {
+    std::vector<Value> results(specs.size());
+    if (specs.empty()) return results;
+    if (maxParallel < 1) maxParallel = 1;
+
+    CURLM* multi = curl_multi_init();
+    if (!multi) {
+        // Fall back to sequential rather than failing the call: a caller that
+        // asked for N responses must still get N responses.
+        for (size_t i = 0; i < specs.size(); i++)
+            results[i] = bantuHttpRequestEx(specs[i].method, specs[i].url, specs[i].body,
+                                            specs[i].contentType, specs[i].opt);
+        return results;
+    }
+    curl_multi_setopt(multi, CURLMOPT_MAXCONNECTS, (long)maxParallel);
+
+    // Jobs are held by pointer and never reallocated: CURLOPT_WRITEDATA points
+    // into each job's buffers, so the vector must not move them.
+    std::vector<BantuHttpJob*> jobs(specs.size(), nullptr);
+    std::unordered_map<CURL*, size_t> indexOf;
+
+    for (size_t i = 0; i < specs.size(); i++) {
+        BantuHttpJob* j = new BantuHttpJob();
+        if (!bantuHttpConfigure(*j, specs[i].method, specs[i].url, specs[i].body,
+                                specs[i].contentType, specs[i].opt)) {
+            ObjectMap err;
+            err["error"]  = Value(std::string("Failed to initialize HTTP client"));
+            err["status"] = Value(0.0);
+            err["ok"]     = Value(false);
+            results[i] = Value(std::move(err));
+            delete j;
+            continue;
+        }
+        jobs[i] = j;
+        indexOf[j->easy] = i;
+        curl_multi_add_handle(multi, j->easy);
+    }
+
+    int running = 0;
+    do {
+        CURLMcode mc = curl_multi_perform(multi, &running);
+        if (mc == CURLM_OK && running)
+            mc = curl_multi_poll(multi, nullptr, 0, 1000, nullptr);
+        if (mc != CURLM_OK) break;
+
+        // Drain completions as they land.
+        CURLMsg* msg = nullptr;
+        int left = 0;
+        while ((msg = curl_multi_info_read(multi, &left)) != nullptr) {
+            if (msg->msg != CURLMSG_DONE) continue;
+            auto it = indexOf.find(msg->easy_handle);
+            if (it == indexOf.end()) continue;
+            size_t i = it->second;
+            results[i] = bantuHttpFinish(*jobs[i], msg->data.result, specs[i].opt);
+        }
+    } while (running);
+
+    for (size_t i = 0; i < jobs.size(); i++) {
+        if (!jobs[i]) continue;
+        // A transfer the loop never reported DONE (an aborted multi) still owes
+        // the caller a response object rather than a null hole.
+        if (results[i].isNull())
+            results[i] = bantuHttpFinish(*jobs[i], CURLE_RECV_ERROR, specs[i].opt);
+        curl_multi_remove_handle(multi, jobs[i]->easy);
+        bantuHttpJobFree(*jobs[i]);
+        delete jobs[i];
+    }
+    curl_multi_cleanup(multi);
+    return results;
 }
 
 // Legacy three-argument form, behind sua.http.get/post/put/delete/patch/head.
@@ -2842,44 +3083,107 @@ private:
         // every other CLI program does.
         signal(SIGPIPE, SIG_IGN);
 #endif
-        int sock = (int)socket(AF_INET, SOCK_STREAM, 0);
+
+        // ─── Create the listening socket ───────────────────────────────
+        // Shared by both worker strategies below; `useReusePort` is the only
+        // difference between them.
+        auto makeListener = [&](bool useReusePort) -> int {
+            int fd = (int)socket(AF_INET, SOCK_STREAM, 0);
+            if (fd < 0) {
+                std::cerr << "  [SERVER] FATAL: socket() failed: " << strerror(errno) << "\n";
+                return -1;
+            }
+            int opt = 1;
+            setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, (const char*)&opt, sizeof(opt));
+            if (useReusePort && !bantu_workers::reusePort(fd)) {
+                std::cerr << "  [SERVER] FATAL: SO_REUSEPORT unavailable\n";
+                CLOSE_SOCKET(fd);
+                return -1;
+            }
+            struct sockaddr_in addr;
+            memset(&addr, 0, sizeof(addr));
+            addr.sin_family = AF_INET;
+            addr.sin_addr.s_addr = INADDR_ANY;  // bind to 0.0.0.0
+            addr.sin_port = htons(port);
+            if (bind(fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+                std::cerr << "  [SERVER] FATAL: bind() failed on port " << port
+                          << ": " << strerror(errno) << "\n";
+                CLOSE_SOCKET(fd);
+                return -1;
+            }
+            if (::listen(fd, 512) < 0) {
+                std::cerr << "  [SERVER] FATAL: listen() failed: " << strerror(errno) << "\n";
+                CLOSE_SOCKET(fd);
+                return -1;
+            }
+            if (!bantu_loop::setNonBlocking(fd)) {
+                std::cerr << "  [SERVER] FATAL: could not set the listener non-blocking\n";
+                CLOSE_SOCKET(fd);
+                return -1;
+            }
+            return fd;
+        };
+
+        // ─── Multi-worker fork ─────────────────────────────────────────
+        // Forked HERE: the Bantu program has already run, so every worker
+        // starts from an identical, fully-configured interpreter -- and
+        // nothing has been accepted yet, so no worker inherits request state.
+        // The parent never returns from start(): it supervises and relays the
+        // broadcast bus. See docs/sua-architecture.md §12.
+        //
+        // TWO strategies, because SO_REUSEPORT does not mean the same thing
+        // everywhere (bantu_workers::kernelBalancesAccepts explains it):
+        //
+        //   Linux  -- each worker binds its OWN socket with SO_REUSEPORT after
+        //             the fork, and the kernel hashes connections across them.
+        //             No thundering herd, best cache locality. NGINX's model.
+        //   others -- ONE socket, created before the fork and inherited by every
+        //             worker, each accepting from it. Mild thundering herd, but
+        //             it actually uses the cores. macOS lands here: measured,
+        //             plain SO_REUSEPORT sent all twelve test connections to
+        //             worker 0 while the other three sat idle.
+        int sock = -1;
+        bool sharedListener = false;
+
+        if (bantuWorkerCount > 1) {
+            if (!bantu_workers::supported()) {
+                std::cerr << "  [SERVER] multi-worker mode is unavailable on this platform; "
+                             "running 1 worker\n";
+                bantuWorkerCount = 1;
+            } else {
+                sharedListener = !bantu_workers::kernelBalancesAccepts();
+                if (sharedListener) {
+                    sock = makeListener(false);        // inherited through the fork
+                    if (sock < 0) return;
+                }
+                bantu_workers::Ctx wctx;
+                bantu_workers::start(bantuWorkerCount, wctx);   // returns only in a child
+                bantuWorkerIndex = wctx.index;
+                bantuWorkerCount = wctx.workers;
+                bantuBus.fd      = wctx.busFd;
+            }
+        }
+
         if (sock < 0) {
-            std::cerr << "  [SERVER] FATAL: socket() failed: " << strerror(errno) << "\n";
-            return;
-        }
-        int opt = 1;
-        setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, (const char*)&opt, sizeof(opt));
-
-        struct sockaddr_in addr;
-        memset(&addr, 0, sizeof(addr));
-        addr.sin_family = AF_INET;
-        addr.sin_addr.s_addr = INADDR_ANY;  // bind to 0.0.0.0
-        addr.sin_port = htons(port);
-
-        if (bind(sock, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
-            std::cerr << "  [SERVER] FATAL: bind() failed on port " << port
-                      << ": " << strerror(errno) << "\n";
-            CLOSE_SOCKET(sock);
-            return;
-        }
-        if (::listen(sock, 128) < 0) {
-            std::cerr << "  [SERVER] FATAL: listen() failed: " << strerror(errno) << "\n";
-            CLOSE_SOCKET(sock);
-            return;
-        }
-        if (!bantu_loop::setNonBlocking(sock)) {
-            std::cerr << "  [SERVER] FATAL: could not set the listener non-blocking\n";
-            CLOSE_SOCKET(sock);
-            return;
+            sock = makeListener(bantuWorkerCount > 1);
+            if (sock < 0) return;
         }
 
         auto backend = bantu_loop::makeBackend();
         bantuLoopBackend = backend.get();
         backend->add(sock, true, false);
+        if (bantuBus.fd >= 0) backend->add(bantuBus.fd, true, false);
 
-        std::cout << "  [SERVER] Listening on 0.0.0.0:" << port
-                  << " (event loop: " << backend->name() << ")\n";
-        std::cout.flush();
+        // One line per worker would be N identical lines; only worker 0 speaks.
+        if (bantuWorkerIndex == 0) {
+            std::cout << "  [SERVER] Listening on 0.0.0.0:" << port
+                      << " (event loop: " << backend->name();
+            if (bantuWorkerCount > 1)
+                std::cout << ", " << bantuWorkerCount << " workers via "
+                          << (sharedListener ? "shared listener" : "SO_REUSEPORT");
+            std::cout << ")\n";
+            std::cout.flush();
+        }
 
         // ─── The event loop ────────────────────────────────────────────
         // One thread, every connection. A connection costs its buffers rather
@@ -2909,6 +3213,51 @@ private:
             uint64_t now = bantu_loop::nowMs();
 
             for (const auto& ev : events) {
+                // ── the broadcast bus ──
+                // Handled before the connection table: the bus fd is a
+                // socketpair to the supervisor, not a client, and it must never
+                // be mistaken for one.
+                if (bantuBus.fd >= 0 && ev.fd == bantuBus.fd) {
+                    if (ev.readable) {
+                        char bbuf[65536];
+                        bool eof = false;
+                        for (;;) {
+                            ssize_t r = recv(bantuBus.fd, bbuf, sizeof(bbuf), 0);
+                            if (r > 0) { bantuBus.in.append(bbuf, (size_t)r); continue; }
+                            if (r == 0) { eof = true; break; }
+                            if (bantu_loop::wouldBlock()) break;
+                            eof = true; break;
+                        }
+                        uint8_t btype; std::string bpayload;
+                        while (bantu_workers::busDecode(bantuBus.in, btype, bpayload))
+                            bantuBusDeliver(btype, bpayload);
+                        if (eof) {
+                            // The supervisor is gone. Keep serving the clients
+                            // we hold -- dropping them would turn a supervisor
+                            // restart into a user-visible outage -- but stop
+                            // pretending broadcasts reach other workers.
+                            backend->del(bantuBus.fd);
+                            CLOSE_SOCKET(bantuBus.fd);
+                            bantuBus.fd = -1;
+                            bantuBus.in.clear(); bantuBus.out.clear(); bantuBus.outPos = 0;
+                        }
+                    }
+                    if (bantuBus.fd >= 0 && (ev.writable || bantuBus.outPos < bantuBus.out.size())) {
+                        while (bantuBus.outPos < bantuBus.out.size()) {
+                            ssize_t w = send(bantuBus.fd, bantuBus.out.data() + bantuBus.outPos,
+                                             (int)(bantuBus.out.size() - bantuBus.outPos), 0);
+                            if (w > 0) { bantuBus.outPos += (size_t)w; continue; }
+                            if (bantu_loop::wouldBlock()) break;
+                            break;
+                        }
+                        if (bantuBus.outPos >= bantuBus.out.size()) {
+                            bantuBus.out.clear(); bantuBus.outPos = 0;
+                        }
+                        bantuBusSyncInterest();
+                    }
+                    continue;
+                }
+
                 // ── the listener ──
                 if (ev.fd == sock) {
                     // Drain the accept queue; one wakeup can cover many pending
@@ -5502,6 +5851,54 @@ private:
             return Value(std::move(routeInfo));
         });
 
+        // sua.server.workers(n) — run n processes across n cores.
+        //
+        //   sua.server.workers(0);   // one per core
+        //   sua.server.workers(4);   // exactly four
+        //
+        // Must be called BEFORE sua.server.listen(); the fork happens inside
+        // listen, once the program has finished registering routes.
+        //
+        // IMPORTANT, and the one thing to understand before switching this on:
+        // Bantu globals are PER WORKER. After the fork each worker has its own
+        // copy and writes never meet, so a `$hits = $hits + 1` counter counts
+        // only that worker's share. That is the property that makes the model
+        // safe -- no shared mutable state means the interpreter cannot race on
+        // itself -- and shared state belongs in a database or on the broadcast
+        // bus. See docs/sua-architecture.md §12.2.
+        serverObj["workers"] = makeNative([](std::vector<Value> args) -> Value {
+            if (!args.empty()) {
+                int n = (int)args[0].numberVal;
+                if (n <= 0) n = bantu_workers::cpuCount();   // 0 / absent => per core
+                if (n > 256) n = 256;                        // sanity, not policy
+                if (n > 1 && !bantu_workers::supported()) {
+                    std::cerr << "  [SERVER] multi-worker mode is unavailable on this "
+                                 "platform; staying single-worker\n";
+                    n = 1;
+                }
+                bantuWorkerCount = n;
+            }
+            return Value((double)bantuWorkerCount);
+        });
+
+        // sua.server.stats() — live counters for this worker.
+        // Everything here is worker-local by design; `workers` and `worker`
+        // tell you which slice of the whole you are looking at.
+        serverObj["stats"] = makeNative([](std::vector<Value>) -> Value {
+            ObjectMap out;
+            out["workers"]          = Value((double)bantuWorkerCount);
+            out["worker"]           = Value((double)bantuWorkerIndex);
+            out["live_connections"] = Value((double)bantuLiveConnections.load());
+            out["ws_clients"]       = Value((double)bantuWsTable().size());
+            out["bus"]              = Value(bantuBus.fd >= 0);
+            out["bus_sent"]         = Value((double)bantuBusSent);
+            out["bus_received"]     = Value((double)bantuBusReceived);
+            // Non-zero means broadcasts were shed to protect memory -- a real
+            // signal that the bus is saturated, not a cosmetic counter.
+            out["bus_dropped"]      = Value((double)bantuBusDropped);
+            return Value(std::move(out));
+        });
+
         // sua.server.limits({...}) — resource and security limits.
         // Called with no argument it just reports the current settings.
         serverObj["limits"] = makeNative([](std::vector<Value> args) -> Value {
@@ -5614,50 +6011,73 @@ private:
                 err["error"] = Value(std::string("sua.http.request expects an options object"));
                 return Value(std::move(err));
             }
-            ObjectMap& o = *args[0].objectVal;
-            auto opt_str = [&](const char* k, const std::string& dflt) {
-                auto it = o.find(k);
-                return (it == o.end() || it->second.isNull()) ? dflt : it->second.toString();
-            };
-            std::string method = opt_str("method", "GET");
-            for (auto& c : method) c = (char)std::toupper((unsigned char)c);
-            std::string url = opt_str("url", "");
-            if (url.empty()) {
+            BantuHttpSpec spec;
+            std::string perr;
+            if (!bantuHttpSpecFrom(*args[0].objectVal, spec, perr)) {
                 ObjectMap err;
                 err["ok"] = Value(false);
                 err["status"] = Value(0.0);
-                err["error"] = Value(std::string("sua.http.request: url is required"));
+                err["error"] = Value(std::string("sua.http.request: ") + perr);
                 return Value(std::move(err));
             }
+            return bantuHttpRequestEx(spec.method, spec.url, spec.body, spec.contentType, spec.opt);
+        });
 
-            std::string body;
-            auto bit = o.find("body");
-            if (bit != o.end() && !bit->second.isNull()) {
-                if (bit->second.isList()) {
-                    std::vector<unsigned char> b = bantuToBytes(bit->second);
-                    body.assign(b.begin(), b.end());
-                } else if (bit->second.isObject()) {
-                    body = bantuJsonStringify(bit->second);
-                } else {
-                    body = bit->second.toString();
+        // sua.http.all([{...}, {...}], max_parallel?) — many requests at once.
+        //
+        //   $rs = sua.http.all([
+        //       {"url": "https://a/x"},
+        //       {"method": "POST", "url": "https://b/y", "body": {"n": 1}}
+        //   ]);
+        //
+        // Each element takes exactly the same options as sua.http.request, and
+        // the results come back in REQUEST order however they complete. The
+        // call still blocks -- it is N round trips collapsed into one wait of
+        // max(t) rather than sum(t), not asynchrony (docs/sua-architecture.md
+        // §12.4). Web Push fan-out is the workload this exists for.
+        httpClientObj["all"] = makeNative([](std::vector<Value> args) -> Value {
+            if (args.empty() || !args[0].isList()) {
+                ObjectMap err;
+                err["ok"] = Value(false);
+                err["error"] = Value(std::string("sua.http.all expects a list of request objects"));
+                return Value(std::move(err));
+            }
+            const std::vector<Value>& reqs = args[0].listVal;
+            int maxParallel = (args.size() > 1 && args[1].isNumber())
+                            ? (int)args[1].numberVal : 16;
+
+            std::vector<BantuHttpSpec> specs;
+            std::vector<Value> bad(reqs.size());        // per-element parse failures
+            std::vector<size_t> slot;                   // specs[i] -> result index
+            specs.reserve(reqs.size());
+            for (size_t i = 0; i < reqs.size(); i++) {
+                if (!reqs[i].isObject()) {
+                    ObjectMap e;
+                    e["ok"] = Value(false); e["status"] = Value(0.0);
+                    e["error"] = Value(std::string("sua.http.all: element is not an object"));
+                    bad[i] = Value(std::move(e));
+                    continue;
                 }
+                BantuHttpSpec sp;
+                std::string perr;
+                if (!bantuHttpSpecFrom(*reqs[i].objectVal, sp, perr)) {
+                    ObjectMap e;
+                    e["ok"] = Value(false); e["status"] = Value(0.0);
+                    e["error"] = Value(std::string("sua.http.all: ") + perr);
+                    bad[i] = Value(std::move(e));
+                    continue;
+                }
+                specs.push_back(std::move(sp));
+                slot.push_back(i);
             }
 
-            BantuHttpOptions opt;
-            auto tit = o.find("timeout");
-            if (tit != o.end() && tit->second.isNumber()) opt.timeout = (long)tit->second.numberVal;
-            auto iit = o.find("insecure");
-            if (iit != o.end()) opt.verifyTls = !iit->second.isTruthy();
-            auto vit = o.find("verbose");
-            if (vit != o.end()) opt.verbose = vit->second.isTruthy();
-
-            auto hit = o.find("headers");
-            if (hit != o.end() && hit->second.isObject()) {
-                for (auto& kv : *hit->second.objectVal)
-                    opt.headers.emplace_back(kv.first, kv.second.toString());
-            }
-            std::string contentType = opt_str("content_type", "");
-            return bantuHttpRequestEx(method, url, body, contentType, opt);
+            std::vector<Value> got = bantuHttpAll(specs, maxParallel);
+            // Reassemble in request order: a malformed element still occupies
+            // its position, so results line up with the input one for one.
+            std::vector<Value> out(reqs.size());
+            for (size_t i = 0; i < reqs.size(); i++) out[i] = bad[i];
+            for (size_t k = 0; k < slot.size() && k < got.size(); k++) out[slot[k]] = got[k];
+            return Value(std::move(out));
         });
 
         // sua.http.insecure(true) — disable TLS certificate verification for the
@@ -7381,22 +7801,40 @@ private:
         });
 
         // sua.ws.send(clientId, data) → send a text message to one client
+        //
+        // Under multiple workers the client may be connected to a DIFFERENT
+        // process, where this worker's table cannot see it. So a local miss is
+        // forwarded on the bus rather than reported as failure; the worker that
+        // owns that client delivers it. The return value therefore means
+        // "delivered locally", and false with a bus attached means "handed off",
+        // not "lost".
         wsObj["send"] = makeNative([](std::vector<Value> args) -> Value {
             if (args.size() < 2) return Value(false);
             std::string clientId = args[0].toString();
             std::string data = args[1].toString();
-            int fd = bantuWsFdFor(clientId);          // snapshot under the lock
-            if (fd < 0) return Value(false);
-            bantuWsSend(fd, data);                    // send with it released
-            return Value(true);
+            int fd = bantuWsFdFor(clientId);
+            if (fd >= 0) { bantuWsSend(fd, data); return Value(true); }
+            if (bantuBus.fd >= 0) {
+                std::string payload;
+                bantu_workers::busPackTarget(payload, clientId, data.data(), data.size());
+                bantuBusPublish(bantu_workers::BUS_TARGET_TEXT, payload.data(), payload.size());
+            }
+            return Value(false);
         });
 
         // sua.ws.broadcast(data) → send to ALL connected clients
+        //
+        // "All" means all workers, not just this one. Local clients are served
+        // directly; the bus carries the message to the other workers, which
+        // deliver to theirs. The return value is the LOCAL count -- the number
+        // reached elsewhere is not knowable synchronously, and inventing a
+        // total would be worse than reporting the part we actually observed.
         wsObj["broadcast"] = makeNative([](std::vector<Value> args) -> Value {
             if (args.empty()) return Value((double)0);
             std::string data = args[0].toString();
             int count = 0;
             for (int fd : bantuWsLiveFds()) { bantuWsSend(fd, data); count++; }
+            bantuBusPublish(bantu_workers::BUS_TEXT, data.data(), data.size());
             return Value((double)count);
         });
 
@@ -7414,9 +7852,15 @@ private:
             std::string clientId = args[0].toString();
             std::vector<uint8_t> data = bantuValueToBytes(args[1]);
             int fd = bantuWsFdFor(clientId);
-            if (fd < 0) return Value(false);
-            bantuWsSendBinary(fd, data);
-            return Value(true);
+            if (fd >= 0) { bantuWsSendBinary(fd, data); return Value(true); }
+            if (bantuBus.fd >= 0) {            // the client may be on another worker
+                std::string payload;
+                bantu_workers::busPackTarget(payload, clientId,
+                                             (const char*)data.data(), data.size());
+                bantuBusPublish(bantu_workers::BUS_TARGET_BINARY,
+                                payload.data(), payload.size());
+            }
+            return Value(false);
         });
 
         // sua.ws.broadcast_binary(byteList) → send binary to ALL clients
@@ -7425,6 +7869,8 @@ private:
             std::vector<uint8_t> data = bantuValueToBytes(args[0]);
             int count = 0;
             for (int fd : bantuWsLiveFds()) { bantuWsSendBinary(fd, data); count++; }
+            bantuBusPublish(bantu_workers::BUS_BINARY,
+                            (const char*)data.data(), data.size());
             return Value((double)count);
         });
 
@@ -7435,14 +7881,27 @@ private:
             std::string clientId = args[0].toString();
             bool isBinary = args.size() > 2 && args[2].numberVal != 0;
             int fd = bantuWsFdFor(clientId);
-            if (fd < 0) return Value(false);
             if (isBinary) {
                 std::vector<uint8_t> data = bantuValueToBytes(args[1]);
-                bantuWsSendBinary(fd, data);
+                if (fd >= 0) { bantuWsSendBinary(fd, data); return Value(true); }
+                if (bantuBus.fd >= 0) {
+                    std::string payload;
+                    bantu_workers::busPackTarget(payload, clientId,
+                                                 (const char*)data.data(), data.size());
+                    bantuBusPublish(bantu_workers::BUS_TARGET_BINARY,
+                                    payload.data(), payload.size());
+                }
             } else {
-                bantuWsSend(fd, args[1].toString());
+                std::string data = args[1].toString();
+                if (fd >= 0) { bantuWsSend(fd, data); return Value(true); }
+                if (bantuBus.fd >= 0) {
+                    std::string payload;
+                    bantu_workers::busPackTarget(payload, clientId, data.data(), data.size());
+                    bantuBusPublish(bantu_workers::BUS_TARGET_TEXT,
+                                    payload.data(), payload.size());
+                }
             }
-            return Value(true);
+            return Value(false);
         });
 
         suaObj["ws"] = Value(std::move(wsObj));
