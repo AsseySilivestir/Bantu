@@ -288,7 +288,7 @@ handler stalls a thread *and* corrupts other requests' scopes.
 | 2 | `event_loop.hpp` + non-blocking rewrite of the three server functions; **Phase 1 locks deleted** | done — see §5.4 |
 | 3 | Security hardening (§9), each item with a test | done — `tests/sua_ws_security_test.sh` 13/13 |
 | 4 | `SO_REUSEPORT` workers; broadcast bus; parallel `sua.http.all` | done — see §12 |
-| 5 | Upstream PR to `AsseySilivestir/Bantu` with reproducer and fix | |
+| 5 | Upstream report to `AsseySilivestir/Bantu` | drafted, **not sent** — [upstream-report.md](upstream-report.md) |
 
 ### Phase 1's lock ordering (while it exists)
 
