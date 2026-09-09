@@ -289,6 +289,8 @@ handler stalls a thread *and* corrupts other requests' scopes.
 | 3 | Security hardening (§9), each item with a test | done — `tests/sua_ws_security_test.sh` 13/13 |
 | 4 | `SO_REUSEPORT` workers; broadcast bus; parallel `sua.http.all` | done — see §12 |
 | 5 | Upstream report to `AsseySilivestir/Bantu` | drafted, **not sent** — [upstream-report.md](upstream-report.md) |
+| 6 | Per-IP caps, cross-worker roster, CI on Linux/Windows | done |
+| 7 | Suspending handlers (no async syntax) | designed, **not started** — [sua-async-design.md](sua-async-design.md) needs one decision |
 
 ### Phase 1's lock ordering (while it exists)
 
@@ -554,8 +556,18 @@ That is not a consolation prize. The heaviest outbound workload sua has is **Web
 which is N independent HTTPS POSTs to N subscribers; sequentially that is N round trips, and it is
 the operation most likely to stall a worker in practice. `sua.http.all` turns it into one.
 
-Coroutine-based handler suspension is recorded as the successor, with its prerequisite named:
-per-coroutine `env_` save/restore in the evaluator.
+Coroutine-based handler suspension is designed in **[sua-async-design.md](sua-async-design.md)**,
+which does the research this section deferred. Three findings worth carrying back here:
+
+- **C++20 coroutines are the wrong tool.** `co_await` is a compile-time transformation that would
+  have to propagate through every one of the thirty-odd `eval*` functions, putting heap-allocated
+  frames on the hot path of arithmetic that never suspends. What is needed is *stackful* suspension.
+- **The state a suspended handler must carry is five fields**, measured rather than assumed, and only
+  two (`env_`, `currentClassName_`) are live in practice. That is smaller than the per-connection
+  `Evaluator` that §4 rejected.
+- **The real obstacle is not mechanism, it is semantics.** Handlers are currently atomic — nothing
+  else runs while one is executing — and suspension breaks that promise for programs already written
+  against it. The recommendation is therefore per-handler opt-in, so nothing existing changes.
 
 ### 12.5 Platform
 
