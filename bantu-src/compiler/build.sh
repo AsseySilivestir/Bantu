@@ -99,6 +99,31 @@ CPP_FLAGS=(
 # Ubuntu, matching what the Dockerfile installs at runtime.
 LINK_LIBS=( -lsqlite3 -l:libcurl.so.4 -lffi -ldl -lpthread )
 
+# ── Optional: libsodium AEAD + argon2id, OFF by default ──────────────────
+# Enable with:  BANTU_SODIUM=1 bash build.sh
+#
+# Kept opt-in so the default binary gains NO new runtime dependency, matching
+# build-mac.sh. Statically linked where the archive is available so the result
+# stays self-contained; the .a lives in a different place on Debian/Ubuntu than
+# it does under Homebrew, so both are probed.
+if [ "${BANTU_SODIUM:-0}" = "1" ]; then
+    SODIUM_HDR=""
+    for d in /usr/include /usr/local/include; do
+        [ -f "$d/sodium.h" ] && SODIUM_HDR="$d" && break
+    done
+    if [ -z "$SODIUM_HDR" ]; then
+        echo "[FAIL] BANTU_SODIUM=1 but sodium.h not found — install libsodium-dev"
+        exit 1
+    fi
+    echo "  libsodium: $SODIUM_HDR"
+    CPP_FLAGS+=( -DBANTU_SODIUM )
+    SODIUM_A=""
+    for d in /usr/lib/x86_64-linux-gnu /usr/lib/aarch64-linux-gnu /usr/lib /usr/local/lib; do
+        [ -f "$d/libsodium.a" ] && SODIUM_A="$d/libsodium.a" && break
+    done
+    if [ -n "$SODIUM_A" ]; then LINK_LIBS+=( "$SODIUM_A" ); else LINK_LIBS+=( -lsodium ); fi
+fi
+
 OBJECTS=()
 for src in "${SOURCES[@]}"; do
     obj="build/$(basename "${src%.cpp}").o"

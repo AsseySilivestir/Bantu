@@ -20,7 +20,7 @@ PORT="${PORT:-39951}"
 TMP="$(mktemp -d)"
 BASE="http://127.0.0.1:$PORT"
 
-cleanup() { [ -n "${SRV:-}" ] && kill "$SRV" 2>/dev/null; rm -rf "$TMP"; }
+cleanup() { [ -n "${SRV:-}" ] && kill "$SRV" 2>/dev/null; [ -n "${CAPSRV:-}" ] && kill "$CAPSRV" 2>/dev/null; rm -rf "$TMP"; }
 trap cleanup EXIT
 
 cat > "$TMP/server.b" <<BEOF
@@ -36,9 +36,20 @@ if ! curl -s -o /dev/null "$BASE/ping" 2>/dev/null; then
     echo "  FAIL  server did not start"; sed 's/^/          /' "$TMP/server.log"; exit 1
 fi
 
-PORT="$PORT" python3 - <<'PY'
+CAPPORT=$((PORT+3))
+cat > "$TMP/cap.b" <<BEOF
+sua.server.limits({"max_connections_per_ip": 5});
+sua.server.get("/ping", def(\$req, \$res) { \$res.json({"ok": true}); });
+sua.server.listen($CAPPORT);
+BEOF
+"$BANTU" run "$TMP/cap.b" > "$TMP/cap.log" 2>&1 &
+CAPSRV=$!
+for _ in $(seq 1 40); do curl -s -o /dev/null "http://127.0.0.1:$CAPPORT/ping" 2>/dev/null && break; sleep 0.2; done
+
+PORT="$PORT" CAPPORT="$CAPPORT" python3 - <<'PY'
 import socket, base64, os, struct, sys, json
 PORT=int(os.environ["PORT"])
+CAPPORT=int(os.environ["CAPPORT"])
 P=F=0
 def check(label, got, want):
     global P,F
@@ -155,6 +166,31 @@ def alive():
     line=c.recv(200).split(b"\r\n")[0].decode(); c.close()
     return line.split(" ")[1]
 check("server survives abrupt disconnects", run(alive), "200")
+
+# ── per-IP connection cap ────────────────────────────────────────────
+# max_connections is process-wide, so before this ONE host could occupy the
+# whole table -- cheap now that a connection costs its buffers rather than a
+# thread. Default is off (a reverse proxy makes every connection share one
+# source address), so this server turns it on explicitly.
+print("\n-- per-IP connection cap --")
+def cap_probe(limit_port):
+    held=[]; rejected=0
+    for _ in range(12):
+        c=socket.socket(); c.settimeout(3); c.connect(("127.0.0.1",limit_port))
+        c.setblocking(False)
+        time.sleep(0.05)
+        try:
+            if b"503" in c.recv(200): rejected+=1; c.close(); continue
+        except BlockingIOError:
+            pass                       # admitted and idle: nothing to read yet
+        held.append(c)
+    n=len(held)
+    for c in held: c.close()
+    return n, rejected
+import time
+held, rejected = run(lambda: cap_probe(CAPPORT))
+check("cap 5: exactly 5 connections admitted", held, 5)
+check("cap 5: the other 7 got 503",            rejected, 7)
 
 print("\n========================================")
 print("  PASS: %d   FAIL: %d" % (P,F))

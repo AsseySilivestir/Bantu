@@ -53,6 +53,7 @@ class H(http.server.BaseHTTPRequestHandler):
 class S(socketserver.ThreadingTCPServer):
     allow_reuse_address=True
     daemon_threads=True
+    request_queue_size=128        # absorb a burst instead of refusing it
 S(("127.0.0.1",PORT),H).serve_forever()
 PY
 BACKEND=$!
@@ -94,7 +95,12 @@ ok(\$rs[0].status == 200, "status is 200");
 
 print("");
 print("-- parallel, not sequential --");
-// 6 x 500ms. Sequential would be ~3000ms; parallel should be ~500-1500ms.
+// Measured RELATIVE to one 500ms request rather than against a fixed
+// millisecond budget: the claim is "six requests cost about what one costs",
+// and an absolute threshold turns machine load into a flaky failure.
+\$b0 = clock();
+sua.http.all([{"url": \$P + "/delay/500"}]);
+\$baseline = clock() - \$b0;
 \$t0 = clock();
 \$rs2 = sua.http.all([
     {"url": \$P + "/delay/500"}, {"url": \$P + "/delay/500"},
@@ -102,9 +108,10 @@ print("-- parallel, not sequential --");
     {"url": \$P + "/delay/500"}, {"url": \$P + "/delay/500"}
 ]);
 \$elapsed = clock() - \$t0;
-print("        6 x 500ms took " + str(\$elapsed) + "ms (sequential would be ~3000ms)");
+print("        1 x 500ms = " + str(\$baseline) + "ms; 6 x 500ms = " + str(\$elapsed)
+      + "ms (sequential would be ~6x)");
 ok(len(\$rs2) == 6, "six responses");
-ok(\$elapsed < 2000, "6 x 500ms finished in under 2000ms");
+ok(\$elapsed < \$baseline * 3, "six requests cost under 3x one request, not 6x");
 
 print("");
 print("-- errors keep their slot --");

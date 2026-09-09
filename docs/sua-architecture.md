@@ -351,11 +351,14 @@ Two correctness bugs fell out of the same work, both of which had been corruptin
 Write backpressure (a 4 MiB per-connection cap, so a client that stops reading cannot make the
 server buffer without bound) and the idle timeout both landed with the loop in Phase 2.
 
-**Still outstanding: per-IP connection caps.** `max_connections` is process-wide, so a single
-address can still occupy the whole table — cheaply, since each connection now costs its buffers
-rather than a thread. Under `sua.server.workers(n)` the cap is also per-worker, making the effective
-process-group limit n x max_connections. Neither is a regression on anything that shipped, but
-neither is finished.
+**Per-IP connection caps** now close the last item: `max_connections_per_ip` bounds how much of the
+table one source address can take. It is **off by default**, and that default is a judgement rather
+than an oversight — behind a reverse proxy every connection shares the proxy's address, so a per-IP
+cap would throttle the entire site at once. It belongs on when the server is directly internet-facing.
+
+Two limits remain inherent rather than open: the cap is **per worker**, so the effective
+process-group limit is n x the value; and it keys on the source address, which under
+`sua.server.workers(n)` also means n separate tables.
 
 ---
 
@@ -501,9 +504,26 @@ counter is per-process, so without this **every worker minted `ws-1`** — and a
 over the bus would have been delivered to a different person's socket on another worker. Single-
 worker mode keeps the original `ws-N` form, so nothing existing changes.
 
-Known limit, recorded rather than hidden: `sua.ws.clients()` enumerates **this worker's** clients.
-A cross-worker roster needs a shared registry with its own consistency questions; it is not in this
-phase.
+`sua.ws.clients()` enumerates **this worker's** clients unless the roster is switched on with
+`sua.server.limits({"ws_roster": true})`. With it, workers publish join/leave deltas on the bus
+(`BUS_ROSTER_ADD` / `DEL`) and each keeps the others' ids, so `clients()` returns the union.
+
+Three details that make it correct rather than merely present:
+
+- **Deltas, not periodic dumps** — one small frame per connect/disconnect, the same order as the
+  traffic that caused it.
+- **A restarted worker asks.** It starts with an empty roster while the others already hold
+  connections, so it broadcasts `BUS_ROSTER_REQ` on startup and everyone replies with a full set.
+  Without this a respawned worker would never learn about existing clients.
+- **The supervisor buries the dead.** A worker that is killed cannot send its own farewell, so the
+  supervisor relays an empty `BUS_ROSTER_FULL` for that index — otherwise its clients would sit in
+  every other worker's roster until the process exited.
+
+It is **off by default because it is not free**: every worker holds every client id, which for 100k
+clients across 8 workers is 800k strings. And it is **eventually consistent** — a client that
+connected microseconds ago elsewhere may not appear yet. That is the honest shape of a roster over
+an asynchronous bus; making it synchronous would mean blocking the loop on every other worker, which
+is exactly the property this architecture exists to avoid.
 
 ### 12.4 `sua.http.*` and curl-multi — what is achievable, and what is not
 

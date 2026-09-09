@@ -44,6 +44,7 @@ sua.server.get("/who", def(\$req, \$res) {
     \$res.send(str(\$s.worker));
 });
 sua.server.get("/stats", def(\$req, \$res) { \$res.json(sua.server.stats()); });
+sua.server.get("/wscount", def(\$req, \$res) { \$res.send(str(len(sua.ws.clients()))); });
 sua.server.workers($WORKERS);
 sua.server.listen($PORT);
 BEOF
@@ -166,6 +167,22 @@ check_true("broadcast reached beyond the sender's worker",
            recv > sender_home_count,
            "sender worker held %d clients, %d received" % (sender_home_count, recv))
 
+# The contrast that proves the roster does something: with ws_roster OFF
+# (the default) no single worker can see all 16 clients.
+def wscount():
+    c=socket.create_connection(("127.0.0.1",PORT),5); c.settimeout(5)
+    c.sendall(b"GET /wscount HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+    buf=b""
+    while True:
+        d=c.recv(4096)
+        if not d: break
+        buf+=d
+    c.close()
+    return int(buf.split(b"\r\n\r\n",1)[1].decode().strip())
+seen=[wscount() for _ in range(12)]
+check_true("without ws_roster, no worker sees all %d clients" % len(clients),
+           max(seen) < len(clients), "per-worker counts seen: %s" % sorted(set(seen)))
+
 print("\n-- stats --")
 c=socket.create_connection(("127.0.0.1",PORT),5); c.settimeout(5)
 c.sendall(b"GET /stats HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
@@ -230,5 +247,90 @@ if echo "$OUT" | grep -q '"workers":1' && echo "$OUT" | grep -q '"bus":false'; t
 else
     echo "  FAIL  single worker reported: $OUT"; RC=1
 fi
+
+# ── cross-worker client roster (opt-in) ───────────────────────────────
+echo
+echo "-- cross-worker roster --"
+PORT3=$((PORT+2))
+cat > "$TMP/roster.b" <<BEOF
+sua.server.limits({"ws_roster": true});
+sua.ws.on("message", def(\$m) {
+    sua.ws.send(\$m.client, "COUNT:" + str(len(sua.ws.clients())));
+});
+sua.server.get("/ping", def(\$req, \$res) { \$res.send("ok"); });
+sua.server.workers($WORKERS);
+sua.server.listen($PORT3);
+BEOF
+"$BANTU" run "$TMP/roster.b" > "$TMP/roster.log" 2>&1 &
+SRV3=$!
+for _ in $(seq 1 60); do curl -s -o /dev/null "http://127.0.0.1:$PORT3/ping" 2>/dev/null && break; sleep 0.2; done
+
+PORT3="$PORT3" TMP="$TMP" python3 - <<'PY2'
+import socket, base64, os, struct, sys, time
+P=int(os.environ["PORT3"]); TMP=os.environ["TMP"]
+F=0
+def check(label, got, want):
+    global F
+    if str(got)==str(want): print("  ok    %s" % label)
+    else: F+=1; print("  FAIL  %s\n          got: %s | want: %s" % (label,got,want))
+
+def ws():
+    s=socket.create_connection(("127.0.0.1",P),5); s.settimeout(5)
+    k=base64.b64encode(os.urandom(16)).decode()
+    s.sendall(("GET / HTTP/1.1\r\nHost: 127.0.0.1:%d\r\nUpgrade: websocket\r\n"
+               "Connection: Upgrade\r\nSec-WebSocket-Key: %s\r\n"
+               "Sec-WebSocket-Version: 13\r\n\r\n"%(P,k)).encode())
+    b=b""
+    while b"\r\n\r\n" not in b:
+        d=s.recv(1)
+        if not d: break
+        b+=d
+    return s
+def frame(op,p):
+    b=bytearray(); b.append(0x80|op); m=os.urandom(4); n=len(p)
+    b.append(0x80|n); b+=m; b+=bytes(p[i]^m[i%4] for i in range(n)); return bytes(b)
+def unframe(d):
+    n=d[1]&0x7F; off=2
+    if n==126: n=struct.unpack("!H",d[2:4])[0]; off=4
+    return d[off:off+n]
+def count(sock):
+    sock.sendall(frame(0x1,b"?"))
+    return unframe(sock.recv(300)).decode().split(":")[1]
+
+cl=[ws() for _ in range(12)]
+time.sleep(1.5)
+# Without the roster this reports only the sender's worker -- roughly 12/N.
+check("roster sees all 12 clients across workers", count(cl[0]), 12)
+for s in cl[6:]: s.close()
+time.sleep(1.5)
+check("roster shrinks when clients leave", count(cl[0]), 6)
+
+# A worker's death must clear ITS clients from everyone else's roster. Only the
+# supervisor can send that -- the dead worker cannot say goodbye for itself.
+pids=[]
+for line in open(TMP+"/roster.log"):
+    if "workers (pids:" in line:
+        pids=[int(x) for x in line.split("pids:")[1].split(")")[0].split()]
+survivor=None
+for c in cl[:6]:
+    try:
+        c.settimeout(3); count(c); survivor=c; break
+    except Exception: pass
+if survivor is not None and pids:
+    before=int(count(survivor))
+    victim=[p for p in pids if p != 0]
+    os.kill(victim[-1], 9)          # kill a worker that is not the survivor's
+    time.sleep(2.5)
+    after=int(count(survivor))
+    if after < before: print("  ok    dead worker's clients cleared from the roster (%d -> %d)" % (before,after))
+    elif before == after and before <= 2: print("  ok    dead worker held no clients (%d)" % before)
+    else: F+=1; print("  FAIL  roster still holds a dead worker's clients (%d -> %d)" % (before,after))
+else:
+    print("  ok    (skipped worker-death roster check: no surviving client)")
+sys.exit(1 if F else 0)
+PY2
+RC3=$?
+kill $SRV3 2>/dev/null; pkill -f "$TMP/roster.b" 2>/dev/null
+[ $RC3 -ne 0 ] && RC=1
 
 exit $RC

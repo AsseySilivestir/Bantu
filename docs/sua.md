@@ -472,7 +472,7 @@ shared state belongs in a database, not a global. `workers(1)` (the default) is 
 
 `sua.ws.broadcast` **does** cross workers: a broadcast reaches every client on every worker, not just
 the ones that happen to share your process. `sua.ws.send(id, …)` likewise finds a client on another
-worker. `sua.ws.clients()` lists only **this worker's** clients.
+worker. `sua.ws.clients()` lists only **this worker's** clients unless you enable `ws_roster` below.
 
 Multi-worker mode is POSIX-only; on Windows it logs a notice and runs single-worker.
 
@@ -481,10 +481,44 @@ Multi-worker mode is POSIX-only; on Windows it logs a notice and runs single-wor
 ```bantu
 sua.server.limits({"max_connections": 50000, "idle_timeout_ms": 120000});
 $s = sua.server.stats();   // workers, worker, live_connections, ws_clients,
-                           // bus, bus_sent, bus_received, bus_dropped
+                           // bus, bus_sent, bus_received, bus_dropped,
+                           // rejected_per_ip, distinct_ips
 ```
 
 `bus_dropped` above zero means broadcasts were shed to protect memory — the bus is saturated.
+
+### Per-IP connection cap
+
+`max_connections` is process-wide, so one host can occupy the whole table. `max_connections_per_ip`
+stops that:
+
+```bantu
+sua.server.limits({"max_connections_per_ip": 64});
+```
+
+**It is off by default, deliberately.** Behind a reverse proxy — nginx, Cloudflare, a load balancer —
+*every* connection arrives from the proxy's address, so any per-IP cap would throttle your whole site
+at once. Turn it on when the server is directly internet-facing; leave it off behind a proxy and cap
+there instead.
+
+Rejected connections get `503` and are counted in `stats().rejected_per_ip`. Under
+`sua.server.workers(n)` the cap is per worker, so the effective process-group limit is n × the value.
+
+### Cross-worker client roster
+
+`sua.ws.clients()` lists this worker's clients. To see every worker's:
+
+```bantu
+sua.server.limits({"ws_roster": true});
+```
+
+Workers then publish joins and leaves on the bus and each keeps the others' ids. It is **off by
+default because it is not free**: one bus frame per connect/disconnect, and every worker holds every
+client id — for 100k clients across 8 workers, 800k strings.
+
+The roster is **eventually consistent**. A client that connected microseconds ago on another worker
+may not appear yet, so treat the list as a snapshot rather than something to synchronise on. When a
+worker dies the supervisor clears its entries from the others.
 
 ---
 

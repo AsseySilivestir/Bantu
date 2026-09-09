@@ -175,6 +175,12 @@ struct BantuServerLimits {
     size_t maxHeaderBytes   = 64 * 1024;        // request header block
     size_t maxBodyBytes     = 8 * 1024 * 1024;  // request body
     int    maxConnections   = 10000;            // concurrent, process-wide
+    // Per-source-address cap. DEFAULT OFF, deliberately: behind a reverse proxy
+    // (nginx, Cloudflare, a load balancer) EVERY connection arrives from the
+    // proxy's address, so any per-IP cap would throttle the whole site at once.
+    // Turn it on when the server is directly internet-facing -- there it is the
+    // difference between one host exhausting max_connections and not.
+    int    maxConnectionsPerIp = 0;             // 0 = unlimited
     int    headerTimeoutMs  = 10000;            // slowloris defence
     int    idleTimeoutMs    = 300000;           // reap dead peers
     size_t maxWsFrameBytes  = 1024 * 1024;      // single WebSocket frame
@@ -198,6 +204,8 @@ static bool bantuQuietMode = false;
 // threads that made it necessary.
 struct BantuConn {
     int         fd = -1;
+    uint32_t    peerIp = 0;      // network byte order; 0 when not counted
+    bool        countedIp = false;
     bool        isWs = false;
     std::string in;              // bytes read, not yet consumed
     std::string out;             // bytes to write, not yet sent
@@ -276,6 +284,11 @@ static void bantuConnClose(int fd) {
 // the loop drops the connection.
 static std::atomic<int> bantuLiveConnections{0};
 
+// Connections currently open per source address, for maxConnectionsPerIp.
+// Only populated while the cap is on, so it costs nothing when it is off.
+static std::unordered_map<uint32_t, int> bantuIpConns;
+static uint64_t bantuRejectedPerIp = 0;
+
 // ─── Cross-worker broadcast bus ────────────────────────────────────────────
 // With SO_REUSEPORT workers a WebSocket client is connected to exactly ONE
 // worker, so sua.ws.broadcast would otherwise reach a fraction of the room.
@@ -296,6 +309,15 @@ static int       bantuWorkerCount = 1;    // 1 == single process, no bus
 static uint64_t  bantuBusSent = 0;
 static uint64_t  bantuBusReceived = 0;
 static uint64_t  bantuBusDropped = 0;     // over the buffer cap, or too large
+
+// Cross-worker client roster. OPT-IN, because it costs one bus frame per
+// connect/disconnect and holds every worker's client ids in every worker --
+// for 100k clients across 8 workers that is 800k strings. Off, sua.ws.clients()
+// reports only this worker's clients, which is what it has always done.
+// Keyed by owning worker so a whole worker's set can be replaced or dropped in
+// one step (the supervisor clears it when that worker dies).
+static bool bantuWsRoster = false;
+static std::unordered_map<int, std::set<std::string>> bantuRemoteRoster;
 
 static void bantuBusSyncInterest() {
     if (bantuBus.fd < 0 || !bantuLoopBackend) return;
@@ -783,6 +805,28 @@ static void bantuWsSendBinary(int fd, const std::vector<uint8_t>& data) {
     bantuConnWriteN(fd, (const char*)frame.data(), frame.size());
 }
 
+// Announce a local client's arrival or departure to the other workers.
+// No-ops unless the roster is switched on and a bus exists.
+static void bantuRosterPublish(uint8_t type, const std::string& id) {
+    if (!bantuWsRoster || bantuBus.fd < 0) return;
+    std::string payload(1, (char)(uint8_t)bantuWorkerIndex);
+    payload += id;
+    bantuBusPublish(type, payload.data(), payload.size());
+}
+
+// Everything this worker currently holds, as one BUS_ROSTER_FULL payload.
+static std::string bantuRosterSnapshot() {
+    std::string payload(1, (char)(uint8_t)bantuWorkerIndex);
+    bool first = true;
+    for (const auto& kv : bantuWsTable()) {
+        if (kv.second.fd < 0) continue;
+        if (!first) payload += "\n";
+        payload += kv.second.id;
+        first = false;
+    }
+    return payload;
+}
+
 // Deliver a frame that arrived from another worker to THIS worker's clients.
 // Frames from the bus are already-decided sends: the originating worker made
 // the routing decision, so no Bantu handler runs here.
@@ -809,6 +853,41 @@ static void bantuBusDeliver(uint8_t type, const std::string& payload) {
             if (!bantu_workers::busUnpackTarget(payload, id, data)) break;
             int fd = bantuWsFdFor(id);
             if (fd >= 0) bantuWsSendBinary(fd, std::vector<uint8_t>(data.begin(), data.end()));
+            break;
+        }
+        case bantu_workers::BUS_ROSTER_ADD: {
+            if (payload.empty()) break;
+            bantuRemoteRoster[(int)(uint8_t)payload[0]].insert(payload.substr(1));
+            break;
+        }
+        case bantu_workers::BUS_ROSTER_DEL: {
+            if (payload.empty()) break;
+            bantuRemoteRoster[(int)(uint8_t)payload[0]].erase(payload.substr(1));
+            break;
+        }
+        case bantu_workers::BUS_ROSTER_REQ: {
+            // A worker (usually one the supervisor just restarted) is asking
+            // everyone to reintroduce themselves.
+            if (!bantuWsRoster) break;
+            std::string snap = bantuRosterSnapshot();
+            bantuBusPublish(bantu_workers::BUS_ROSTER_FULL, snap.data(), snap.size());
+            break;
+        }
+        case bantu_workers::BUS_ROSTER_FULL: {
+            // Replaces that worker's set outright -- including the empty one
+            // the supervisor sends when a worker dies.
+            if (payload.empty()) break;
+            int w = (int)(uint8_t)payload[0];
+            std::set<std::string> ids;
+            std::string rest = payload.substr(1);
+            size_t start = 0;
+            while (start < rest.size()) {
+                size_t nl = rest.find('\n', start);
+                if (nl == std::string::npos) { ids.insert(rest.substr(start)); break; }
+                ids.insert(rest.substr(start, nl - start));
+                start = nl + 1;
+            }
+            bantuRemoteRoster[w] = std::move(ids);
             break;
         }
         default: break;                          // unknown type: ignore, stay compatible
@@ -894,6 +973,8 @@ static void bantuWsUpgrade(int sock, const std::string& wsKey) {
 
     auto it = bantuConns.find(sock);
     if (it != bantuConns.end()) { it->second.isWs = true; it->second.wsId = wsId; }
+
+    bantuRosterPublish(bantu_workers::BUS_ROSTER_ADD, client.id);
 
     if (!bantuQuietMode)
         std::cout << "  [WS] Client connected: " << client.id << " (fd=" << sock << ")\n";
@@ -1049,6 +1130,7 @@ static void bantuWsTeardown(int wsId) {
         }
     }
     bantuWsTable().erase(wsId);
+    bantuRosterPublish(bantu_workers::BUS_ROSTER_DEL, id);
 }
 
 // Helper: parse "host:port" → (host, port). Supports IPv6 brackets [::1]:53.
@@ -3205,7 +3287,17 @@ private:
         auto backend = bantu_loop::makeBackend();
         bantuLoopBackend = backend.get();
         backend->add(sock, true, false);
-        if (bantuBus.fd >= 0) backend->add(bantuBus.fd, true, false);
+        if (bantuBus.fd >= 0) {
+            backend->add(bantuBus.fd, true, false);
+            // Ask the other workers to reintroduce their clients. Matters most
+            // for a worker the supervisor just RESTARTED: it starts with an
+            // empty roster while the others are already holding connections,
+            // and without this it would never learn about them.
+            if (bantuWsRoster) {
+                std::string me(1, (char)(uint8_t)bantuWorkerIndex);
+                bantuBusPublish(bantu_workers::BUS_ROSTER_REQ, me.data(), me.size());
+            }
+        }
 
         // One line per worker would be N identical lines; only worker 0 speaks.
         if (bantuWorkerIndex == 0) {
@@ -3231,6 +3323,14 @@ private:
             auto it = bantuConns.find(fd);
             if (it == bantuConns.end()) return;
             if (it->second.isWs) bantuWsTeardown(it->second.wsId);
+            // Release the per-IP slot. Keyed on the flag rather than on the
+            // current limit, so turning the cap off at runtime cannot strand
+            // counts for connections that were admitted while it was on.
+            if (it->second.countedIp) {
+                auto ipIt = bantuIpConns.find(it->second.peerIp);
+                if (ipIt != bantuIpConns.end() && --ipIt->second <= 0)
+                    bantuIpConns.erase(ipIt);
+            }
             backend->del(fd);
             bantuConns.erase(it);
             CLOSE_SOCKET(fd);
@@ -3301,19 +3401,43 @@ private:
                         int cfd = (int)accept(sock, (struct sockaddr*)&ca, &cl);
                         if (cfd < 0) break;
 
+                        static const char* busy =
+                            "HTTP/1.1 503 Service Unavailable\r\n"
+                            "Content-Length: 0\r\nConnection: close\r\n"
+                            "Retry-After: 1\r\n\r\n";
+
                         if (bantuLiveConnections.load() >= bantuLimits.maxConnections) {
-                            static const char* busy =
-                                "HTTP/1.1 503 Service Unavailable\r\n"
-                                "Content-Length: 0\r\nConnection: close\r\n"
-                                "Retry-After: 1\r\n\r\n";
                             send(cfd, busy, (int)strlen(busy), 0);
                             CLOSE_SOCKET(cfd);
                             continue;
                         }
+
+                        // Per-source cap: one host must not be able to take the
+                        // whole table. Cheap to try now that a connection costs
+                        // its buffers instead of a thread, which is exactly why
+                        // this became worth enforcing.
+                        uint32_t peerIp = (uint32_t)ca.sin_addr.s_addr;
+                        bool countIp = bantuLimits.maxConnectionsPerIp > 0;
+                        if (countIp) {
+                            auto found = bantuIpConns.find(peerIp);
+                            int held = (found == bantuIpConns.end()) ? 0 : found->second;
+                            if (held >= bantuLimits.maxConnectionsPerIp) {
+                                bantuRejectedPerIp++;
+                                send(cfd, busy, (int)strlen(busy), 0);
+                                CLOSE_SOCKET(cfd);
+                                continue;
+                            }
+                        }
+
                         bantu_loop::setNonBlocking(cfd);
                         BantuConn c;
                         c.fd = cfd;
                         c.lastActive = now;
+                        if (countIp) {
+                            c.peerIp = peerIp;
+                            c.countedIp = true;
+                            bantuIpConns[peerIp]++;
+                        }
                         bantuConns[cfd] = std::move(c);
                         backend->add(cfd, true, false);
                         bantuLiveConnections++;
@@ -5929,6 +6053,9 @@ private:
             // Non-zero means broadcasts were shed to protect memory -- a real
             // signal that the bus is saturated, not a cosmetic counter.
             out["bus_dropped"]      = Value((double)bantuBusDropped);
+            // Non-zero means the per-IP cap actually turned traffic away.
+            out["rejected_per_ip"]  = Value((double)bantuRejectedPerIp);
+            out["distinct_ips"]     = Value((double)bantuIpConns.size());
             return Value(std::move(out));
         });
 
@@ -5951,12 +6078,15 @@ private:
                 num("max_header_bytes",     bantuLimits.maxHeaderBytes);
                 num("max_body_bytes",       bantuLimits.maxBodyBytes);
                 num("max_connections",      bantuLimits.maxConnections);
+                num("max_connections_per_ip", bantuLimits.maxConnectionsPerIp);
                 num("header_timeout_ms",    bantuLimits.headerTimeoutMs);
                 num("idle_timeout_ms",      bantuLimits.idleTimeoutMs);
                 num("max_ws_frame_bytes",   bantuLimits.maxWsFrameBytes);
                 num("max_ws_message_bytes", bantuLimits.maxWsMessageBytes);
                 auto co = o.find("ws_check_origin");
                 if (co != o.end()) bantuLimits.wsCheckOrigin = co->second.isTruthy();
+                auto wr = o.find("ws_roster");
+                if (wr != o.end()) bantuWsRoster = wr->second.isTruthy();
                 auto ao = o.find("ws_allowed_origins");
                 if (ao != o.end() && ao->second.isList()) {
                     bantuLimits.wsAllowedOrigins.clear();
@@ -5968,11 +6098,13 @@ private:
             out["max_header_bytes"]     = Value((double)bantuLimits.maxHeaderBytes);
             out["max_body_bytes"]       = Value((double)bantuLimits.maxBodyBytes);
             out["max_connections"]      = Value((double)bantuLimits.maxConnections);
+            out["max_connections_per_ip"] = Value((double)bantuLimits.maxConnectionsPerIp);
             out["header_timeout_ms"]    = Value((double)bantuLimits.headerTimeoutMs);
             out["idle_timeout_ms"]      = Value((double)bantuLimits.idleTimeoutMs);
             out["max_ws_frame_bytes"]   = Value((double)bantuLimits.maxWsFrameBytes);
             out["max_ws_message_bytes"] = Value((double)bantuLimits.maxWsMessageBytes);
             out["ws_check_origin"]      = Value(bantuLimits.wsCheckOrigin);
+            out["ws_roster"]            = Value(bantuWsRoster);
             std::vector<Value> origins;
             for (const auto& a : bantuLimits.wsAllowedOrigins) origins.push_back(Value(a));
             out["ws_allowed_origins"]   = Value(std::move(origins));
@@ -7903,9 +8035,19 @@ private:
         });
 
         // sua.ws.clients() → list of connected client IDs
+        //
+        // This worker's clients by default. With sua.server.limits({"ws_roster":
+        // true}) it also includes clients held by the other workers, learned
+        // from join/leave frames on the bus. That roster is EVENTUALLY
+        // consistent: a client that connected microseconds ago on another
+        // worker may not appear yet. Treat the list as a snapshot, not a lock.
         wsObj["clients"] = makeNative([](std::vector<Value> args) -> Value {
             std::vector<Value> out;
             for (const auto& id : bantuWsLiveIds()) out.push_back(Value(id));
+            if (bantuWsRoster) {
+                for (const auto& kv : bantuRemoteRoster)
+                    for (const auto& id : kv.second) out.push_back(Value(id));
+            }
             return Value(std::move(out));
         });
 

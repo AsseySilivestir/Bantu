@@ -55,6 +55,15 @@ enum BusType : uint8_t {
     BUS_BINARY          = 2,   // payload: message bytes
     BUS_TARGET_TEXT     = 3,   // payload: [u16 idLen BE][client id][data]
     BUS_TARGET_BINARY   = 4,   // payload: [u16 idLen BE][client id][data]
+
+    // ── client roster (opt-in; see sua.server.limits({"ws_roster": true})) ──
+    // Every roster frame opens with [u8 worker index], so a receiver can keep
+    // each worker's set separately and replace it wholesale without having to
+    // reason about which entries came from where.
+    BUS_ROSTER_ADD      = 5,   // payload: [u8 worker][client id]
+    BUS_ROSTER_DEL      = 6,   // payload: [u8 worker][client id]
+    BUS_ROSTER_REQ      = 7,   // payload: [u8 worker]  -- "send me your list"
+    BUS_ROSTER_FULL     = 8,   // payload: [u8 worker][ids joined by \n]
 };
 
 // Largest frame the relay will carry. A broadcast bigger than this is dropped
@@ -355,6 +364,20 @@ inline bool start(int n, Ctx& out) {
                 if (slots[i].pid != gone) continue;
                 dropSlot(slots[i]);
                 slots[i].pid = -1;
+
+                // Tell the survivors that this worker's clients are gone. Only
+                // the supervisor can: the dead worker cannot send its own
+                // farewell, and without this its ids would sit in every other
+                // worker's roster until the process exited.
+                {
+                    std::string payload(1, (char)(uint8_t)i);
+                    std::string frame;
+                    busEncode(frame, BUS_ROSTER_FULL, payload.data(), payload.size());
+                    for (size_t j = 0; j < slots.size(); j++)
+                        if (j != i && slots[j].fd >= 0) relayTo(slots[j], frame);
+                    for (auto& o : slots) if (o.fd >= 0) flush(o);
+                }
+
                 if (gStopping) break;
                 std::fprintf(stderr, "  [SERVER] worker %zu (pid %d) exited (%s %d); restarting\n",
                              i, (int)gone,
