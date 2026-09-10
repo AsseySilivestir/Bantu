@@ -32,6 +32,7 @@
 //  See docs/sua-architecture.md for the full rationale.
 // ════════════════════════════════════════════════════════════════════════════
 
+#include "platform_compat.hpp"
 #include <algorithm>
 #include <chrono>
 #include <cstdint>

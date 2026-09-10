@@ -4,6 +4,7 @@
  * High-performance C++ interpreter with native types
  */
 
+#include "platform_compat.hpp"
 #include <string>
 #include <variant>
 #include <memory>

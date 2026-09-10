@@ -264,7 +264,8 @@ PORT3=$((PORT+2))
 cat > "$TMP/roster.b" <<BEOF
 sua.server.limits({"ws_roster": true});
 sua.ws.on("message", def(\$m) {
-    sua.ws.send(\$m.client, "COUNT:" + str(len(sua.ws.clients())));
+    sua.ws.send(\$m.client, "W:" + str(sua.server.stats().worker)
+                            + ":" + str(len(sua.ws.clients())));
 });
 sua.server.get("/ping", def(\$req, \$res) { \$res.send("ok"); });
 sua.server.workers($WORKERS);
@@ -302,9 +303,13 @@ def unframe(d):
     n=d[1]&0x7F; off=2
     if n==126: n=struct.unpack("!H",d[2:4])[0]; off=4
     return d[off:off+n]
-def count(sock):
+def ask(sock):
+    """-> (worker index that answered, roster size it sees)"""
     sock.sendall(frame(0x1,b"?"))
-    return unframe(sock.recv(300)).decode().split(":")[1]
+    parts=unframe(sock.recv(300)).decode().split(":")
+    return int(parts[1]), int(parts[2])
+def count(sock):
+    return ask(sock)[1]
 
 cl=[ws() for _ in range(12)]
 time.sleep(1.5)
@@ -316,26 +321,47 @@ check("roster shrinks when clients leave", count(cl[0]), 6)
 
 # A worker's death must clear ITS clients from everyone else's roster. Only the
 # supervisor can send that -- the dead worker cannot say goodbye for itself.
+#
+# The victim has to be chosen, not guessed. An earlier version killed the last
+# worker and asserted the count dropped; that only passed because macOS's
+# shared listener piles clients onto one worker, so the victim happened to hold
+# five of six. On Linux SO_REUSEPORT spreads them evenly and the victim can
+# legitimately hold none, making "the count dropped" a coin flip. So: ask every
+# client which worker it is on, kill one that actually holds clients and is not
+# the observer's, and assert the EXACT expected drop.
 pids=[]
 for line in open(TMP+"/roster.log"):
     if "workers (pids:" in line:
         pids=[int(x) for x in line.split("pids:")[1].split(")")[0].split()]
-survivor=None
-for c in cl[:6]:
+
+alive=cl[:6]
+homes={}
+for c in alive:
     try:
-        c.settimeout(3); count(c); survivor=c; break
+        c.settimeout(3)
+        w,_=ask(c)
+        homes.setdefault(w,[]).append(c)
     except Exception: pass
-if survivor is not None and pids:
-    before=int(count(survivor))
-    victim=[p for p in pids if p != 0]
-    os.kill(victim[-1], 9)          # kill a worker that is not the survivor's
-    time.sleep(2.5)
-    after=int(count(survivor))
-    if after < before: print("  ok    dead worker's clients cleared from the roster (%d -> %d)" % (before,after))
-    elif before == after and before <= 2: print("  ok    dead worker held no clients (%d)" % before)
-    else: F+=1; print("  FAIL  roster still holds a dead worker's clients (%d -> %d)" % (before,after))
+
+observer=None; victim_w=None
+for w, members in homes.items():
+    others=[x for x in homes if x != w and homes[x]]
+    if others:
+        observer=members[0]; victim_w=others[0]; break
+
+if observer is not None and victim_w is not None and victim_w < len(pids):
+    before=count(observer)
+    expected_drop=len(homes[victim_w])
+    os.kill(pids[victim_w], 9)
+    time.sleep(3.0)
+    after=count(observer)
+    check("killing worker %d (holding %d) drops the roster by exactly that"
+          % (victim_w, expected_drop), before-after, expected_drop)
 else:
-    print("  ok    (skipped worker-death roster check: no surviving client)")
+    # Everything landed on one worker: the bus was never exercised, so this
+    # assertion has nothing to say. Say so rather than passing silently.
+    print("  ok    (skipped: all clients on one worker, homes=%s)"
+          % {k: len(v) for k,v in homes.items()})
 sys.exit(1 if F else 0)
 PY2
 RC3=$?

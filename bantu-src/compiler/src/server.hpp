@@ -18,6 +18,7 @@
  *   [Client] <---> [WebSocket] --> Real-time channel messaging
  */
 
+#include "platform_compat.hpp"
 #include "types.hpp"
 #include <iostream>
 #include <string>
@@ -69,26 +70,32 @@ namespace stun {
     constexpr uint16_t ATTR_MESSAGE_INTEGRITY= 0x0008;
 
     // STUN header: 20 bytes
+    BANTU_PACKED_BEGIN
     struct StunHeader {
         uint16_t type;
         uint16_t length;
         uint32_t cookie;
         uint8_t  transactionId[12];
-    } __attribute__((packed));
+    } BANTU_PACKED;
+    BANTU_PACKED_END
 
     // STUN attribute header: 4 bytes
+    BANTU_PACKED_BEGIN
     struct StunAttrHeader {
         uint16_t type;
         uint16_t length;
-    } __attribute__((packed));
+    } BANTU_PACKED;
+    BANTU_PACKED_END
 
     // XOR-MAPPED-ADDRESS (IPv4)
+    BANTU_PACKED_BEGIN
     struct StunXorMappedAddr {
         uint8_t  reserved;
         uint8_t  family;    // 0x01 = IPv4
         uint16_t port;
         uint32_t address;
-    } __attribute__((packed));
+    } BANTU_PACKED;
+    BANTU_PACKED_END
 }
 
 // ============================================================

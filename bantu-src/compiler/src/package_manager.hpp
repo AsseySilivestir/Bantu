@@ -32,6 +32,7 @@
 // ════════════════════════════════════════════════════════════════════
 #pragma once
 
+#include "platform_compat.hpp"
 #include <iostream>
 #include <fstream>
 #include <sstream>
