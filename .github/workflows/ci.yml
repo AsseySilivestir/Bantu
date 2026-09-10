@@ -185,11 +185,32 @@ jobs:
       - name: Configure + build
         shell: bash
         run: |
-          cmake -S bantu-src/compiler -B build \
+          # MSVC compile errors do not produce annotations on their own, and job
+          # logs need authentication to download -- so surface them by hand,
+          # exactly as the test suites do. Without this a red Windows build is
+          # undiagnosable from the API.
+          set +e
+          out=$(cmake -S bantu-src/compiler -B build \
             -DCMAKE_TOOLCHAIN_FILE="$VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" \
             -DVCPKG_TARGET_TRIPLET=x64-windows-static \
-            -DCMAKE_BUILD_TYPE=Release
-          cmake --build build --config Release
+            -DCMAKE_BUILD_TYPE=Release 2>&1)
+          rc=$?
+          echo "$out"
+          if [ $rc -ne 0 ]; then
+            echo "$out" | grep -iE 'cmake error|could not find|error' | head -20 | while read -r l; do
+              echo "::error::configure: $l"
+            done
+            exit 1
+          fi
+          out=$(cmake --build build --config Release 2>&1)
+          rc=$?
+          echo "$out"
+          if [ $rc -ne 0 ]; then
+            echo "$out" | grep -iE 'error [A-Z]+[0-9]+|error:|unresolved external' | head -25 | while read -r l; do
+              echo "::error::build: $l"
+            done
+            exit 1
+          fi
       - name: Smoke test
         shell: bash
         run: |
