@@ -20,6 +20,18 @@
 #
 #  Run:  bash tests/sua_concurrency_test.sh
 #        BANTU=./bantu-src/compiler/build/bantu bash tests/sua_concurrency_test.sh
+#
+#  KNOWN INTERMITTENT, recorded rather than papered over: this suite failed
+#  once in roughly eight runs when executed immediately after the whole rest of
+#  the test batch, and passed every time in isolation. It was NOT reproducible
+#  in eight further attempts. Ruled out: leftover server processes (zero after
+#  the workers suite) and ephemeral port exhaustion (TIME_WAIT peaked at 529
+#  against a 16,384-port range). Cause still unknown.
+#
+#  Deliberately NOT retried in CI and NOT loosened: this suite is the gate on a
+#  data race that was real and silent, so an intermittent failure here is
+#  exactly the signal that must not be hidden. ci.yml echoes each failing
+#  assertion as an annotation, so the next occurrence will name itself.
 #        CONC=200 bash tests/sua_concurrency_test.sh
 # ════════════════════════════════════════════════════════════════════════
 set -u

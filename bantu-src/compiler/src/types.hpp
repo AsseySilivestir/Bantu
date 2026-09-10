@@ -9,6 +9,8 @@
 #include <memory>
 #include <vector>
 #include <unordered_map>
+#include <stdexcept>
+#include "ordered_map.hpp"
 #include <functional>
 #include <iostream>
 #include <sstream>
@@ -44,7 +46,11 @@ class Value;
 //   is specifically designed to allow incomplete T (used in pimpl patterns),
 //   so the member declaration compiles even while Value is incomplete.
 //   The map is only instantiated lazily, by which time Value is complete.
-using ObjectMap = std::unordered_map<std::string, Value>;
+// Insertion-ordered, and therefore the SAME order on every platform. It used
+// to be std::unordered_map, which iterated in hash order -- different between
+// libc++ and libstdc++, so json.stringify() key order, CSV column order and
+// arctic DataFrame columns all silently depended on the OS. See ordered_map.hpp.
+using ObjectMap = BantuOrderedMap<Value>;
 using NativeFn = std::function<Value(std::vector<Value>)>;
 
 class Value {
