@@ -20,17 +20,20 @@ sua.server.listen(3000);
 ## Routing
 
 ```bantu
-sua.server.get(path, handler)
-sua.server.post(path, handler)
-sua.server.put(path, handler)
-sua.server.delete(path, handler)
-sua.server.patch(path, handler)
-sua.server.head(path, handler)
-sua.server.options(path, handler)     // path defaults to "*"
-sua.server.all(path, handler)         // GET, POST, PUT, DELETE, PATCH
-sua.server.routes()                   // -> [{method, path}, ...]
-sua.server.listen(port)               // blocks forever
+sua.server.get(path, handler, options?)
+sua.server.post(path, handler, options?)
+sua.server.put(path, handler, options?)
+sua.server.delete(path, handler, options?)
+sua.server.patch(path, handler, options?)
+sua.server.head(path, handler, options?)
+sua.server.options(path, handler, options?)   // path defaults to "*"
+sua.server.all(path, handler, options?)       // GET, POST, PUT, DELETE, PATCH
+sua.server.routes()                           // -> [{method, path}, ...]
+sua.server.listen(port)                       // blocks forever
 ```
+
+The optional third argument currently understands one key, `{"suspend": true}` — see
+[Suspending handlers](#suspending-handlers). Unknown keys are ignored.
 
 A handler takes `($req, $res)`. Matching runs in three passes, first match wins:
 
@@ -482,7 +485,8 @@ Multi-worker mode is POSIX-only; on Windows it logs a notice and runs single-wor
 sua.server.limits({"max_connections": 50000, "idle_timeout_ms": 120000});
 $s = sua.server.stats();   // workers, worker, live_connections, ws_clients,
                            // bus, bus_sent, bus_received, bus_dropped,
-                           // rejected_per_ip, distinct_ips
+                           // rejected_per_ip, distinct_ips,
+                           // suspended, max_suspended, suspensions
 ```
 
 `bus_dropped` above zero means broadcasts were shed to protect memory — the bus is saturated.
@@ -520,6 +524,70 @@ The roster is **eventually consistent**. A client that connected microseconds ag
 may not appear yet, so treat the list as a snapshot rather than something to synchronise on. When a
 worker dies the supervisor clears its entries from the others.
 
+### Suspending handlers
+
+A worker is one event loop on one thread, so a handler that waits on something makes every other
+connection on that worker wait too. Mark a route `{"suspend": true}` and it hands the worker back
+while it waits:
+
+```bantu
+sua.server.get("/proxy", def($req, $res) {
+    $r = sua.http.get("https://slow.example/thing");   // suspends the handler,
+    $res.json($r);                                     // not the worker
+}, {"suspend": true});
+```
+
+No new syntax — no `async`, no `await`, no callbacks. The handler is the same handler; it just stops
+holding the loop. Measured: ten handlers each waiting 300 ms complete in **310 ms** rather than 3 s,
+and a fast request is served in **1 ms** while a 1.2 s handler is in flight.
+
+Three calls suspend: `sleep()`, `sua.http.*`, and `sua.http.all`. Everything else runs as it always
+has.
+
+#### Read this before turning it on
+
+**A suspended handler is not atomic.** Today a handler runs start to finish with no other Bantu code
+interleaved, and programs are written against that whether or not their authors realised it.
+Suspension breaks it:
+
+```bantu
+$stock = 1;
+sua.server.post("/buy", def($req, $res) {
+    if ($stock > 0) {
+        sua.http.post("https://payments/charge", $body);   // suspends HERE
+        $stock = $stock - 1;                               // another buyer already passed the check
+        $res.json({"ok": true});
+    }
+}, {"suspend": true});
+```
+
+Two buyers both pass `$stock > 0`, both are charged, stock goes to `-1`. This is a **logical** race,
+not a memory one: no tool finds it and it appears only under concurrency. It is the ordinary cost of
+cooperative multitasking — Node, asyncio and Go all live with it — but sua did not have it before,
+which is exactly why this is **per route** and not a global switch. An unmarked handler is still
+atomic, and always will be.
+
+The rule: a marked handler must not read shared state, suspend, and then act on what it read. Re-read
+it after the suspension, or keep the state in the database and let SQL do the check.
+
+#### Cost and limits
+
+A suspended handler is one OS thread; a connection whose handler is *not* suspended costs nothing
+extra. So the thread count tracks concurrent outbound I/O — tens — not connections.
+
+```bantu
+sua.server.limits({"max_suspended_handlers": 256});   // default 256; set before listen()
+$s = sua.server.stats();   // ... suspended, max_suspended, suspensions
+```
+
+Over the cap a suspendable handler simply **runs inline** — the behaviour of every earlier release,
+so the request is still served, just without yielding the worker. It is never an error.
+`suspended` sitting at `max_suspended` is the signal to raise it.
+
+`sua.sqlite.*` does **not** suspend. sua has one process-wide connection, and offloading statements
+onto it would make `lastInsertId` and `changes` report another handler's results — a silent
+corruption worse than the stall it would fix. See `docs/sua-async-design.md` §9.2.
+
 ---
 
 ## Databases
@@ -543,12 +611,15 @@ sua.sqlite.close()
 
 These are real constraints of the current implementation, not oversights to work around silently.
 
-- **A blocking handler stalls its worker.** Each worker is one event loop on one thread, so a slow
-  handler delays the other clients *on that worker*, and a handler that makes an HTTP request to its
-  own worker deadlocks. `sua.server.workers(n)` reduces the blast radius to 1/n; `sua.http.all`
-  collapses a fan-out into a single wait. Making handlers genuinely non-blocking needs coroutines —
-  see [sua-architecture.md](sua-architecture.md) §12.4 for why, and for the two shortcuts that look
-  like they would work but reintroduce interpreter races.
+- **An unmarked handler stalls its worker while it waits.** Each worker is one event loop on one
+  thread, so a slow handler delays the other clients *on that worker*, and a handler that makes an
+  HTTP request to its own worker deadlocks. Mark the route `{"suspend": true}` and neither happens —
+  see [Suspending handlers](#suspending-handlers), and read the atomicity note there first.
+  `sua.server.workers(n)` reduces the blast radius to 1/n either way.
+- **`sua.sqlite.*` never suspends**, even on a marked route: sua has a single process-wide
+  connection, and offloading statements onto it would make `lastInsertId` and `changes` report
+  another handler's results. A slow query still stalls the worker.
+  [sua-async-design.md](sua-async-design.md) §9.2 has the detail and what the real fix would be.
 - **`sua.server.use()` registers middleware that never runs.** The dispatch loop contains no
   middleware step. Put shared logic in a function your handlers call.
 - **`sua.response.*` does not work.** It writes to globals the server never reads, and

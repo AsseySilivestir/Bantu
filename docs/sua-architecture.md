@@ -265,17 +265,27 @@ socket open in the background.
 
 ## 7. The trade-off, stated plainly
 
-**A blocking builtin stalls its worker's loop.** There are 8 blocking call sites reachable from a
+**A blocking builtin stalls its worker's loop.** There were 8 blocking call sites reachable from a
 handler (`curl_easy_perform`, `sqlite3_step`, `sleep`).
 
 This is the same constraint Node has. Phase 4 was expected to remove it by driving `sua.http.*`
 from the loop with curl-multi; **that turned out not to be achievable without coroutines, and §12.4
-records why, including the re-entrancy shortcut that must not be taken.** What Phase 4 does deliver
-is `sua.http.all` (many outbound requests in parallel within one call, so the stall is `max(t)` not
+records why, including the re-entrancy shortcut that must not be taken.** What Phase 4 delivered is
+`sua.http.all` (many outbound requests in parallel within one call, so the stall is `max(t)` not
 `sum(t)`) and `SO_REUSEPORT`, which limits the damage to one worker of N.
 
-It is worth being clear that this is **strictly better than what it replaces**. Today a blocking
-handler stalls a thread *and* corrupts other requests' scopes.
+**Phase 7 removed it for `sleep` and all of `sua.http.*`.** A route marked `{"suspend": true}` runs
+on a task thread that holds a strict handoff baton: the handler parks, its outbound call proceeds
+with the baton released, and the loop serves everything else meanwhile. Exactly one thread ever runs
+Bantu code, so §2.1 cannot return. §12.6 has the design; [sua-async-design.md](sua-async-design.md)
+has the full reasoning.
+
+**`sqlite3_step` still blocks**, and deliberately: sua exposes one process-wide connection, and
+offloading statements onto it would make `lastInsertId` and `changes` report another handler's
+results — silent corruption in exchange for latency. sua-async-design.md §9.2.
+
+It is worth being clear that all of this is **strictly better than what it replaces**. Before Phase
+2 a blocking handler stalled a thread *and* corrupted other requests' scopes.
 
 ---
 
@@ -290,7 +300,7 @@ handler stalls a thread *and* corrupts other requests' scopes.
 | 4 | `SO_REUSEPORT` workers; broadcast bus; parallel `sua.http.all` | done — see §12 |
 | 5 | Upstream report to `AsseySilivestir/Bantu` | drafted, **not sent** — [upstream-report.md](upstream-report.md) |
 | 6 | Per-IP caps, cross-worker roster, CI on Linux/Windows | done |
-| 7 | Suspending handlers (no async syntax) | designed, **not started** — [sua-async-design.md](sua-async-design.md) needs one decision |
+| 7 | Suspending handlers (no async syntax) | done — `coroutine.hpp`, opt-in per route; `tests/sua_suspend_test.sh` 9/9. See §12.6 |
 
 ### Phase 1's lock ordering (while it exists)
 
@@ -581,12 +591,85 @@ which does the research this section deferred. Three findings worth carrying bac
   else runs while one is executing — and suspension breaks that promise for programs already written
   against it. The recommendation is therefore per-handler opt-in, so nothing existing changes.
 
+That design was accepted as recommended and built; §12.6 records what it turned out to be. Option 1
+above — "a thread per in-flight handler" — deserves a correction in light of it: a thread per handler
+is only fatal *if the threads run at the same time*. Constraining them so that exactly one is ever
+runnable turns the rejected option into the accepted one. The rejection was right about the danger
+and wrong about the mechanism.
+
 ### 12.5 Platform
 
 `fork` and `SO_REUSEPORT` are POSIX. On Windows, `sua.server.workers(n)` logs that multi-worker mode
 is unavailable and runs single-worker; every other guarantee is unchanged. Multi-worker Windows
 would need a different mechanism entirely (a shared listening handle passed to child processes),
 and single-worker Windows is not a regression against anything that shipped.
+
+### 12.6 Phase 7 — suspending handlers
+
+`bantu-src/compiler/src/coroutine.hpp`. Opt in per route:
+
+```bantu
+sua.server.get("/proxy", def($req, $res) {
+    $r = sua.http.get("https://slow.example/thing");
+    $res.json($r);
+}, {"suspend": true});
+```
+
+**The baton.** A marked handler runs on its own thread, but a single logical baton is held either by
+the loop or by one task, never by two and never by none. `spawn` hands it over and blocks until the
+task parks or finishes, so a handler that never suspends is indistinguishable from one called
+inline. There is exactly one primitive:
+
+> `yieldFor(work)` — park (hand the baton to the loop), run `work` on this thread with the baton
+> released, ask the loop for the baton back, block until it arrives.
+
+`sleep`, `sua.http.*` and `sua.http.all` are each two lines on top of it. Off a task thread —
+an unmarked handler, a plain script, a handler that ran inline because the pool was full —
+`yieldFor` simply calls `work()`, which is the behaviour of every earlier release.
+
+**Why not the planned curl_multi/loop integration.** §12.4 assumed `sua.http.*` would need curl's
+fds registered with `bantu_loop::Backend` via `curl_multi_socket_action`. It does not. The handler
+already has a thread; the blocking curl call can run on *that* thread with the baton released, and
+the loop is just as free. Same result, none of the loop surgery.
+
+**Waking the loop.** A task that finishes its off-baton work while the loop is parked in
+`wait()` writes one byte to a socketpair the loop watches (`bantu_loop::makeWakePair`), then blocks
+until the loop hands the baton back. A socketpair rather than `pipe(2)` because Windows has no pipe
+an I/O multiplexer accepts.
+
+**What crosses the boundary.** Only plain C data. `work` runs while the loop is free, so it must
+touch no interpreter state, no `bantuConns`, no backend. In `sua.http.all` that means the curl calls
+go off the baton and the response `Value`s are built after it is back — completion codes are all
+that cross.
+
+**What a suspended handler carries.** Two fields, `env_` and `currentClassName_`, saved before
+parking and restored on resume. `globalEnv_` and `classRegistry_` are immutable once the program has
+loaded; `filePathStack_`/`loadedModules_`/`includeDepth_` are live only during `include`, which
+cannot suspend.
+
+**Connection identity.** A suspended handler outlives the connection-table entry it was dispatched
+for: the client can disconnect while it waits, and the kernel will reissue the same fd *number* to
+the next connection. Connections carry a serial; a resumed handler checks it and drops the response
+if the connection it was answering is gone. The idle reaper skips a connection whose handler is
+suspended — it has not gone quiet, the server is the one taking the time.
+
+**Cost.** One OS thread per *suspended* handler, not per connection; capped by
+`max_suspended_handlers` (default 256). Over the cap a suspendable handler runs inline, which is
+correct, just not concurrent — never an error. Visible in `sua.server.stats()` as `suspended`,
+`max_suspended`, `suspensions`.
+
+**Measured** (`tests/sua_suspend_test.sh`, macOS): a fast request served in **1 ms** while a 1.2 s
+handler is in flight; ten handlers each waiting 300 ms complete in **310 ms**; a handler making an
+HTTP request to its own worker completes in **1 ms** where it previously deadlocked until curl timed
+out at 10 s. Under `workers(3)`, six 1 s handlers landed 3/2/1 across workers and each still took
+~1.17 s, so they overlapped *within* a worker as well as across.
+
+**The hazard, and why it is per route.** Suspension means a handler is no longer atomic, and a
+program that reads shared state, suspends, then acts on what it read now has a logical race that no
+sanitizer finds. sua did not have that before. Turning suspension on globally would have invalidated
+that promise silently for every program already written against it — so it is opt-in per route, and
+`tests/sua_suspend_test.sh` asserts that an *unmarked* handler still blocks, which is the assertion
+that would fail if anyone later made it global.
 
 
 ---

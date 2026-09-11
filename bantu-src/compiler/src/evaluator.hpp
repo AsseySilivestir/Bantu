@@ -20,6 +20,7 @@
 #include "mime_types.hpp"       // extension -> Content-Type for the static file server
 #include "event_loop.hpp"       // kqueue/epoll/poll readiness loop for the sua server
 #include "worker_pool.hpp"      // SO_REUSEPORT workers + the cross-worker broadcast bus
+#include "coroutine.hpp"        // opt-in suspending handlers (the baton scheduler)
 #include "pwa_native.hpp"       // manifest / service worker / offline rendering for sua.pwa
 #include "webpush.hpp"          // RFC 8188/8291/8292 Web Push (pulls in p256.hpp + aes_gcm.hpp)
 #include <iostream>
@@ -165,6 +166,14 @@ struct BantuServerRoute {
     std::string method;
     std::string path;
     Value handler;  // Bantu function (or null if none)
+    // Opt in with sua.server.get(path, handler, {"suspend": true}).
+    //
+    // Per route rather than global, because suspension breaks a promise sua
+    // currently makes: today a handler runs start to finish with no other Bantu
+    // code interleaved, and programs written against that would break SILENTLY
+    // if it stopped being true. Marking one route is an explicit statement that
+    // this handler tolerates interleaving. See docs/sua-async-design.md §6-§7.
+    bool suspend = false;
 };
 
 // ─── Server resource limits ───────────────────────────────────────────────
@@ -187,12 +196,53 @@ struct BantuServerLimits {
     size_t maxWsMessageBytes= 8 * 1024 * 1024;  // reassembled, across continuations
     bool   wsCheckOrigin    = true;             // reject cross-site WS upgrades
     std::vector<std::string> wsAllowedOrigins;  // empty + check on = same-origin only
+    // Concurrently SUSPENDED handlers, which is one OS thread each. Not a cap
+    // on requests: a handler that never suspends never takes a slot, and the
+    // slot is released the moment the handler finishes. Over the cap, a
+    // suspendable handler runs inline -- correct, just not concurrent -- so
+    // this bounds memory without ever failing a request.
+    int    maxSuspendedHandlers = 256;
 };
 static BantuServerLimits bantuLimits;
 
 // Mirrors the evaluator's --quiet flag for code outside the class (setQuiet
 // keeps them in step), so diagnostics honour `bantu -q` like everything else.
 static bool bantuQuietMode = false;
+
+// ─── Suspending a handler ──────────────────────────────────────────────────
+// The interpreter's whole mutable state is two fields (measured, not assumed:
+// globalEnv_ and classRegistry_ are immutable once the program has loaded, and
+// filePathStack_/loadedModules_/includeDepth_ are live only during `include`,
+// which cannot suspend). The Evaluator publishes pointers to them here so that
+// free functions -- bantuHttpRequestEx and friends are file-scope, not members
+// -- can save and restore them across a suspension without the scheduler
+// knowing anything about the interpreter.
+static std::shared_ptr<Environment>* bantuEnvSlot = nullptr;
+static std::string*                  bantuClassSlot = nullptr;
+
+// Run `work` without holding up the event loop.
+//
+// On a suspendable handler's thread this parks the handler, runs `work` while
+// the loop serves other connections, and resumes once it finishes. Anywhere
+// else -- a plain script, a handler that did not opt in, a handler that ran
+// inline because the pool was full -- it just calls work(), which is exactly
+// the behaviour every release so far has had.
+//
+// `work` runs while the loop is free, so it must touch NOTHING the loop owns:
+// no interpreter state, no bantuConns, no backend. Every current caller is a
+// blocking C library call against its own state (curl, sleep, sqlite), which
+// is what makes that condition easy to keep.
+template <typename F>
+static void bantuOffBaton(F&& work) {
+    if (!bantu_co::Scheduler::onTask()) { work(); return; }
+    // The loop runs other Bantu code while we are parked, so our scope chain
+    // has to be put back by hand on the way out.
+    std::shared_ptr<Environment> savedEnv = bantuEnvSlot ? *bantuEnvSlot : nullptr;
+    std::string savedClass = bantuClassSlot ? *bantuClassSlot : std::string();
+    bantu_co::sched().yieldFor([&] { work(); });
+    if (bantuEnvSlot)   *bantuEnvSlot = savedEnv;
+    if (bantuClassSlot) *bantuClassSlot = savedClass;
+}
 
 // ─── Event-loop connection state ───────────────────────────────────────────
 // One of these per open socket, replacing one OS thread per open socket. A
@@ -217,8 +267,16 @@ struct BantuConn {
     int         wsId = 0;
     std::string fragment;        // reassembled continuation frames
     uint8_t     fragOpcode = 0;
+    // A suspended handler outlives the connection table entry it was dispatched
+    // for: the client can disconnect while the handler waits on an outbound
+    // call, and the kernel will happily hand the same fd NUMBER to the next
+    // connection. `serial` is what tells those two apart, so a late response is
+    // discarded instead of being written to a stranger's socket.
+    uint64_t    serial = 0;
+    int         pending = 0;     // suspended handlers holding this connection
 };
 static std::unordered_map<int, BantuConn> bantuConns;
+static uint64_t bantuConnSerialSeq = 0;
 static bantu_loop::Backend* bantuLoopBackend = nullptr;
 
 // Watch this fd for writability iff it has pending output.
@@ -339,6 +397,15 @@ static void bantuBusPublish(uint8_t type, const char* data, size_t n) {
     bantu_workers::busEncode(bantuBus.out, type, data, n);
     bantuBusSent++;
     bantuBusSyncInterest();
+}
+
+// Optional third argument to sua.server.<method>(): {"suspend": true}.
+// Unknown keys are ignored so the object can carry future per-route options
+// without breaking programs written against this one.
+static bool bantuRouteOptSuspend(const std::vector<Value>& args) {
+    if (args.size() < 3 || !args[2].isObject() || !args[2].objectVal) return false;
+    auto it = args[2].objectVal->find("suspend");
+    return it != args[2].objectVal->end() && it->second.isTruthy();
 }
 
 static std::vector<BantuServerRoute> bantuServerRoutes;
@@ -1736,7 +1803,12 @@ static Value bantuHttpRequestEx(const std::string& method, const std::string& ur
         err["ok"] = Value(false);
         return Value(std::move(err));
     }
-    CURLcode res = curl_easy_perform(j.easy);
+    // The whole transfer runs off the baton: curl touches only its own handle,
+    // so while it waits on the network the event loop is free to serve every
+    // other connection on this worker. In a handler that did not opt into
+    // suspension this is an ordinary blocking call, unchanged.
+    CURLcode res = CURLE_OK;
+    bantuOffBaton([&] { res = curl_easy_perform(j.easy); });
     Value out = bantuHttpFinish(j, res, opt);
     bantuHttpJobFree(j);
     return out;
@@ -1843,24 +1915,36 @@ static std::vector<Value> bantuHttpAll(std::vector<BantuHttpSpec>& specs, int ma
         curl_multi_add_handle(multi, j->easy);
     }
 
-    int running = 0;
-    do {
-        CURLMcode mc = curl_multi_perform(multi, &running);
-        if (mc == CURLM_OK && running)
-            mc = curl_multi_poll(multi, nullptr, 0, 1000, nullptr);
-        if (mc != CURLM_OK) break;
+    // The wait runs off the baton, so in a handler that opted into suspension
+    // the whole fan-out happens while the event loop keeps serving. Only the
+    // curl calls go inside: building the response Values touches the
+    // interpreter's allocator and writes the trace to stderr, so that is done
+    // afterwards, back on the baton. Completion codes are all that crosses.
+    std::vector<CURLcode> codes(specs.size(), CURLE_OK);
+    std::vector<char>     done(specs.size(), 0);
+    bantuOffBaton([&] {
+        int running = 0;
+        do {
+            CURLMcode mc = curl_multi_perform(multi, &running);
+            if (mc == CURLM_OK && running)
+                mc = curl_multi_poll(multi, nullptr, 0, 1000, nullptr);
+            if (mc != CURLM_OK) break;
 
-        // Drain completions as they land.
-        CURLMsg* msg = nullptr;
-        int left = 0;
-        while ((msg = curl_multi_info_read(multi, &left)) != nullptr) {
-            if (msg->msg != CURLMSG_DONE) continue;
-            auto it = indexOf.find(msg->easy_handle);
-            if (it == indexOf.end()) continue;
-            size_t i = it->second;
-            results[i] = bantuHttpFinish(*jobs[i], msg->data.result, specs[i].opt);
-        }
-    } while (running);
+            // Drain completions as they land.
+            CURLMsg* msg = nullptr;
+            int left = 0;
+            while ((msg = curl_multi_info_read(multi, &left)) != nullptr) {
+                if (msg->msg != CURLMSG_DONE) continue;
+                auto it = indexOf.find(msg->easy_handle);
+                if (it == indexOf.end()) continue;
+                codes[it->second] = msg->data.result;
+                done[it->second]  = 1;
+            }
+        } while (running);
+    });
+
+    for (size_t i = 0; i < specs.size(); i++)
+        if (jobs[i] && done[i]) results[i] = bantuHttpFinish(*jobs[i], codes[i], specs[i].opt);
 
     for (size_t i = 0; i < jobs.size(); i++) {
         if (!jobs[i]) continue;
@@ -2243,6 +2327,12 @@ public:
             this->env_ = savedEnv;
             return result;
         };
+        // A suspended handler has to put these two back when it resumes, and
+        // the code that does it is at file scope (see bantuOffBaton). Published
+        // here rather than passed around because there is exactly one Evaluator
+        // per process, and a worker forks AFTER the program has loaded.
+        bantuEnvSlot   = &this->env_;
+        bantuClassSlot = &this->currentClassName_;
         curl_global_init(CURL_GLOBAL_DEFAULT);
         // Web Push takes its randomness from the one platform CSPRNG. Left
         // unset it fails closed rather than falling back to a predictable PRNG.
@@ -3023,12 +3113,14 @@ private:
         Value matchedHandler;
         ObjectMap params;
         bool found = false;
+        bool suspendable = false;   // this route opted into suspension
         std::vector<std::string> pathParts = bantuSplitPath(path);
 
         // First pass: exact match
         for (auto& route : bantuServerRoutes) {
             if (route.method == method && route.path == path) {
                 matchedHandler = route.handler;
+                suspendable = route.suspend;
                 found = true;
                 break;
             }
@@ -3051,6 +3143,7 @@ private:
                 }
                 if (ok) {
                     matchedHandler = route.handler;
+                    suspendable = route.suspend;
                     params = trial;
                     found = true;
                     break;
@@ -3062,6 +3155,7 @@ private:
             for (auto& route : bantuServerRoutes) {
                 if (route.method == "OPTIONS" && route.path == "*") {
                     matchedHandler = route.handler;
+                    suspendable = route.suspend;
                     found = true;
                     break;
                 }
@@ -3085,6 +3179,7 @@ private:
                     std::string prefix = route.path.substr(0, route.path.size() - 1);
                     if (path.find(prefix) == 0 || path == route.path.substr(0, route.path.size() - 2)) {
                         matchedHandler = route.handler;
+                        suspendable = route.suspend;
                         found = true;
                         break;
                     }
@@ -3092,6 +3187,7 @@ private:
                     std::string prefix = route.path.substr(0, route.path.size() - 1);
                     if (path.find(prefix) == 0) {
                         matchedHandler = route.handler;
+                        suspendable = route.suspend;
                         found = true;
                         break;
                     }
@@ -3114,45 +3210,82 @@ private:
         reqObj["body"] = bodyVal;
         Value reqVal = Value(std::move(reqObj));
 
-        // Call the handler (if any)
-        if (found && (matchedHandler.isFunction() || matchedHandler.isNativeFn())) {
-            try {
-                bantuCallFunction(matchedHandler, {reqVal, resVal});
-            } catch (const std::exception& e) {
-                std::cerr << "  [SERVER] Handler exception: " << e.what() << "\n";
-                state->status = 500;
-                state->body = std::string("{\"error\":\"Internal server error: ") + e.what() + "\"}";
-                state->contentType = "application/json; charset=utf-8";
-            }
-        } else if (!found) {
-            state->status = 404;
-            ObjectMap errObj;
-            errObj["error"] = Value(std::string("Not found"));
-            errObj["path"] = Value(path);
-            errObj["method"] = Value(method);
-            state->body = bantuJsonStringify(Value(std::move(errObj)));
-            state->contentType = "application/json; charset=utf-8";
-        } else {
-            // Route found but no handler — return empty 200
-            state->status = 200;
-            state->body = "";
+        // ─── Run the handler, then answer ──────────────────────────────
+        // Everything from here to the final write is packaged as one callable,
+        // because on a route that opted into suspension the whole of it runs on
+        // a task thread rather than on the loop. Route matching, static files
+        // and the WebSocket upgrade stay on the loop: they do not block, and
+        // keeping them there means a suspendable route costs nothing extra
+        // until its handler actually suspends.
+        //
+        // `serial` is captured with the fd. By the time this finishes the
+        // client may have disconnected and the kernel may have reissued the
+        // same fd number to somebody else -- see BantuConn::serial.
+        uint64_t serial = 0;
+        {
+            auto sc = bantuConns.find(sock);
+            if (sc != bantuConns.end()) { serial = sc->second.serial; sc->second.pending++; }
         }
 
-        // Build and send the HTTP response
-        std::ostringstream resp;
-        resp << "HTTP/1.1 " << state->status << " " << bantuHttpStatusText(state->status) << "\r\n";
-        resp << "Content-Type: " << state->contentType << "\r\n";
-        resp << "Content-Length: " << state->body.size() << "\r\n";
-        resp << "Access-Control-Allow-Origin: *\r\n";
-        resp << "Access-Control-Allow-Methods: GET, POST, PUT, DELETE, PATCH, OPTIONS\r\n";
-        resp << "Access-Control-Allow-Headers: Content-Type, Authorization\r\n";
-        for (auto& [k, v] : state->headers) {
-            resp << k << ": " << v << "\r\n";
-        }
-        resp << "Server: Bantu-Sua/1.2\r\n";
-        resp << "\r\n" << state->body;
-        bantuConnWrite(sock, resp.str());
-        bantuConnClose(sock);
+        auto respond = [this, sock, serial, state, reqVal, resVal, matchedHandler,
+                        found, method, path]() {
+            if (found && (matchedHandler.isFunction() || matchedHandler.isNativeFn())) {
+                try {
+                    bantuCallFunction(matchedHandler, {reqVal, resVal});
+                } catch (const std::exception& e) {
+                    std::cerr << "  [SERVER] Handler exception: " << e.what() << "\n";
+                    state->status = 500;
+                    state->body = std::string("{\"error\":\"Internal server error: ") + e.what() + "\"}";
+                    state->contentType = "application/json; charset=utf-8";
+                }
+            } else if (!found) {
+                state->status = 404;
+                ObjectMap errObj;
+                errObj["error"] = Value(std::string("Not found"));
+                errObj["path"] = Value(path);
+                errObj["method"] = Value(method);
+                state->body = bantuJsonStringify(Value(std::move(errObj)));
+                state->contentType = "application/json; charset=utf-8";
+            } else {
+                // Route found but no handler — return empty 200
+                state->status = 200;
+                state->body = "";
+            }
+
+            // Is the connection we were dispatched for still the one on this
+            // fd? A handler that never suspended cannot fail this; one that did
+            // can, and then the only correct action is to drop the response.
+            auto sc = bantuConns.find(sock);
+            if (sc == bantuConns.end() || sc->second.serial != serial) return;
+            sc->second.pending--;
+
+            // Build and send the HTTP response
+            std::ostringstream resp;
+            resp << "HTTP/1.1 " << state->status << " " << bantuHttpStatusText(state->status) << "\r\n";
+            resp << "Content-Type: " << state->contentType << "\r\n";
+            resp << "Content-Length: " << state->body.size() << "\r\n";
+            resp << "Access-Control-Allow-Origin: *\r\n";
+            resp << "Access-Control-Allow-Methods: GET, POST, PUT, DELETE, PATCH, OPTIONS\r\n";
+            resp << "Access-Control-Allow-Headers: Content-Type, Authorization\r\n";
+            for (auto& [k, v] : state->headers) {
+                resp << k << ": " << v << "\r\n";
+            }
+            resp << "Server: Bantu-Sua/1.2\r\n";
+            resp << "\r\n" << state->body;
+            bantuConnWrite(sock, resp.str());
+            bantuConnClose(sock);
+        };
+
+        // A full pool falls back to running inline. That is the behaviour of
+        // every release before this one, so it is always correct -- the request
+        // is served, just without yielding the worker. It is never an error.
+        if (!suspendable) { respond(); return; }
+        // The loop thread's own interpreter state has to survive handing the
+        // baton over: the task restores the handler's scope chain on top of it.
+        auto sEnv = env_; auto sCls = currentClassName_;
+        bool spawned = bantu_co::sched().spawn(respond);
+        env_ = sEnv; currentClassName_ = sCls;
+        if (!spawned) respond();
     }
 
     // Helper: HTTP status text
@@ -3284,9 +3417,16 @@ private:
             if (sock < 0) return;
         }
 
+        // Started after the fork so each worker has its own pool and its own
+        // wake pipe -- a worker must never be able to resume another worker's
+        // handler, and after the fork it could not reach one anyway.
+        bantu_co::sched().start(bantuLimits.maxSuspendedHandlers);
+
         auto backend = bantu_loop::makeBackend();
         bantuLoopBackend = backend.get();
         backend->add(sock, true, false);
+        if (bantu_co::sched().started())
+            backend->add(bantu_co::sched().wakeFd(), true, false);
         if (bantuBus.fd >= 0) {
             backend->add(bantuBus.fd, true, false);
             // Ask the other workers to reintroduce their clients. Matters most
@@ -3391,6 +3531,14 @@ private:
                     continue;
                 }
 
+                // ── a suspended handler is ready to continue ──
+                // Checked before the connection table for the same reason the
+                // bus is: this fd is a wake pipe, not a client.
+                if (bantu_co::sched().started() && ev.fd == bantu_co::sched().wakeFd()) {
+                    bantu_co::sched().drainWake();
+                    continue;
+                }
+
                 // ── the listener ──
                 if (ev.fd == sock) {
                     // Drain the accept queue; one wakeup can cover many pending
@@ -3432,6 +3580,7 @@ private:
                         bantu_loop::setNonBlocking(cfd);
                         BantuConn c;
                         c.fd = cfd;
+                        c.serial = ++bantuConnSerialSeq;
                         c.lastActive = now;
                         if (countIp) {
                             c.peerIp = peerIp;
@@ -3528,10 +3677,24 @@ private:
                 if (cc.closing && cc.outPos >= cc.out.size()) doomed.push_back(cc.fd);
             }
 
+            // ── suspended handlers that finished their outbound work ──
+            // After the events, so a handler resumed here writes its response
+            // into a connection table this iteration has already updated.
+            if (bantu_co::sched().started()) {
+                auto sEnv = env_; auto sCls = currentClassName_;
+                bantu_co::sched().pump();
+                env_ = sEnv; currentClassName_ = sCls;
+            }
+
             // ── timers: reap idle connections ──
             for (auto& kv : bantuConns) {
                 BantuConn& c = kv.second;
                 if (c.closing && c.outPos >= c.out.size()) { doomed.push_back(c.fd); continue; }
+                // A connection whose handler is suspended has not gone
+                // quiet -- the server is the one taking the time. Reaping it
+                // would close the socket out from under a reply that is on its
+                // way, which is a far worse failure than holding an fd.
+                if (c.pending > 0) continue;
                 uint64_t limit = c.isWs ? (uint64_t)bantuLimits.idleTimeoutMs
                                         : (uint64_t)bantuLimits.headerTimeoutMs;
                 if (now - c.lastActive > limit) doomed.push_back(c.fd);
@@ -4301,7 +4464,12 @@ private:
 
         env_->define("sleep", makeNative([](std::vector<Value> args) -> Value {
             double ms = args.size() > 0 ? args[0].numberVal : 1000;
-            std::this_thread::sleep_for(std::chrono::milliseconds((long long)ms));
+            // In a handler that opted into suspension this hands the worker
+            // back to the event loop for the duration; everywhere else it is
+            // the same blocking sleep it has always been.
+            bantuOffBaton([&] {
+                std::this_thread::sleep_for(std::chrono::milliseconds((long long)ms));
+            });
             return Value();
         }));
 
@@ -5821,7 +5989,7 @@ private:
         serverObj["get"] = makeNative([this](std::vector<Value> args) -> Value {
             std::string path = args.size() > 0 ? args[0].toString() : "/";
             Value handler = args.size() > 1 ? args[1] : Value();
-            bantuServerRoutes.push_back({"GET", path, handler});
+            bantuServerRoutes.push_back({"GET", path, handler, bantuRouteOptSuspend(args)});
             std::cout << "  [SERVER] GET " << path << " registered\n";
             ObjectMap routeInfo;
             routeInfo["method"] = Value(std::string("GET"));
@@ -5834,7 +6002,7 @@ private:
         serverObj["post"] = makeNative([this](std::vector<Value> args) -> Value {
             std::string path = args.size() > 0 ? args[0].toString() : "/";
             Value handler = args.size() > 1 ? args[1] : Value();
-            bantuServerRoutes.push_back({"POST", path, handler});
+            bantuServerRoutes.push_back({"POST", path, handler, bantuRouteOptSuspend(args)});
             std::cout << "  [SERVER] POST " << path << " registered\n";
             ObjectMap routeInfo;
             routeInfo["method"] = Value(std::string("POST"));
@@ -5847,7 +6015,7 @@ private:
         serverObj["put"] = makeNative([this](std::vector<Value> args) -> Value {
             std::string path = args.size() > 0 ? args[0].toString() : "/";
             Value handler = args.size() > 1 ? args[1] : Value();
-            bantuServerRoutes.push_back({"PUT", path, handler});
+            bantuServerRoutes.push_back({"PUT", path, handler, bantuRouteOptSuspend(args)});
             std::cout << "  [SERVER] PUT " << path << " registered\n";
             ObjectMap routeInfo;
             routeInfo["method"] = Value(std::string("PUT"));
@@ -5860,7 +6028,7 @@ private:
         serverObj["delete"] = makeNative([this](std::vector<Value> args) -> Value {
             std::string path = args.size() > 0 ? args[0].toString() : "/";
             Value handler = args.size() > 1 ? args[1] : Value();
-            bantuServerRoutes.push_back({"DELETE", path, handler});
+            bantuServerRoutes.push_back({"DELETE", path, handler, bantuRouteOptSuspend(args)});
             std::cout << "  [SERVER] DELETE " << path << " registered\n";
             ObjectMap routeInfo;
             routeInfo["method"] = Value(std::string("DELETE"));
@@ -5873,7 +6041,7 @@ private:
         serverObj["patch"] = makeNative([this](std::vector<Value> args) -> Value {
             std::string path = args.size() > 0 ? args[0].toString() : "/";
             Value handler = args.size() > 1 ? args[1] : Value();
-            bantuServerRoutes.push_back({"PATCH", path, handler});
+            bantuServerRoutes.push_back({"PATCH", path, handler, bantuRouteOptSuspend(args)});
             std::cout << "  [SERVER] PATCH " << path << " registered\n";
             ObjectMap routeInfo;
             routeInfo["method"] = Value(std::string("PATCH"));
@@ -5886,7 +6054,7 @@ private:
         serverObj["head"] = makeNative([this](std::vector<Value> args) -> Value {
             std::string path = args.size() > 0 ? args[0].toString() : "/";
             Value handler = args.size() > 1 ? args[1] : Value();
-            bantuServerRoutes.push_back({"HEAD", path, handler});
+            bantuServerRoutes.push_back({"HEAD", path, handler, bantuRouteOptSuspend(args)});
             std::cout << "  [SERVER] HEAD " << path << " registered\n";
             ObjectMap routeInfo;
             routeInfo["method"] = Value(std::string("HEAD"));
@@ -5899,7 +6067,7 @@ private:
         serverObj["options"] = makeNative([this](std::vector<Value> args) -> Value {
             std::string path = args.size() > 0 ? args[0].toString() : "*";
             Value handler = args.size() > 1 ? args[1] : Value();
-            bantuServerRoutes.push_back({"OPTIONS", path, handler});
+            bantuServerRoutes.push_back({"OPTIONS", path, handler, bantuRouteOptSuspend(args)});
             std::cout << "  [SERVER] OPTIONS " << path << " registered\n";
             ObjectMap routeInfo;
             routeInfo["method"] = Value(std::string("OPTIONS"));
@@ -5998,7 +6166,7 @@ private:
             std::string path = args.size() > 0 ? args[0].toString() : "/";
             Value handler = args.size() > 1 ? args[1] : Value();
             for (const auto& m : {"GET", "POST", "PUT", "DELETE", "PATCH"}) {
-                bantuServerRoutes.push_back({m, path, handler});
+                bantuServerRoutes.push_back({m, path, handler, bantuRouteOptSuspend(args)});
             }
             std::cout << "  [SERVER] ALL " << path << " registered (GET/POST/PUT/DELETE/PATCH)\n";
             ObjectMap routeInfo;
@@ -6056,6 +6224,15 @@ private:
             // Non-zero means the per-IP cap actually turned traffic away.
             out["rejected_per_ip"]  = Value((double)bantuRejectedPerIp);
             out["distinct_ips"]     = Value((double)bantuIpConns.size());
+            // Suspended handlers: one OS thread each, and the only thing in
+            // the server whose cost is not bounded by max_connections.
+            // `suspensions` counting up while `suspended` stays low is the
+            // healthy shape -- handlers yielding and resuming. `suspended`
+            // sitting at max_suspended_handlers means new suspendable
+            // handlers are falling back to running inline.
+            out["suspended"]        = Value((double)bantu_co::sched().live());
+            out["max_suspended"]    = Value((double)bantu_co::sched().capacity());
+            out["suspensions"]      = Value((double)bantu_co::sched().suspensions());
             return Value(std::move(out));
         });
 
@@ -6083,6 +6260,7 @@ private:
                 num("idle_timeout_ms",      bantuLimits.idleTimeoutMs);
                 num("max_ws_frame_bytes",   bantuLimits.maxWsFrameBytes);
                 num("max_ws_message_bytes", bantuLimits.maxWsMessageBytes);
+                num("max_suspended_handlers", bantuLimits.maxSuspendedHandlers);
                 auto co = o.find("ws_check_origin");
                 if (co != o.end()) bantuLimits.wsCheckOrigin = co->second.isTruthy();
                 auto wr = o.find("ws_roster");
@@ -6103,6 +6281,7 @@ private:
             out["idle_timeout_ms"]      = Value((double)bantuLimits.idleTimeoutMs);
             out["max_ws_frame_bytes"]   = Value((double)bantuLimits.maxWsFrameBytes);
             out["max_ws_message_bytes"] = Value((double)bantuLimits.maxWsMessageBytes);
+            out["max_suspended_handlers"] = Value((double)bantuLimits.maxSuspendedHandlers);
             out["ws_check_origin"]      = Value(bantuLimits.wsCheckOrigin);
             out["ws_roster"]            = Value(bantuWsRoster);
             std::vector<Value> origins;

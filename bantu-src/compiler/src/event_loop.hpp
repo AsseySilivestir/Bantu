@@ -95,6 +95,57 @@ inline bool wouldBlock() {
 #endif
 }
 
+// ── waking the loop from another thread ─────────────────────────────────────
+// The loop parks in wait() for up to a second. A suspended handler that
+// finishes its outbound I/O on another thread needs the loop to notice *now*,
+// not on the next tick, so it writes one byte to `w` and the loop sees `r`
+// become readable. This is the classic self-pipe trick.
+//
+// A socketpair rather than pipe(2) because Windows has no pipe an I/O
+// multiplexer will accept -- there, a pair of loopback TCP sockets is the
+// standard substitute, and using sockets on both platforms keeps the drain
+// code identical.
+inline bool makeWakePair(int& r, int& w) {
+#if defined(_WIN32)
+    SOCKET ln = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (ln == INVALID_SOCKET) return false;
+    struct sockaddr_in a;
+    memset(&a, 0, sizeof(a));
+    a.sin_family = AF_INET;
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    a.sin_port = 0;                              // any free port
+    int alen = (int)sizeof(a);
+    if (bind(ln, (struct sockaddr*)&a, alen) != 0 || ::listen(ln, 1) != 0 ||
+        getsockname(ln, (struct sockaddr*)&a, &alen) != 0) {
+        closesocket(ln); return false;
+    }
+    SOCKET cw = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (cw == INVALID_SOCKET) { closesocket(ln); return false; }
+    if (connect(cw, (struct sockaddr*)&a, alen) != 0) {
+        closesocket(cw); closesocket(ln); return false;
+    }
+    SOCKET cr = accept(ln, nullptr, nullptr);
+    closesocket(ln);
+    if (cr == INVALID_SOCKET) { closesocket(cw); return false; }
+    // Nagle would delay a one-byte wakeup by up to 40ms, which is precisely
+    // the latency this exists to avoid.
+    int one = 1;
+    setsockopt(cw, IPPROTO_TCP, TCP_NODELAY, (const char*)&one, sizeof(one));
+    r = (int)cr; w = (int)cw;
+#else
+    int fds[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, fds) != 0) return false;
+    r = fds[0]; w = fds[1];
+#endif
+    // Both ends non-blocking: the reader is on the loop, and the writer must
+    // never block a handler thread just because the byte queue is full -- a
+    // full queue already means a wakeup is pending, so dropping the write is
+    // the correct outcome rather than a lost event.
+    setNonBlocking(r);
+    setNonBlocking(w);
+    return true;
+}
+
 // ── the backend interface ───────────────────────────────────────────────────
 
 struct Event {
