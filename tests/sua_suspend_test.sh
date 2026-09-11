@@ -88,6 +88,15 @@ sua.server.get("/inc2", def(\$req, \$res) {
     \$res.json({"tag": tag_two()});
 }, {"suspend": true});
 
+sua.ws.on("message", def(\$m) { sua.ws.send(\$m.id, "echo:" + \$m.data); });
+
+// Touches the loop's own connection table from a task thread, after parking.
+sua.server.get("/blast", def(\$req, \$res) {
+    sleep(500);
+    \$n = sua.ws.broadcast("from-suspended");
+    \$res.json({"sent": \$n, "clients": len(sua.ws.clients())});
+}, {"suspend": true});
+
 sua.server.listen($PORT);
 BEOF
 
@@ -131,7 +140,7 @@ for _ in $(seq 1 60); do
 done
 
 PORT="$PORT" PORT2="$PORT2" python3 - <<'PY'
-import json, os, socket, time, urllib.request
+import base64, json, os, socket, struct, time, urllib.request
 import concurrent.futures as cf
 
 PORT = int(os.environ["PORT"])
@@ -254,6 +263,39 @@ with cf.ThreadPoolExecutor(2) as ex:
     b1, b2 = i1.result(), i2.result()
 ok('"d1"' in b1, "handler 1's include resolved against its own directory -- got %s" % b1[:80])
 ok('"d2"' in b2, "handler 2's include resolved against its own directory -- got %s" % b2[:80])
+
+# ── 8. a suspended handler reaching the loop's connection table ──────────
+print("")
+print("-- sua.ws.broadcast from a suspended handler --")
+
+def ws_connect():
+    sk = socket.create_connection(("127.0.0.1", PORT), timeout=10)
+    key = base64.b64encode(os.urandom(16)).decode()
+    sk.sendall(("GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade: websocket\r\n"
+                "Connection: Upgrade\r\nSec-WebSocket-Key: %s\r\n"
+                "Sec-WebSocket-Version: 13\r\n\r\n" % key).encode())
+    buf = b""
+    while b"\r\n\r\n" not in buf:          # one byte at a time: a bulk recv
+        buf += sk.recv(1)                      # would swallow the first frame
+    return sk
+
+def read_text_frame(sk):
+    h = sk.recv(2)
+    ln = h[1] & 127
+    if ln == 126: ln = struct.unpack(">H", sk.recv(2))[0]
+    return sk.recv(ln).decode()
+
+socks = [ws_connect() for _ in range(3)]
+try:
+    blast = json.loads(get("/blast"))
+    ok(blast.get("sent") == 3, "the broadcast reached all three clients (sent=%r)"
+                               % blast.get("sent"))
+    ok(blast.get("clients") == 3, "sua.ws.clients() was readable from the task thread")
+    frames = [read_text_frame(sk) for sk in socks]
+    ok(all(f == "from-suspended" for f in frames),
+       "each client received the frame intact -- got %r" % frames)
+finally:
+    for sk in socks: sk.close()
 
 print("")
 print("  %d passed, %d failed" % (R["pass"], R["fail"]))

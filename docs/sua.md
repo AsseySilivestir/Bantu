@@ -544,6 +544,11 @@ and a fast request is served in **1 ms** while a 1.2 s handler is in flight.
 Three calls suspend: `sleep()`, `sua.http.*`, and `sua.http.all`. Everything else runs as it always
 has.
 
+Only **routes** can opt in. `sua.ws.on(...)` handlers and the PWA/push routes always run on the loop,
+so a `sleep()` or outbound call inside one still holds the worker. A suspendable route may freely
+call `sua.ws.send` / `sua.ws.broadcast` — those reach the loop's connection table under the same
+guarantee that only one thread runs Bantu code at a time.
+
 #### Read this before turning it on
 
 **A suspended handler is not atomic.** Today a handler runs start to finish with no other Bantu code

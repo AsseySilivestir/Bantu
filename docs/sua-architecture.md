@@ -665,7 +665,7 @@ suspended — it has not gone quiet, the server is the one taking the time.
 correct, just not concurrent — never an error. Visible in `sua.server.stats()` as `suspended`,
 `max_suspended`, `suspensions`.
 
-**Measured** (`tests/sua_suspend_test.sh`, 16 assertions, macOS): a fast request served in **1 ms** while a 1.2 s
+**Measured** (`tests/sua_suspend_test.sh`, 19 assertions, macOS): a fast request served in **1 ms** while a 1.2 s
 handler is in flight; ten handlers each waiting 300 ms complete in **310 ms**; a handler making an
 HTTP request to its own worker completes in **1 ms** where it previously deadlocked until curl timed
 out at 10 s. Under `workers(3)`, six 1 s handlers landed 3/2/1 across workers and each still took
