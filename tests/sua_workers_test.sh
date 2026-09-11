@@ -143,19 +143,26 @@ check_true("no worker took >60% of the load",
            "worst %d of %d -- distribution: %s" % (worst, total, dict(dist)))
 
 print("\n-- WebSocket clients spread across workers --")
-clients=[]
-homes=[]
-ids=[]
-for _ in range(16):
-    s,rest=ws(); clients.append(s)
+# Opened CONCURRENTLY, which is both what a real app does and the only way this
+# distributes on macOS. Connecting one at a time leaves the accept race
+# uncontended, so whichever worker is already blocked in kevent wins every
+# time -- CI put all 16 on one worker and three assertions failed for a reason
+# that was the test's, not the server's. Linux SO_REUSEPORT spreads either way.
+def open_one(_):
     try:
+        s,rest=ws()
         if not rest: rest=s.recv(500)
-        msg=unframe(rest).decode()
-        _,w,cid = msg.split(":",2)
-        homes.append(w); ids.append(cid)
-    except Exception as e:
-        homes.append("?"); ids.append("?")
+        _,w,cid = unframe(rest).decode().split(":",2)
+        return s,w,cid
+    except Exception:
+        return None,"?","?"
+with cf.ThreadPoolExecutor(16) as ex:
+    opened=list(ex.map(open_one, range(16)))
+clients=[s for s,_,_ in opened if s is not None]
+homes=[w for s,w,_ in opened if s is not None]
+ids=[c for s,_,c in opened if s is not None]
 spread=collections.Counter(homes)
+check("all 16 WebSocket connections opened", len(clients), 16)
 check_true("WS clients landed on >1 worker", len(spread)>1, "homes: %s" % dict(spread))
 # The bug this protects: a per-process counter made every worker mint "ws-1".
 check("client ids are unique across workers", len(set(ids)), len(ids))

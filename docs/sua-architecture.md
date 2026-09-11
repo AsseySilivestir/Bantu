@@ -425,9 +425,21 @@ So there are two strategies, chosen by `bantu_workers::kernelBalancesAccepts()`:
 The pre-fork shared listener is the classic Apache model. It trades a few wasted wakeups for
 actually using the cores, which is the right trade when the alternative is one busy worker and N-1
 idle ones. Measured after the fix, 400 concurrent requests across 4 macOS workers: **103 / 99 / 99 /
-99**. Under strictly *sequential* requests the same setup skews hard (183 / 11 / 6 / 0), because
-whichever worker wakes first always wins an uncontended race — that is expected, and it is also the
-load where distribution does not matter.
+99**.
+
+**The macOS caveat worth knowing before you deploy on it:** under strictly *sequential* connections
+the same setup skews hard (183 / 11 / 6 / 0), because an uncontended accept race is always won by
+whichever worker is already parked in `kevent`. For HTTP that is harmless — sequential load is
+precisely the load that does not need distributing. For **WebSockets it is not**, because those
+connections are long-lived: clients arriving one at a time during a quiet period will pile onto a
+single worker and *stay* there, and the imbalance persists long after traffic picks up. Sixteen
+WebSocket clients opened one at a time landed 16/0/0/0; opened concurrently they spread. Linux's
+`SO_REUSEPORT` hashes the 4-tuple and so spreads either way (measured 51/45/51/53 over sequential
+requests).
+
+If you run many long-lived WebSocket connections and multi-worker on macOS, expect imbalance. It is
+a development-machine concern rather than a production one — but it is real, and it is why
+`tests/sua_workers_test.sh` opens its clients concurrently.
 
 The fork point is load-bearing: **after** the Bantu program has run (routes registered, handlers
 defined, globals initialised) and **before** anything is accepted. Every worker therefore starts

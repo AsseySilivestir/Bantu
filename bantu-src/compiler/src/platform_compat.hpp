@@ -26,6 +26,29 @@
     #define _SSIZE_T_DEFINED
   #endif
 
+  // stat(2) mode test macros. MSVC's <sys/stat.h> defines _S_IFMT/_S_IFDIR but
+  // not the POSIX S_IS*() predicates built on them.
+  #include <sys/stat.h>
+  #if !defined(S_ISDIR)
+    #define S_ISDIR(m) (((m) & _S_IFMT) == _S_IFDIR)
+  #endif
+  #if !defined(S_ISREG)
+    #define S_ISREG(m) (((m) & _S_IFMT) == _S_IFREG)
+  #endif
+
+  // chmod(2). MSVC provides _chmod, and its mode bits are only _S_IREAD /
+  // _S_IWRITE -- there is no execute bit on Windows, so a POSIX mode like 0755
+  // cannot be honoured exactly. Mapping "owner-writable" to _S_IWRITE keeps the
+  // one distinction NTFS actually models; the executable bit is meaningless
+  // there because Windows decides executability by file extension.
+  #include <io.h>
+  inline int bantu_compat_chmod(const char* path, int mode) {
+    return _chmod(path, (mode & 0200) ? (_S_IREAD | _S_IWRITE) : _S_IREAD);
+  }
+  #if !defined(chmod)
+    #define chmod(p, m) bantu_compat_chmod((p), (m))
+  #endif
+
   // Struct packing. Used as:
   //     BANTU_PACKED_BEGIN
   //     struct Wire { ... } BANTU_PACKED;
