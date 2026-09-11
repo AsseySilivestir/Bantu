@@ -140,6 +140,14 @@ public:
         return true;
     }
 
+    // Cheap enough to call every loop iteration; lets the caller skip saving
+    // its interpreter context when there is nothing to resume.
+    bool anyReady() {
+        if (!started_) return false;
+        std::lock_guard<std::mutex> l(m_);
+        return !ready_.empty();
+    }
+
     // Give the baton to every task whose off-baton work has finished, one at a
     // time, each running until it parks again or completes.
     void pump() {

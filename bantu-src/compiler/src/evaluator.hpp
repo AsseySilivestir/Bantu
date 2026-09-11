@@ -210,15 +210,58 @@ static BantuServerLimits bantuLimits;
 static bool bantuQuietMode = false;
 
 // ─── Suspending a handler ──────────────────────────────────────────────────
-// The interpreter's whole mutable state is two fields (measured, not assumed:
-// globalEnv_ and classRegistry_ are immutable once the program has loaded, and
-// filePathStack_/loadedModules_/includeDepth_ are live only during `include`,
-// which cannot suspend). The Evaluator publishes pointers to them here so that
-// free functions -- bantuHttpRequestEx and friends are file-scope, not members
-// -- can save and restore them across a suspension without the scheduler
-// knowing anything about the interpreter.
-static std::shared_ptr<Environment>* bantuEnvSlot = nullptr;
-static std::string*                  bantuClassSlot = nullptr;
+// Handing the baton between the loop and a suspended handler means the
+// interpreter's mutable state has to be saved and restored at each edge. That
+// state is five fields, and the Evaluator publishes pointers to them here
+// because the code that saves them is at file scope -- bantuHttpRequestEx and
+// friends are free functions, not members -- and because the scheduler must
+// stay free of interpreter types.
+//
+// `globalEnv_` and `classRegistry_` are NOT among them: both are effectively
+// append-only and shared on purpose, so a class declared by one handler is
+// visible to the next, exactly as it is today.
+struct BantuEvalSlots {
+    std::shared_ptr<Environment>* env = nullptr;       // the current scope chain
+    std::string*              className = nullptr;     // super() resolution
+    std::vector<std::string>* fileStack = nullptr;     // relative include resolution
+    std::vector<std::string>* loaded    = nullptr;     // include cycle guard
+    int*                      depth     = nullptr;     // include depth guard
+};
+static BantuEvalSlots bantuSlots;
+
+// A saved interpreter context: what one execution -- the loop, or one
+// suspended handler -- must have back when it resumes.
+//
+// The include fields are here because `include` CAN suspend. A file included
+// from inside a handler runs its top-level code immediately, and that code may
+// call sleep() or sua.http.get(). Two handlers interleaving inside includes
+// would otherwise push and pop one shared filePathStack_, and the second to
+// finish would pop the first's entry -- silently resolving later relative
+// includes against the wrong directory.
+struct BantuEvalState {
+    std::shared_ptr<Environment> env;
+    std::string className;
+    std::vector<std::string> fileStack;
+    std::vector<std::string> loaded;
+    int depth = 0;
+
+    static BantuEvalState save() {
+        BantuEvalState s;
+        if (bantuSlots.env)       s.env       = *bantuSlots.env;
+        if (bantuSlots.className) s.className = *bantuSlots.className;
+        if (bantuSlots.fileStack) s.fileStack = *bantuSlots.fileStack;
+        if (bantuSlots.loaded)    s.loaded    = *bantuSlots.loaded;
+        if (bantuSlots.depth)     s.depth     = *bantuSlots.depth;
+        return s;
+    }
+    void restore() const {
+        if (bantuSlots.env)       *bantuSlots.env       = env;
+        if (bantuSlots.className) *bantuSlots.className = className;
+        if (bantuSlots.fileStack) *bantuSlots.fileStack = fileStack;
+        if (bantuSlots.loaded)    *bantuSlots.loaded    = loaded;
+        if (bantuSlots.depth)     *bantuSlots.depth     = depth;
+    }
+};
 
 // Run `work` without holding up the event loop.
 //
@@ -230,18 +273,16 @@ static std::string*                  bantuClassSlot = nullptr;
 //
 // `work` runs while the loop is free, so it must touch NOTHING the loop owns:
 // no interpreter state, no bantuConns, no backend. Every current caller is a
-// blocking C library call against its own state (curl, sleep, sqlite), which
-// is what makes that condition easy to keep.
+// blocking C library call against its own state (curl, sleep), which is what
+// makes that condition easy to keep.
 template <typename F>
 static void bantuOffBaton(F&& work) {
     if (!bantu_co::Scheduler::onTask()) { work(); return; }
-    // The loop runs other Bantu code while we are parked, so our scope chain
+    // The loop runs other Bantu code while we are parked, so our own context
     // has to be put back by hand on the way out.
-    std::shared_ptr<Environment> savedEnv = bantuEnvSlot ? *bantuEnvSlot : nullptr;
-    std::string savedClass = bantuClassSlot ? *bantuClassSlot : std::string();
+    BantuEvalState mine = BantuEvalState::save();
     bantu_co::sched().yieldFor([&] { work(); });
-    if (bantuEnvSlot)   *bantuEnvSlot = savedEnv;
-    if (bantuClassSlot) *bantuClassSlot = savedClass;
+    mine.restore();
 }
 
 // ─── Event-loop connection state ───────────────────────────────────────────
@@ -2331,8 +2372,11 @@ public:
         // the code that does it is at file scope (see bantuOffBaton). Published
         // here rather than passed around because there is exactly one Evaluator
         // per process, and a worker forks AFTER the program has loaded.
-        bantuEnvSlot   = &this->env_;
-        bantuClassSlot = &this->currentClassName_;
+        bantuSlots.env       = &this->env_;
+        bantuSlots.className = &this->currentClassName_;
+        bantuSlots.fileStack = &this->filePathStack_;
+        bantuSlots.loaded    = &this->loadedModules_;
+        bantuSlots.depth     = &this->includeDepth_;
         curl_global_init(CURL_GLOBAL_DEFAULT);
         // Web Push takes its randomness from the one platform CSPRNG. Left
         // unset it fails closed rather than falling back to a predictable PRNG.
@@ -3282,9 +3326,9 @@ private:
         if (!suspendable) { respond(); return; }
         // The loop thread's own interpreter state has to survive handing the
         // baton over: the task restores the handler's scope chain on top of it.
-        auto sEnv = env_; auto sCls = currentClassName_;
+        BantuEvalState loopState = BantuEvalState::save();
         bool spawned = bantu_co::sched().spawn(respond);
-        env_ = sEnv; currentClassName_ = sCls;
+        loopState.restore();
         if (!spawned) respond();
     }
 
@@ -3680,10 +3724,12 @@ private:
             // ── suspended handlers that finished their outbound work ──
             // After the events, so a handler resumed here writes its response
             // into a connection table this iteration has already updated.
-            if (bantu_co::sched().started()) {
-                auto sEnv = env_; auto sCls = currentClassName_;
+            // anyReady() first so the common iteration -- nothing to resume --
+            // does not pay for saving the loop's context.
+            if (bantu_co::sched().anyReady()) {
+                BantuEvalState loopState = BantuEvalState::save();
                 bantu_co::sched().pump();
-                env_ = sEnv; currentClassName_ = sCls;
+                loopState.restore();
             }
 
             // ── timers: reap idle connections ──

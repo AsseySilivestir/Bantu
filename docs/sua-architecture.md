@@ -642,10 +642,17 @@ touch no interpreter state, no `bantuConns`, no backend. In `sua.http.all` that 
 go off the baton and the response `Value`s are built after it is back — completion codes are all
 that cross.
 
-**What a suspended handler carries.** Two fields, `env_` and `currentClassName_`, saved before
-parking and restored on resume. `globalEnv_` and `classRegistry_` are immutable once the program has
-loaded; `filePathStack_`/`loadedModules_`/`includeDepth_` are live only during `include`, which
-cannot suspend.
+**What a suspended handler carries.** Five fields, saved before parking and restored on resume.
+`env_` and `currentClassName_` are the two live in almost every suspension. The other three are the
+include state — `filePathStack_`, `loadedModules_`, `includeDepth_` — which the design assumed could
+never be live across a suspension and was wrong about: `include` is valid inside a function body,
+and an included file runs its top-level code immediately, so that code can sleep or make an HTTP
+call. Two handlers suspended inside includes would otherwise share one `filePathStack_`, and the
+second to finish would pop the first's entry. Reproduced before the fix: both handlers failed with
+`Module not found: inner_two.b (imported from .../d1/outer.b)`.
+
+`globalEnv_` and `classRegistry_` are deliberately *not* saved: both are append-only and shared on
+purpose, so a class declared by one handler stays visible to the next, exactly as today.
 
 **Connection identity.** A suspended handler outlives the connection-table entry it was dispatched
 for: the client can disconnect while it waits, and the kernel will reissue the same fd *number* to
@@ -658,7 +665,7 @@ suspended — it has not gone quiet, the server is the one taking the time.
 correct, just not concurrent — never an error. Visible in `sua.server.stats()` as `suspended`,
 `max_suspended`, `suspensions`.
 
-**Measured** (`tests/sua_suspend_test.sh`, macOS): a fast request served in **1 ms** while a 1.2 s
+**Measured** (`tests/sua_suspend_test.sh`, 16 assertions, macOS): a fast request served in **1 ms** while a 1.2 s
 handler is in flight; ten handlers each waiting 300 ms complete in **310 ms**; a handler making an
 HTTP request to its own worker completes in **1 ms** where it previously deadlocked until curl timed
 out at 10 s. Under `workers(3)`, six 1 s handlers landed 3/2/1 across workers and each still took

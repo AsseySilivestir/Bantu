@@ -99,7 +99,7 @@ This is the finding that makes the whole thing tractable, and it was measured ra
 |---|---|
 | `env_` | **yes** — the current scope chain, swapped on every call |
 | `currentClassName_` | **yes** — `super()` resolution, live inside any method |
-| `filePathStack_`, `loadedModules_`, `includeDepth_` | only during `include`, which cannot suspend today |
+| `filePathStack_`, `loadedModules_`, `includeDepth_` | only during `include` — ~~which cannot suspend today~~ **see the correction below** |
 
 `globalEnv_` and `classRegistry_` are effectively immutable once the program has loaded, so they are
 shared rather than saved.
@@ -107,6 +107,15 @@ shared rather than saved.
 So the coroutine context is a five-field struct, saved on suspend and restored on resume. Compare
 that with the alternative of per-connection `Evaluator` instances, which `sua-architecture.md` §4
 rejected as a language-semantics change: this is strictly smaller.
+
+> **Correction (found during implementation).** "`include` cannot suspend" is wrong. `include` is
+> valid inside a function body, and an included file runs its top-level code immediately — so that
+> code can call `sleep()` or `sua.http.get()`. Two handlers suspended inside includes share one
+> `filePathStack_`, and the second to finish pops the *first's* entry, after which relative includes
+> resolve against the wrong directory. Reproduced: with only `env_`/`currentClassName_` saved, two
+> concurrent handlers including from different directories both failed with
+> `Module not found: inner_two.b (imported from .../d1/outer.b)`. All five fields are saved.
+> `tests/sua_suspend_test.sh` covers it.
 
 ## 5. The six questions
 
@@ -253,7 +262,7 @@ than being smuggled in here.
 reachable from a handler. In practice a local SQLite statement is sub-millisecond; the cases that
 hurt are a large query or a write waiting on a busy lock.
 
-### 9.3 One hazard the design did not anticipate
+### 9.3 Two hazards the design did not anticipate
 
 A suspended handler outlives the connection-table entry it was dispatched for. The client can
 disconnect while the handler waits, and the kernel will reissue the same **fd number** to the next
@@ -261,3 +270,7 @@ connection — so a late response would be written to a stranger's socket. Conne
 serial; a resumed handler checks it and drops the response if the connection it was answering is
 gone. Conversely the idle reaper skips a connection whose handler is suspended: it has not gone
 quiet, the server is the one taking the time.
+
+The second is the `include` correction in §4 above — the reason the saved context is five fields
+rather than the two that are live in almost every suspension. The save is unconditional at both
+edges, but the loop only pays for it on an iteration that actually has a handler to resume.

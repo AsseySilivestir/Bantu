@@ -77,6 +77,17 @@ sua.server.get("/self", def(\$req, \$res) {
     \$res.json({"inner": \$r.body, "status": \$r.status});
 }, {"suspend": true});
 
+// Each includes a file that sleeps and then includes a sibling of its own.
+sua.server.get("/inc1", def(\$req, \$res) {
+    include "d1/outer.b";
+    \$res.json({"tag": tag_one()});
+}, {"suspend": true});
+
+sua.server.get("/inc2", def(\$req, \$res) {
+    include "d2/outer.b";
+    \$res.json({"tag": tag_two()});
+}, {"suspend": true});
+
 sua.server.listen($PORT);
 BEOF
 
@@ -91,6 +102,15 @@ sua.server.get("/echo/:n", def(\$req, \$res) {
 }, {"suspend": true});
 sua.server.listen($PORT2);
 BEOF
+
+# Two include trees in two directories, each reachable only from its own.
+# If the include stack is shared across suspensions, d2/outer.b will look for
+# inner_two.b next to d1/outer.b and not find it.
+mkdir -p "$TMP/d1" "$TMP/d2"
+printf 'def tag_one() { return "d1"; }\n' > "$TMP/d1/inner_one.b"
+printf 'def tag_two() { return "d2"; }\n' > "$TMP/d2/inner_two.b"
+printf 'sleep(400);\ninclude "inner_one.b";\n' > "$TMP/d1/outer.b"
+printf 'sleep(400);\ninclude "inner_two.b";\n' > "$TMP/d2/outer.b"
 
 "$BANTU" run "$TMP/srv.b" > "$TMP/srv.log" 2>&1 &
 SRV=$!
@@ -221,6 +241,19 @@ ok(all(d["cap"] == 2 for _, d in parsed), "the cap was actually 2")
 # Two at a time suspend, the rest run inline: strictly slower than an
 # unbounded pool (310ms) and strictly faster than fully serialised (1800ms).
 ok(cap_ms > 400, "a pool of 2 did not overlap all six")
+
+# ── 7. two handlers suspended inside include ─────────────────────────────
+print("")
+print("-- two handlers inside `include` at once --")
+def try_get(p):
+    try:    return get(p, timeout=15)
+    except Exception as e: return "ERR %r" % e
+with cf.ThreadPoolExecutor(2) as ex:
+    i1 = ex.submit(try_get, "/inc1")
+    i2 = ex.submit(try_get, "/inc2")
+    b1, b2 = i1.result(), i2.result()
+ok('"d1"' in b1, "handler 1's include resolved against its own directory -- got %s" % b1[:80])
+ok('"d2"' in b2, "handler 2's include resolved against its own directory -- got %s" % b2[:80])
 
 print("")
 print("  %d passed, %d failed" % (R["pass"], R["fail"]))
