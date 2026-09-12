@@ -99,6 +99,20 @@ public:
     // member above. A const reference only requires ObjectMap to be
     // declared, not complete.
     explicit Value(const ObjectMap& obj) : type(OBJECT), objectVal(std::make_shared<ObjectMap>(obj)) {}
+    // Adopt an existing map instead of copying it, so several Values can refer
+    // to the SAME object. The constructor above always copies, which is right
+    // for ordinary dict literals but wrong wherever an object has to hand out
+    // references to itself -- sua's $res, whose methods return $res so calls
+    // chain, is the case that needs it. A named factory rather than another
+    // constructor because a shared_ptr overload would be ambiguous against the
+    // NATIVE_HANDLE pair below.
+    static Value objectRef(std::shared_ptr<ObjectMap> m) {
+        Value v;
+        v.type = OBJECT;
+        v.objectVal = std::move(m);
+        return v;
+    }
+
     explicit Value(std::vector<Value> lst) : type(LIST), listVal(std::move(lst)) {}
     explicit Value(NativeFn fn) : type(NATIVE_FN), nativeFn(std::move(fn)) {}
     // NATIVE_HANDLE: wrap an opaque native object with a type tag. The two-arg

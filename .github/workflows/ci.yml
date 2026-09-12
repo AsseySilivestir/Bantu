@@ -85,6 +85,8 @@ jobs:
                    tests/sua_http_all_test.sh \
                    tests/sua_concurrency_test.sh \
                    tests/sua_suspend_test.sh \
+                   tests/sua_memory_test.sh \
+                   tests/sua_timeout_test.sh \
                    tests/sua_workers_test.sh; do
             echo "── $s ──"
             if out=$(bash "$s" 2>&1); then
@@ -163,6 +165,7 @@ jobs:
           done
           for s in tests/event_loop_test.sh tests/sua_ws_security_test.sh \
                    tests/sua_pwa_http_test.sh tests/sua_suspend_test.sh \
+                   tests/sua_memory_test.sh tests/sua_timeout_test.sh \
                    tests/sua_workers_test.sh; do
             if out=$(bash "$s" 2>&1); then
               echo "$out"

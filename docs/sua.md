@@ -524,6 +524,51 @@ The roster is **eventually consistent**. A client that connected microseconds ag
 may not appear yet, so treat the list as a snapshot rather than something to synchronise on. When a
 worker dies the supervisor clears its entries from the others.
 
+### Scaling to very large connection counts
+
+What the **server** costs per connection, measured on this implementation:
+
+| | measured |
+|---|---|
+| idle HTTP connection | **244 bytes** (10,000 held) |
+| idle WebSocket connection | **702 bytes** (4,000 held) |
+| broadcast throughput | **122,000 messages/second** (4,000 clients, 0 lost) |
+| request throughput | **8,500 requests/second**, one worker |
+| idle-connection reaping | **O(expired)**, not O(connections) |
+
+At 702 bytes, two million WebSockets is about **1.4 GB of application memory** — comfortably inside a
+4 KB-per-connection budget, with room to spare. Nothing in the server is O(connections) per event:
+connections are held in last-activity order so the idle reaper stops at the first one that has not
+expired, and `epoll`/`kqueue` report only the sockets that are actually ready.
+
+**The remaining limits are the operating system's, not sua's**, and they dominate at that scale:
+
+- **File descriptors.** One per connection, plus headroom. `ulimit -n`, and on Linux `fs.nr_open`
+  and `fs.file-max`. macOS caps `kern.maxfilesperproc` far lower (61,440 by default), so large
+  counts are a Linux exercise.
+- **Kernel socket memory.** This is the dominant term, not the server's 702 bytes: each TCP socket
+  carries kernel receive and send buffers whose *minimums* are `net.ipv4.tcp_rmem` and
+  `net.ipv4.tcp_wmem` (4096 each by default), plus the socket structure itself. Budget several KB
+  per idle connection and size `net.ipv4.tcp_mem` accordingly. Leave `tcp_moderate_rcvbuf` on so the
+  kernel grows buffers only for connections that actually move data.
+- **Accept backlog** — `net.core.somaxconn` and `net.core.netdev_max_backlog`, or connections are
+  dropped during a surge rather than queued.
+- **conntrack**, if a stateful firewall is in the path: `nf_conntrack_max` is a hard ceiling that
+  fails in a confusing way when hit.
+- **Client-side ports**, when load-testing from one machine: a single source address has roughly
+  28,000 ephemeral ports. Test from several addresses or several hosts, or you will measure the
+  client's limit and think it is the server's.
+
+Use `sua.server.workers(0)` to put one event loop on each core. The per-connection costs above are
+per worker, and connections are spread across them.
+
+> **Honest limits of the numbers above.** They were measured up to 10,000 connections on one macOS
+> machine, where `kern.maxfilesperproc` and loopback ephemeral ports prevent going further. The cost
+> *per connection* is flat and the reaper is now O(expired), so nothing in the design degrades with
+> count — but two million connections has not been run end to end, and the OS tuning above is what
+> would decide it. The `poll` fallback backend (Windows, or any platform without epoll/kqueue) is
+> O(connections) per wait by construction and will not scale to these numbers.
+
 ### Suspending handlers
 
 A worker is one event loop on one thread, so a handler that waits on something makes every other

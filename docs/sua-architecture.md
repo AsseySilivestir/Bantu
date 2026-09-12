@@ -180,6 +180,35 @@ Caveat, recorded honestly: when a worker stalls on a blocking call, it stalls bo
 already holds *and* the new ones the kernel has already assigned to it. That is the §7 trade-off, and
 `SO_REUSEPORT` reduces the blast radius to 1/N rather than eliminating it.
 
+### 5.2a Idle connections must not cost a scan
+
+The reaper that closes idle connections originally looked at **every** connection on **every** loop
+iteration. That is invisible at ten thousand connections and fatal at two million, and the loop
+iterates per *event batch*, not once per second — so under load it would spend more than a second of
+CPU per second of wall clock and never catch up. Measured on the real structure:
+
+| connections | full scan, per pass |
+|---|---|
+| 10,000 | 0.086 ms |
+| 100,000 | 1.49 ms |
+| 1,000,000 | 19.97 ms |
+| 2,000,000 | 46.48 ms |
+
+Connections are now held in **last-activity order**, one list per timeout class (HTTP headers,
+WebSockets). Because each class has a *constant* timeout, least-recently-active is the same order as
+expires-first, so the reaper stops at the first entry still inside its timeout and never looks at the
+rest. Moving a connection to the back on activity is O(1); the pass is O(expired) rather than
+O(connections), and costs **0.00001 ms at any size** when nothing has expired.
+
+nginx uses a red-black tree of deadlines, which handles arbitrary per-timer values. With a fixed
+timeout per class a list is strictly cheaper — O(1) rather than O(log n) to reorder — and cannot get
+out of order.
+
+Two things this makes newly possible to get wrong, both covered by `tests/sua_timeout_test.sh`:
+a WebSocket must be **re-filed** into the WebSocket timeout class when it upgrades (otherwise every
+WebSocket would silently die at `header_timeout_ms`), and the walk must not stop early and leave a
+backlog behind an entry it skipped.
+
 ### 5.2 Memory
 
 With tuned TCP buffers, per-connection RAM goes **under 3.5 KB**; a single 64 GB node has been shown

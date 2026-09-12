@@ -74,6 +74,7 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <exception>
 #include <functional>
 #include <mutex>
 #include <thread>
@@ -88,7 +89,6 @@ struct Task {
     std::condition_variable cv;
     std::function<void()>   body;
     bool turn = false;      // this task holds the baton
-    bool quit = false;      // pool shutdown
 };
 
 class Scheduler {
@@ -129,7 +129,6 @@ public:
         if (!idle_.empty()) { t = idle_.back(); idle_.pop_back(); }
         else {
             t = new Task();
-            all_.push_back(t);
             // Started while m_ is held: the new thread's first act is to lock
             // m_, so it waits until we release it below.
             t->th = std::thread(&Scheduler::taskMain, this, t);
@@ -186,30 +185,39 @@ public:
         }
         loopCv_.notify_one();
 
-        work();                                  // off-baton; the loop is free
+        // The baton MUST come back even if `work` throws. Letting an exception
+        // escape here would unwind this task's C++ stack -- destroying Values,
+        // Environments and the shared_ptrs inside them -- WHILE the loop thread
+        // is running other handlers. That is precisely the concurrent access to
+        // interpreter state this whole design exists to prevent, and it would
+        // be reintroduced on the one path nobody exercises.
+        // Not hypothetical: std::this_thread::sleep_for is specified to throw
+        // std::system_error, and any future suspension point may throw too.
+        std::exception_ptr failure;
+        try {
+            work();                              // off-baton; the loop is free
+        } catch (...) {
+            failure = std::current_exception();
+        }
 
         {
             std::lock_guard<std::mutex> l(m_);
             ready_.push_back(t);
         }
         wake();
-        std::unique_lock<std::mutex> l(m_);
-        t->cv.wait(l, [t] { return t->turn; });
+        {
+            std::unique_lock<std::mutex> l(m_);
+            t->cv.wait(l, [t] { return t->turn; });
+        }
+        // Safe to unwind now: we hold the baton, so the loop is stopped.
+        if (failure) std::rethrow_exception(failure);
     }
 
-    // Ends the pool. Not reached in a server that runs until killed; it exists
-    // so the scheduler is not a leak in any other embedding.
-    void shutdown() {
-        std::vector<Task*> all;
-        {
-            std::lock_guard<std::mutex> l(m_);
-            for (Task* t : idle_) { t->quit = true; t->cv.notify_one(); }
-            all.swap(all_);
-            idle_.clear();
-        }
-        for (Task* t : all) { if (t->th.joinable()) t->th.join(); delete t; }
-        started_ = false;
-    }
+    // There is deliberately no shutdown(). The pool's threads live for the
+    // life of the process: the server loop never returns, and a teardown that
+    // tried to join a task blocked waiting for its turn would hang. Tasks are
+    // reused rather than recreated, so the thread count is bounded by
+    // max_suspended_handlers and does not grow.
 
 private:
     // Hand the baton to `t` and block until it comes back. Called with `l`
@@ -226,8 +234,7 @@ private:
     void taskMain(Task* t) {
         for (;;) {
             std::unique_lock<std::mutex> l(m_);
-            t->cv.wait(l, [t] { return t->turn || t->quit; });
-            if (t->quit) return;
+            t->cv.wait(l, [t] { return t->turn; });
             l.unlock();
 
             current_ = t;
@@ -262,7 +269,7 @@ private:
     bool                    loopTurn_ = true;    // the loop starts holding it
     std::vector<Task*>      ready_;              // finished their off-baton work
     std::vector<Task*>      idle_;               // threads awaiting a handler
-    std::vector<Task*>      all_;
+                                                 // (Tasks are never freed -- see sched())
     int                     live_ = 0;
     int                     max_ = 0;
     bool                    started_ = false;
@@ -275,8 +282,13 @@ private:
 inline thread_local Task* Scheduler::current_ = nullptr;
 
 inline Scheduler& sched() {
-    static Scheduler s;
-    return s;
+    // Deliberately leaked. Task threads block on this object's mutex and
+    // condition variable for the life of the process, so destroying it during
+    // static destruction -- while they are still waiting on it -- is undefined
+    // behaviour. A function-local `static Scheduler s;` would do exactly that
+    // on any exit path that runs static destructors.
+    static Scheduler* s = new Scheduler();
+    return *s;
 }
 
 }  // namespace bantu_co
