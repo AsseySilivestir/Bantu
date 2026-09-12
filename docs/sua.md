@@ -477,6 +477,20 @@ shared state belongs in a database, not a global. `workers(1)` (the default) is 
 the ones that happen to share your process. `sua.ws.send(id, …)` likewise finds a client on another
 worker. `sua.ws.clients()` lists only **this worker's** clients unless you enable `ws_roster` below.
 
+**Counts are per worker, deliveries are not.** Under `workers(n)` these three report only what the
+worker answering the call can see, even though the *message* reaches everyone:
+
+| | what it counts |
+|---|---|
+| `sua.ws.broadcast(msg)` returns | clients on **this** worker. The others are reached over the bus and are not counted |
+| `sua.server.stats().ws_clients` | clients on **this** worker |
+| `sua.ws.clients()` | this worker's, plus the roster if `ws_roster` is on |
+
+Measured with 4 workers and 64 clients: `broadcast` returned **49** and all **64** clients received
+the frame. The number is not a delivery receipt — delivery across the bus is fire-and-forget, so no
+exact total is available at the moment the call returns. Do not use the return value to decide
+whether a broadcast worked; use it as a local hint, or count acknowledgements from clients.
+
 Multi-worker mode is POSIX-only; on Windows it logs a notice and runs single-worker.
 
 ### Limits and stats

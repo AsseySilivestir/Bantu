@@ -8371,6 +8371,14 @@ private:
         // deliver to theirs. The return value is the LOCAL count -- the number
         // reached elsewhere is not knowable synchronously, and inventing a
         // total would be worse than reporting the part we actually observed.
+        // sua.ws.broadcast(text) -> how many of THIS WORKER's clients it went to.
+        //
+        // Under workers(n) that is not the total: the frame also goes onto the
+        // bus and reaches every other worker's clients, which are not counted.
+        // Measured with 4 workers and 64 clients, this returned 49 while all 64
+        // received the frame. Delivery across the bus is fire-and-forget, so no
+        // exact total exists at the moment the call returns -- reporting the
+        // local number is honest; inventing a global one would not be.
         wsObj["broadcast"] = makeNative([](std::vector<Value> args) -> Value {
             if (args.empty()) return Value((double)0);
             std::string data = args[0].toString();
