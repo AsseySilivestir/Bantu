@@ -195,20 +195,61 @@ public:
         return "null";
     }
 
-    bool equals(const Value& other) const {
+    // Structural equality for lists and dicts, identity for everything that
+    // cannot meaningfully be compared by value.
+    //
+    // These used to fall through to `default: return false`, so `==` on a list
+    // or a dict was ALWAYS false -- including `$a == $a`, a variable compared
+    // with itself. Any program checking whether two lists matched silently got
+    // the wrong answer, and `!=` was correspondingly always true. Nothing can
+    // depend on that, which is why it is fixed rather than preserved.
+    //
+    // `depth` guards against a structure that contains itself ($a.push($a)),
+    // which would otherwise recurse until the stack ran out. At the limit the
+    // comparison gives up and says "not equal": arbitrary, but terminating, and
+    // it cannot be reached by data of any sane shape.
+    bool equals(const Value& other, int depth = 0) const {
         if (type != other.type) {
             if (type == NUMBER && other.type == BOOL) return (numberVal != 0) == other.boolVal;
             if (type == BOOL && other.type == NUMBER) return boolVal == (other.numberVal != 0);
             return false;
         }
+        if (depth > 64) return false;
         switch (type) {
             case NUMBER: return numberVal == other.numberVal;
             case STRING: return stringVal == other.stringVal;
             case BOOL: return boolVal == other.boolVal;
             case NULL_VAL: return true;
             case NATIVE_HANDLE: return handle == other.handle;   // identity
-            default: return false;
+            case LIST: {
+                if (listVal.size() != other.listVal.size()) return false;
+                for (size_t i = 0; i < listVal.size(); i++)
+                    if (!listVal[i].equals(other.listVal[i], depth + 1)) return false;
+                return true;
+            }
+            case OBJECT: {
+                if (objectVal == other.objectVal) return true;      // the same map
+                if (!objectVal || !other.objectVal) return false;
+                if (objectVal->size() != other.objectVal->size()) return false;
+                // Compared by key, not by position: two dicts with the same
+                // entries are equal whatever order they were built in, even
+                // though iteration order is now insertion order.
+                for (const auto& kv : *objectVal) {
+                    auto it = other.objectVal->find(kv.first);
+                    if (it == other.objectVal->end()) return false;
+                    if (!kv.second.equals(it->second, depth + 1)) return false;
+                }
+                return true;
+            }
+            // Identity: two separately-defined functions with identical bodies
+            // are not the same function, and an instance is equal only to
+            // itself unless the language grows a way to say otherwise.
+            case FUNCTION:       return functionVal == other.functionVal;
+            case CLASS_INSTANCE: return classInstanceVal == other.classInstanceVal;
+            case CLASS_DEF:      return classDefVal == other.classDefVal;
+            case NATIVE_FN:      return false;   // closures have no identity to compare
         }
+        return false;
     }
 };
 

@@ -600,8 +600,8 @@ No new syntax — no `async`, no `await`, no callbacks. The handler is the same 
 holding the loop. Measured: ten handlers each waiting 300 ms complete in **310 ms** rather than 3 s,
 and a fast request is served in **1 ms** while a 1.2 s handler is in flight.
 
-Three calls suspend: `sleep()`, `sua.http.*`, and `sua.http.all`. Everything else runs as it always
-has.
+These suspend: `sleep()`, `sua.http.*`, `sua.http.all`, and the two `sua.udp` calls that wait on the
+network (`recvfrom` and the one-shot `send`). Everything else runs as it always has.
 
 Only **routes** can opt in. `sua.ws.on(...)` handlers and the PWA/push routes always run on the loop,
 so a `sleep()` or outbound call inside one still holds the worker. A suspendable route may freely
@@ -654,6 +654,97 @@ corruption worse than the stall it would fix. See `docs/sua-async-design.md` §9
 
 ---
 
+## UDP — `sua.udp`
+
+Datagram sockets: DNS, STUN, NTP, game and telemetry protocols, anything where you want to send a
+packet and not hold a connection open. Bytes are Bantu's usual representation — a list of integers
+0–255, the same as the hash/crypto modules use.
+
+```bantu
+sua.udp.socket(opts?)                 // -> handle; opts: {"family": "ipv4"|"ipv6", "nonblocking": bool}
+sua.udp.bind($sock, "host:port")      // port 0 = let the OS choose
+sua.udp.send_to($sock, "host:port", $bytes)   // -> bytes sent
+sua.udp.recvfrom($sock, opts?)        // -> {from, data, timeout}; opts: {"timeoutMs", "maxBytes"}
+sua.udp.getsockname($sock)            // -> "host:port"
+sua.udp.close($sock)                  // safe to call twice
+sua.udp.send("host:port", $bytes, opts?)      // one-shot: socket, send, await reply, close
+```
+
+### A round trip
+
+```bantu
+$srv = sua.udp.socket({});
+sua.udp.bind($srv, "127.0.0.1:39000");
+
+$cli = sua.udp.socket({});
+sua.udp.send_to($cli, "127.0.0.1:39000", [72, 73]);
+
+$pkt = sua.udp.recvfrom($srv, {"timeoutMs": 2000});
+if (!$pkt.timeout) {
+    print("got " + str($pkt.data) + " from " + $pkt.from);
+}
+sua.udp.close($srv);
+sua.udp.close($cli);
+```
+
+`recvfrom` returns `{"timeout": true, "from": "", "data": []}` when the timeout expires — it does not
+raise. A hard socket error does raise.
+
+The one-shot form covers the common query/response case:
+
+```bantu
+$r = sua.udp.send("8.8.8.8:53", $dnsQuery, {"timeoutMs": 2000});
+```
+
+IPv6 uses bracket form for the address, and the socket must be created for it:
+
+```bantu
+$s = sua.udp.socket({"family": "ipv6"});
+sua.udp.bind($s, "[::1]:39001");
+```
+
+### Things worth knowing before you rely on it
+
+**A datagram larger than `maxBytes` is silently truncated.** UDP has no way to ask for the rest, so
+the tail is simply gone and nothing reports it. `maxBytes` defaults to **4096**; set it to 65536 if
+you might receive full-size datagrams:
+
+```bantu
+$pkt = sua.udp.recvfrom($sock, {"timeoutMs": 1000, "maxBytes": 65536});
+```
+
+**`maxBytes` must be 0–65536 and ports must be 0–65535.** Both are validated and raise a catchable
+Bantu error. They did not used to be: a negative `maxBytes` terminated the process outright, and
+`"127.0.0.1:99999"` quietly bound to port 34463.
+
+**A datagram is capped at 65,507 bytes** by the protocol, and sockets ask the kernel for a 64 KB send
+and receive buffer so a full-size one actually goes out. Larger sends fail with "Message too long".
+
+**Sockets are not closed for you.** There are no finalisers — a socket you do not `close()` stays
+open until the process exits. In a long-running server, close every socket you create.
+
+**Blocking, unless the route opts in.** `recvfrom` and the one-shot `send` wait on the network, and
+inside an ordinary handler that holds the whole worker — a 3-second `recvfrom` made every other
+connection on that worker wait 2.7 seconds, measured. On a route marked `{"suspend": true}` they
+hand the worker back for the duration, exactly like `sleep` and `sua.http.*`:
+
+```bantu
+sua.server.get("/lookup", def($req, $res) {
+    $r = sua.udp.send("8.8.8.8:53", $query, {"timeoutMs": 2000});   // suspends the handler,
+    $res.json({"answered": !$r.timeout});                           // not the worker
+}, {"suspend": true});
+```
+
+See [Suspending handlers](#suspending-handlers), including the atomicity note.
+
+**UDP gives no delivery guarantee.** Packets can be lost, duplicated, or arrive out of order, and
+`send_to` returning a byte count means the packet left this machine — nothing more. Anything that
+needs reliability has to build it on top, or use TCP.
+
+**`from` is unauthenticated.** A UDP source address is trivially spoofed. Never use `$pkt.from` as
+proof of who sent something, and be careful about replying to it in a way that could amplify traffic
+towards a victim.
+
 ## Databases
 
 ```bantu
@@ -684,6 +775,8 @@ These are real constraints of the current implementation, not oversights to work
   connection, and offloading statements onto it would make `lastInsertId` and `changes` report
   another handler's results. A slow query still stalls the worker.
   [sua-async-design.md](sua-async-design.md) §9.2 has the detail and what the real fix would be.
+- **UDP sockets are never closed for you.** There are no finalisers in the language, so a socket you
+  do not `sua.udp.close()` stays open until the process exits. See [UDP](#udp--suaudp).
 - **`sua.server.use()` registers middleware that never runs.** The dispatch loop contains no
   middleware step. Put shared logic in a function your handlers call.
 - **`sua.response.*` does not work.** It writes to globals the server never reads, and

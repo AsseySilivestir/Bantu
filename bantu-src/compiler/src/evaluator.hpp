@@ -1304,6 +1304,16 @@ static void bantuWsTeardown(int wsId) {
 }
 
 // Helper: parse "host:port" → (host, port). Supports IPv6 brackets [::1]:53.
+// Reject a port that cannot be represented instead of letting htons() wrap it.
+// Unvalidated, "127.0.0.1:99999" bound to port 34463 and "127.0.0.1:-1" bound
+// to 65535 -- both silently, so a typo became a service listening somewhere
+// nobody would think to look.
+static void bantuUdpCheckPort(int port, const char* who) {
+    if (port < 0 || port > 65535)
+        ErrorHandler::throwError(std::string(who) + ": port " + std::to_string(port) +
+                                 " is out of range (0-65535)", 0, 0, ErrorHandler::RUNTIME_ERROR);
+}
+
 static std::pair<std::string, int> bantuUdpParseAddr(const std::string& addr) {
     // IPv6 form: [::1]:53
     if (!addr.empty() && addr[0] == '[') {
@@ -8070,6 +8080,13 @@ private:
             if (nonblocking) {
                 bantuUdpSetNonblocking(fd);
             }
+            // macOS defaults the UDP send buffer to 9216 bytes, so a perfectly
+            // legal 60,000-byte datagram failed with "Message too long". Ask
+            // for enough to carry the protocol maximum; a kernel that refuses
+            // simply leaves its default, which is what happened before.
+            int bufsz = 65536;
+            setsockopt(fd, SOL_SOCKET, SO_SNDBUF, (const char*)&bufsz, sizeof(bufsz));
+            setsockopt(fd, SOL_SOCKET, SO_RCVBUF, (const char*)&bufsz, sizeof(bufsz));
             int id = bantuNextUdpId++;
             bantuUdpSocketTable()[id] = BantuUdpSocket{fd, family, false};
             ObjectMap handle;
@@ -8102,6 +8119,7 @@ private:
             if (id < 0 || !entry || entry->fd < 0)
                 ErrorHandler::throwError("sua.udp.bind: not a valid socket handle", 0, 0, ErrorHandler::RUNTIME_ERROR);
             auto [host, port] = bantuUdpParseAddr(args[1].toString());
+            bantuUdpCheckPort(port, "sua.udp.bind");
             if (port == 0 && args[1].toString().find(":0") == std::string::npos) {
                 // port missing entirely
                 if (args[1].toString().find(":") == std::string::npos) {
@@ -8122,6 +8140,10 @@ private:
                                          0, 0, ErrorHandler::RUNTIME_ERROR);
             }
             entry->bound = true;
+            // The handle dict is shared with the caller, so keep its `bound`
+            // field honest instead of leaving it reading false forever.
+            if (args[0].isObject() && args[0].objectVal)
+                (*args[0].objectVal)["bound"] = Value(true);
             return Value(true);
         });
 
@@ -8136,6 +8158,7 @@ private:
             if (id < 0 || !entry || entry->fd < 0)
                 ErrorHandler::throwError("sua.udp.send_to: not a valid socket handle", 0, 0, ErrorHandler::RUNTIME_ERROR);
             auto [host, port] = bantuUdpParseAddr(args[1].toString());
+            bantuUdpCheckPort(port, "sua.udp.send_to");
             struct sockaddr_storage ss;
             socklen_t sslen = 0;
             std::string err;
@@ -8171,11 +8194,40 @@ private:
                 auto tit = o.find("timeoutMs");
                 if (tit != o.end()) timeoutMs = (int)tit->second.numberVal;
                 auto mit = o.find("maxBytes");
-                if (mit != o.end()) maxBytes = (size_t)mit->second.numberVal;
+                if (mit != o.end()) {
+                    // Taken straight from a double and used to size an
+                    // allocation, this KILLED THE PROCESS: maxBytes -1 became
+                    // SIZE_MAX and died with [FATAL] vector, 1e18 died with
+                    // [FATAL] std::bad_alloc. Neither is catchable from Bantu,
+                    // so a bad argument -- or one derived from a request --
+                    // took the whole server down.
+                    //
+                    // A UDP datagram cannot exceed 65507 bytes, so anything
+                    // outside this range is a mistake in the program and is
+                    // worth saying so rather than clamping silently.
+                    double req = mit->second.numberVal;
+                    if (!(req >= 0.0) || req > 65536.0)
+                        ErrorHandler::throwError(
+                            "sua.udp.recvfrom: maxBytes must be between 0 and 65536 "
+                            "(a UDP datagram cannot exceed 65507 bytes)", 0, 0,
+                            ErrorHandler::RUNTIME_ERROR);
+                    maxBytes = (size_t)req;
+                }
             }
+            // Capture the fd BEFORE going off the baton. `entry` points into
+            // bantuUdpSocketTable(), and while this handler is parked the loop
+            // can run another one that creates a socket and rehashes the table
+            // -- which would leave `entry` dangling.
+            const int ufd = entry->fd;
+
             // Wait for data with optional timeout via poll()
             if (timeoutMs > 0) {
-                int rc = bantuUdpPoll(entry->fd, timeoutMs);
+                int rc = 0;
+                // On a route marked {"suspend": true} the wait happens with the
+                // worker free; everywhere else this is the blocking call it has
+                // always been. Measured before: a 3s recvfrom stalled every
+                // other connection on the worker for 2.7s.
+                bantuOffBaton([&] { rc = bantuUdpPoll(ufd, timeoutMs); });
                 if (rc == 0) {
                     ObjectMap r;
                     r["timeout"] = Value(true);
@@ -8191,8 +8243,13 @@ private:
             std::vector<uint8_t> buf(maxBytes);
             struct sockaddr_storage peer;
             socklen_t peerLen = sizeof(peer);
-            ssize_t n = recvfrom(entry->fd, (char*)buf.data(), (int)buf.size(), 0,
-                                 (struct sockaddr*)&peer, &peerLen);
+            ssize_t n = 0;
+            // No timeout given means a blocking recvfrom with no bound at all,
+            // so this one matters even more than the poll above.
+            bantuOffBaton([&] {
+                n = recvfrom(ufd, (char*)buf.data(), (int)buf.size(), 0,
+                             (struct sockaddr*)&peer, &peerLen);
+            });
             if (n < 0) {
                 ErrorHandler::throwError(std::string("sua.udp.recvfrom: recvfrom() failed: ") + bantuUdpErrStr(),
                                          0, 0, ErrorHandler::RUNTIME_ERROR);
@@ -8212,6 +8269,7 @@ private:
                 ErrorHandler::throwError("sua.udp.send(addr, data, [opts]) needs at least 2 args", 0, 0, ErrorHandler::RUNTIME_ERROR);
             std::string addrStr = args[0].toString();
             auto [host, port] = bantuUdpParseAddr(addrStr);
+            bantuUdpCheckPort(port, "sua.udp.send");
             int timeoutMs = 2000;
             size_t maxBytes = 4096;
             std::string familyStr = "ipv4";
@@ -8221,7 +8279,16 @@ private:
                 auto tit = o.find("timeoutMs");
                 if (tit != o.end()) timeoutMs = (int)tit->second.numberVal;
                 auto mit = o.find("maxBytes");
-                if (mit != o.end()) maxBytes = (size_t)mit->second.numberVal;
+                if (mit != o.end()) {
+                    // Same fatal allocation as recvfrom -- see the note there.
+                    double req = mit->second.numberVal;
+                    if (!(req >= 0.0) || req > 65536.0)
+                        ErrorHandler::throwError(
+                            "sua.udp.send: maxBytes must be between 0 and 65536 "
+                            "(a UDP datagram cannot exceed 65507 bytes)", 0, 0,
+                            ErrorHandler::RUNTIME_ERROR);
+                    maxBytes = (size_t)req;
+                }
                 auto fit = o.find("family");
                 if (fit != o.end()) familyStr = fit->second.toString();
             }
@@ -8231,6 +8298,9 @@ private:
                 ErrorHandler::throwError(std::string("sua.udp.send: socket() failed: ") + bantuUdpErrStr(),
                                          0, 0, ErrorHandler::RUNTIME_ERROR);
             }
+            int bufsz1 = 65536;
+            setsockopt(fd, SOL_SOCKET, SO_SNDBUF, (const char*)&bufsz1, sizeof(bufsz1));
+            setsockopt(fd, SOL_SOCKET, SO_RCVBUF, (const char*)&bufsz1, sizeof(bufsz1));
             struct sockaddr_storage ss;
             socklen_t sslen = 0;
             std::string err;
@@ -8246,8 +8316,10 @@ private:
                 ErrorHandler::throwError(std::string("sua.udp.send: sendto() failed: ") + bantuUdpErrStr(),
                                          0, 0, ErrorHandler::RUNTIME_ERROR);
             }
-            // Wait for response
-            int rc = bantuUdpPoll(fd, timeoutMs);
+            // Wait for response -- off the baton, so a suspendable handler
+            // does not hold the worker for the whole round trip.
+            int rc = 0;
+            bantuOffBaton([&] { rc = bantuUdpPoll(fd, timeoutMs); });
             ObjectMap r;
             if (rc == 0) {
                 BANTU_CLOSE_SOCKET(fd);
@@ -8264,8 +8336,11 @@ private:
             std::vector<uint8_t> rbuf(maxBytes);
             struct sockaddr_storage peer;
             socklen_t peerLen = sizeof(peer);
-            ssize_t n = recvfrom(fd, (char*)rbuf.data(), (int)rbuf.size(), 0,
-                                 (struct sockaddr*)&peer, &peerLen);
+            ssize_t n = 0;
+            bantuOffBaton([&] {
+                n = recvfrom(fd, (char*)rbuf.data(), (int)rbuf.size(), 0,
+                             (struct sockaddr*)&peer, &peerLen);
+            });
             BANTU_CLOSE_SOCKET(fd);
             if (n < 0) {
                 ErrorHandler::throwError(std::string("sua.udp.send: recvfrom() failed: ") + bantuUdpErrStr(),
