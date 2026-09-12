@@ -32,12 +32,14 @@
 // ════════════════════════════════════════════════════════════════════
 #pragma once
 
+#include "platform_compat.hpp"
 #include <iostream>
 #include <fstream>
 #include <sstream>
 #include <string>
 #include <vector>
 #include <map>
+#include <set>
 #include <sys/stat.h>
 #include <cstdio>
 #include <cstring>
@@ -788,7 +790,16 @@ inline bool isPackageInstalled(const std::string& pkgName) {
 }
 
 // Install a package from the local registry into ./bantu_modules/<name>/
-inline bool installPackage(const std::string& pkgName, std::string version) {
+// Recursive installer core. `visited` guards against dependency cycles and
+// redundant re-installs within a single resolution run. Callers use the
+// one-arg installPackage() wrapper below.
+inline bool installPackageInto(const std::string& pkgName, std::string version,
+                               std::set<std::string>& visited) {
+    // Cycle-safe: a package already handled in this run is a no-op success.
+    // (Keyed by name; the first version to resolve wins for a given run.)
+    if (visited.count(pkgName)) return true;
+    visited.insert(pkgName);
+
     std::string src = findPackageInRegistry(pkgName, version);
     if (src.empty()) {
         std::cerr << "  [ERROR] Package not found in local registry: " << pkgName;
@@ -822,7 +833,30 @@ inline bool installPackage(const std::string& pkgName, std::string version) {
         return false;
     }
     std::cout << "  [OK] Installed " << pkgName << " (" << n << " files) -> " << dst << "\n";
+
+    // ── Transitive dependencies (C6) ──────────────────────────────────────
+    // Read the freshly-installed package's manifest and pull in anything it
+    // declares under "dependencies" (e.g. crypto/uuid depend on hash). The
+    // visited-set makes this cycle-safe and avoids re-installing shared deps.
+    Manifest m = readManifest(join(dst, "package.json"));
+    for (const auto& d : m.dependencies) {
+        if (visited.count(d.name)) continue;
+        std::cout << "  [deps] " << pkgName << " requires " << d.name
+                  << " (" << (d.version.empty() ? "latest" : d.version) << ")\n";
+        if (!installPackageInto(d.name, d.version.empty() ? "latest" : d.version, visited)) {
+            std::cerr << "  [WARN] Could not install dependency '" << d.name
+                      << "' required by '" << pkgName << "'.\n";
+            // Non-fatal: the primary package is installed; a missing transitive
+            // dep is surfaced but doesn't roll back the whole operation.
+        }
+    }
     return true;
+}
+
+// Public entrypoint — resolves a package AND its transitive dependencies.
+inline bool installPackage(const std::string& pkgName, std::string version) {
+    std::set<std::string> visited;
+    return installPackageInto(pkgName, version, visited);
 }
 
 // Remove a package from ./bantu_modules/

@@ -1,0 +1,131 @@
+name: release
+
+# Build the Bantu toolchain for Linux, macOS and Windows on every version tag,
+# package standalone installers, and attach everything to the GitHub Release.
+#
+#   git tag v1.2.3 && git push origin v1.2.3
+#
+# Produces, per release:
+#   bantu-linux-x64.tar.gz
+#   bantu-macos-arm64.tar.gz  + Bantu-<ver>-macos-arm64.pkg
+#   bantu-macos-x64.tar.gz    + Bantu-<ver>-macos-x64.pkg
+#   bantu-windows-x64.zip     + Bantu-<ver>-x64.msi
+# which the one-line install.sh / install.ps1 scripts consume.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to build (without leading v)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  # ── Linux (native build via build.sh) ──────────────────────────────────
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install deps
+        run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev libcurl4-openssl-dev
+      - name: Build
+        run: bash bantu-src/compiler/build.sh
+      - name: Package
+        run: |
+          mkdir -p out
+          cp bantu-src/compiler/build/bantu bantu
+          tar -czf out/bantu-linux-x64.tar.gz bantu
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: out/*
+
+  # ── macOS (native build via build-mac.sh) + .pkg, both arches ──────────
+  macos:
+    strategy:
+      matrix:
+        include:
+          - runner: macos-14   # Apple silicon
+            arch: arm64
+          - runner: macos-13   # Intel
+            arch: x64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: bash bantu-src/compiler/build-mac.sh
+      - name: Resolve version
+        id: v
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+      - name: Package tarball + pkg
+        run: |
+          mkdir -p out
+          cp bantu-src/compiler/build/bantu bantu
+          tar -czf out/bantu-macos-${{ matrix.arch }}.tar.gz bantu
+          bash scripts/installers/build-macos-pkg.sh ./bantu "${{ steps.v.outputs.version || '0.0.0' }}"
+          cp dist/*.pkg out/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-${{ matrix.arch }}
+          path: out/*
+
+  # ── Windows (native build via CMake + vcpkg) + MSI ─────────────────────
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install sqlite3 + curl (vcpkg)
+        shell: bash
+        run: vcpkg install sqlite3:x64-windows-static curl:x64-windows-static
+      - name: Configure + build
+        shell: bash
+        run: |
+          cmake -S bantu-src/compiler -B build \
+            -DCMAKE_TOOLCHAIN_FILE="$VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" \
+            -DVCPKG_TARGET_TRIPLET=x64-windows-static \
+            -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --config Release
+      - name: Locate binary
+        shell: bash
+        run: |
+          bin="$(find build -name bantu.exe | head -n1)"
+          echo "Found: $bin"
+          cp "$bin" bantu.exe
+      - name: Resolve version
+        id: v
+        shell: bash
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+      - name: Package zip + MSI
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force out | Out-Null
+          Compress-Archive -Force -Path bantu.exe -DestinationPath out/bantu-windows-x64.zip
+          ./scripts/installers/build-windows-msi.ps1 -Binary ./bantu.exe -Version "${{ steps.v.outputs.version }}" -Arch x64
+          Copy-Item dist/*.msi out/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: out/*
+
+  # ── Assemble the GitHub Release ────────────────────────────────────────
+  release:
+    needs: [linux, macos, windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Flatten
+        run: |
+          mkdir -p release
+          find artifacts -type f -exec cp {} release/ \;
+          ls -la release
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/*
+          generate_release_notes: true

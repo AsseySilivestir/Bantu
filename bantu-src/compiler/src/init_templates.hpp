@@ -557,4 +557,463 @@ inline std::string bantu_json(const std::string& name, const std::string& versio
     return s;
 }
 
+// ════════════════════════════════════════════════════════════════════
+//  `bantu init --pwa` — a Sua web app that is also a Progressive Web App
+//
+//  Everything the --web template gives you, plus an installable manifest,
+//  a service worker with offline support, and Web Push notifications.
+// ════════════════════════════════════════════════════════════════════
+
+// ─── main.b — PWA server ─────────────────────────────────────────────
+inline std::string pwa_main_b(const std::string& name) {
+    std::string s = R"BANTU(// ════════════════════════════════════════════════════════════════════
+//  %%NAME%% — an installable Bantu Progressive Web App
+//  Scaffolded by `bantu init --pwa`
+//
+//  Run:    bantu run main.b
+//  Open:   http://localhost:8080
+//
+//  Service workers require a secure context. localhost counts as one, so
+//  this works over plain http in development; deploy behind HTTPS and it
+//  keeps working unchanged.
+// ════════════════════════════════════════════════════════════════════
+
+// ── PWA ──────────────────────────────────────────────────────────────
+// One flat config, mirroring django-pwa's PWA_APP_* settings. This alone
+// registers /manifest.json, /serviceworker.js, /offline and /pwa.js, and
+// makes the app installable.
+sua.pwa.configure({
+    "name": "%%NAME%%",
+    "short_name": "%%NAME%%",
+    "description": "A Bantu progressive web app",
+    "theme_color": "#2563eb",
+    "background_color": "#ffffff",
+    "display": "standalone",
+    "start_url": "/",
+    "scope": "/",
+    "icons": [
+        {"src": "/icons/icon-192.png", "sizes": "192x192", "type": "image/png"},
+        {"src": "/icons/icon-512.png", "sizes": "512x512", "type": "image/png"}
+    ],
+    // Cached during service-worker install, so these work with no network.
+    "precache": ["/", "/css/style.css", "/js/app.js"]
+});
+
+// ── Push notifications ───────────────────────────────────────────────
+// The keypair is generated on first run and reused after that. Keep
+// vapid.json out of version control and STABLE — the public key is baked
+// into every subscription, so replacing it invalidates all of them.
+$keys = sua.push.keys("./vapid.json");
+if ($keys != null) {
+    sua.push.configure({
+        "public_key": $keys.public_key,
+        "private_key": $keys.private_key,
+        "subject": "mailto:you@example.com",
+        "db": "./subscriptions.db"
+    });
+}
+
+// ── Routes ───────────────────────────────────────────────────────────
+sua.server.get("/api/status", def($req, $res) {
+    $res.json({
+        "app": "%%NAME%%",
+        "subscribers": sua.push.count(),
+        "push": has_native("webpush")
+    });
+});
+
+// Push a notification to every subscriber. send_all drops any subscription
+// the push service reports as gone (404/410).
+sua.server.post("/api/notify", def($req, $res) {
+    $title = "Hello from %%NAME%%";
+    $body = "Your first push notification.";
+    if ($req.body != null) {
+        if ($req.body.title != null) { $title = $req.body.title; }
+        if ($req.body.body != null) { $body = $req.body.body; }
+    }
+    $r = sua.push.send_all({
+        "head": $title,
+        "body": $body,
+        "icon": "/icons/icon-192.png",
+        "url": "/"
+    }, {"ttl": 3600});
+    $res.json({"ok": $r.ok, "sent": $r.sent, "failed": $r.failed, "pruned": $r.pruned});
+});
+
+sua.server.static("./public");
+
+print("");
+print("  %%NAME%% is running on http://localhost:8080");
+print("  Install it from the address bar, then try the notification button.");
+print("");
+
+sua.server.listen(8080);
+)BANTU";
+    replaceAll(s, "%%NAME%%", name);
+    return s;
+}
+
+// ─── public/index.html ───────────────────────────────────────────────
+inline std::string pwa_index_html(const std::string& name) {
+    std::string s = R"HTML(<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>%%NAME%%</title>
+  <link rel="stylesheet" href="/css/style.css">
+  <!-- sua injects the manifest link, theme-color, Apple meta tags and
+       /pwa.js here automatically (auto_inject is on by default). To place
+       them yourself, set "auto_inject": false and render sua.pwa.meta(). -->
+</head>
+<body>
+  <main>
+    <h1>%%NAME%%</h1>
+    <p class="sub">An installable Bantu web app.</p>
+
+    <section class="card">
+      <h2>Status</h2>
+      <dl>
+        <dt>Installed</dt><dd id="s-installed">-</dd>
+        <dt>Notifications</dt><dd id="s-perm">-</dd>
+        <dt>Subscribers</dt><dd id="s-count">-</dd>
+      </dl>
+    </section>
+
+    <section class="card">
+      <div class="actions">
+        <button id="btn-install" disabled>Install app</button>
+        <button id="btn-subscribe">Enable notifications</button>
+        <button id="btn-notify">Send a push</button>
+      </div>
+      <p id="msg"></p>
+    </section>
+  </main>
+  <script src="/js/app.js"></script>
+</body>
+</html>
+)HTML";
+    replaceAll(s, "%%NAME%%", name);
+    return s;
+}
+
+// ─── public/offline.html ─────────────────────────────────────────────
+inline std::string pwa_offline_html(const std::string& name) {
+    std::string s = R"HTML(<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Offline - %%NAME%%</title>
+  <link rel="stylesheet" href="/css/style.css">
+</head>
+<body>
+  <main>
+    <h1>You're offline</h1>
+    <p class="sub">%%NAME%% can't reach the network. Pages you've already
+       visited are still available.</p>
+    <button onclick="location.reload()">Try again</button>
+  </main>
+  <script>addEventListener('online', () => location.reload());</script>
+</body>
+</html>
+)HTML";
+    replaceAll(s, "%%NAME%%", name);
+    return s;
+}
+
+// ─── public/js/app.js ────────────────────────────────────────────────
+inline std::string pwa_app_js() {
+    return R"JS(// window.BantuPWA is provided by /pwa.js, which sua injects into <head>.
+const $ = (id) => document.getElementById(id);
+const say = (t) => { $('msg').textContent = t; };
+
+async function refresh() {
+  $('s-installed').textContent = BantuPWA.isInstalled() ? 'yes' : 'no';
+  $('s-perm').textContent = BantuPWA.permission();
+  $('btn-install').disabled = !BantuPWA.canInstall();
+  try {
+    const r = await fetch('/api/status');
+    $('s-count').textContent = (await r.json()).subscribers;
+  } catch (e) {
+    $('s-count').textContent = 'offline';
+  }
+}
+
+BantuPWA.onInstallPrompt(() => { $('btn-install').disabled = false; });
+
+$('btn-install').onclick = async () => {
+  const outcome = await BantuPWA.promptInstall();
+  say(outcome === 'accepted' ? 'Installed.' : 'Install dismissed.');
+  refresh();
+};
+
+$('btn-subscribe').onclick = async () => {
+  try {
+    await BantuPWA.subscribePush();
+    say('Subscribed. The server can push to this browser now.');
+  } catch (e) {
+    say(e.message);
+  }
+  refresh();
+};
+
+$('btn-notify').onclick = async () => {
+  try {
+    const r = await fetch('/api/notify', { method: 'POST' });
+    const j = await r.json();
+    say('Sent to ' + j.sent + ' subscriber(s).');
+  } catch (e) {
+    say('Could not reach the server.');
+  }
+};
+
+addEventListener('load', () => setTimeout(refresh, 300));
+)JS";
+}
+
+// ─── public/css/style.css ────────────────────────────────────────────
+inline std::string pwa_style_css() {
+    return R"CSS(:root { color-scheme: light dark; --accent: #2563eb; --line: #8884; --dim: #6b7280; }
+* { box-sizing: border-box; }
+body {
+  margin: 0; padding: 2rem 1.25rem;
+  font: 16px/1.6 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+main { max-width: 34rem; margin: 0 auto; }
+h1 { font-size: 1.6rem; margin: 0 0 .25rem; }
+h2 { font-size: .78rem; text-transform: uppercase; letter-spacing: .08em;
+     color: var(--dim); margin: 0 0 .75rem; }
+.sub { color: var(--dim); margin: 0 0 2rem; }
+.card { border: 1px solid var(--line); border-radius: 12px; padding: 1.25rem; margin-bottom: 1.25rem; }
+dl { display: grid; grid-template-columns: auto 1fr; gap: .4rem 1rem; margin: 0; }
+dt { color: var(--dim); }
+dd { margin: 0; }
+.actions { display: flex; flex-wrap: wrap; gap: .6rem; }
+button {
+  font: inherit; padding: .55rem 1.1rem; border: 0; border-radius: 8px;
+  background: var(--accent); color: #fff; cursor: pointer;
+}
+button:disabled { opacity: .45; cursor: not-allowed; }
+#msg { min-height: 1.5rem; color: var(--dim); font-size: .92rem; margin: 1rem 0 0; }
+)CSS";
+}
+
+// ─── .gitignore (adds the push secrets) ──────────────────────────────
+inline std::string pwa_gitignore() {
+    return R"GI(# Bantu
+*.db
+*.db-journal
+
+# Web Push secrets — the VAPID private key must never be committed.
+vapid.json
+subscriptions.db
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+)GI";
+}
+
+// ─── README.md ───────────────────────────────────────────────────────
+inline std::string pwa_readme_md(const std::string& name) {
+    std::string s = R"MD(# %%NAME%%
+
+An installable Progressive Web App built with Bantu and `sua`.
+
+## Run
+
+```bash
+bantu run main.b
+```
+
+Then open <http://localhost:8080>.
+
+## What you get
+
+| URL | Purpose |
+|---|---|
+| `/manifest.json` | the web app manifest, rendered from `sua.pwa.configure()` |
+| `/serviceworker.js` | offline caching plus `push` and `notificationclick` handlers |
+| `/offline` | the fallback page shown when the network is unreachable |
+| `/pwa.js` | `window.BantuPWA` — registration, install prompt, push subscription |
+| `/pwa/subscribe` | stores browser push subscriptions in `subscriptions.db` |
+
+The service worker is served from the ROOT on purpose: a worker's scope is the
+directory it is served from, so only a root-served worker can control the whole
+site.
+
+## Installing it
+
+Open the site in Chrome or Edge and use the install icon in the address bar, or
+click "Install app". On iOS use Share → Add to Home Screen.
+
+Installability requires: a manifest with icons, a registered service worker with
+a `fetch` handler, and a secure context. `localhost` counts as secure, so it all
+works in development.
+
+## Push notifications
+
+1. Click "Enable notifications" — the browser asks permission, subscribes with
+   the server's VAPID public key, and POSTs the subscription to `/pwa/subscribe`.
+2. Click "Send a push" — the server encrypts (RFC 8291 `aes128gcm`), signs a
+   VAPID JWT (RFC 8292), and POSTs to each subscriber's endpoint.
+
+`vapid.json` is generated on first run. **Keep it secret and keep it stable** —
+the public key is embedded in every subscription, so replacing it silently
+invalidates them all. It is gitignored for you.
+
+To send from your own code:
+
+```bantu
+sua.push.send_all({
+    "head": "Title",
+    "body": "Message body",
+    "icon": "/icons/icon-192.png",
+    "url": "/somewhere"
+}, {"ttl": 3600});
+```
+
+Payloads are capped at 3993 octets (4096 minus the header, delimiter and tag).
+
+## Customising
+
+Edit the `sua.pwa.configure({...})` call in `main.b`. To use your own service
+worker, add `"service_worker": "./public/sw.js"`.
+
+Meta tags are injected into your HTML automatically. To place them yourself, set
+`"auto_inject": false` and render `sua.pwa.meta()` into your `<head>`.
+
+## Icons
+
+`public/icons/` contains placeholder 192x192 and 512x512 PNGs. Replace them with
+your own artwork; keep the filenames or update the config to match.
+)MD";
+    replaceAll(s, "%%NAME%%", name);
+    return s;
+}
+
+inline std::string pwa_bantu_json(const std::string& name, const std::string& version) {
+    std::string s = R"JSON({
+  "name": "%%NAME%%",
+  "version": "1.0.0",
+  "entry": "main.b",
+  "template": "pwa",
+  "language": "bantu",
+  "bantuVersion": "%%VER%%",
+  "dependencies": {}
+}
+)JSON";
+    replaceAll(s, "%%NAME%%", name);
+    replaceAll(s, "%%VER%%", version);
+    return s;
+}
+
+// A minimal valid PNG: a solid square in the theme colour, emitted with a
+// hand-rolled deflate "stored" block so no image library is needed. Real
+// artwork should replace these — the README says so.
+inline std::string pwa_icon_png(int size) {
+    auto be32 = [](std::string& out, uint32_t v) {
+        out += (char)((v >> 24) & 0xFF); out += (char)((v >> 16) & 0xFF);
+        out += (char)((v >> 8) & 0xFF);  out += (char)(v & 0xFF);
+    };
+    // CRC-32 (PNG chunk checksum)
+    auto crc32 = [](const std::string& s) -> uint32_t {
+        static uint32_t table[256];
+        static bool init = false;
+        if (!init) {
+            for (uint32_t i = 0; i < 256; i++) {
+                uint32_t c = i;
+                for (int k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
+                table[i] = c;
+            }
+            init = true;
+        }
+        uint32_t c = 0xFFFFFFFFu;
+        for (unsigned char ch : s) c = table[(c ^ ch) & 0xFF] ^ (c >> 8);
+        return c ^ 0xFFFFFFFFu;
+    };
+    auto adler32 = [](const std::string& s) -> uint32_t {
+        uint32_t a = 1, b = 0;
+        for (unsigned char ch : s) { a = (a + ch) % 65521; b = (b + a) % 65521; }
+        return (b << 16) | a;
+    };
+    auto chunk = [&](std::string& out, const char* tag, const std::string& data) {
+        be32(out, (uint32_t)data.size());
+        std::string body = std::string(tag) + data;
+        out += body;
+        be32(out, crc32(body));
+    };
+
+    // 1-bit indexed colour: 2 palette entries, one bit per pixel. Keeps the
+    // placeholder small without needing a real deflate implementation
+    // (a truecolour version of the 512px icon would be ~790 KB stored).
+    int rowBytes = (size + 7) / 8;
+    float u = size / 16.0f;
+    auto glyph = [&](int x, int y) -> bool {
+        float fx = (float)x, fy = (float)y;
+        auto box = [&](float x0, float x1, float y0, float y1) {
+            return fx >= x0 * u && fx < x1 * u && fy >= y0 * u && fy < y1 * u;
+        };
+        // A blocky "B": a stem, three bars, and two bowl edges.
+        if (box(4.5f, 6.1f, 3.5f, 12.5f)) return true;    // stem
+        if (box(4.5f, 10.2f, 3.5f, 5.1f)) return true;    // top bar
+        if (box(4.5f, 10.2f, 7.2f, 8.8f)) return true;    // middle bar
+        if (box(4.5f, 10.2f, 10.9f, 12.5f)) return true;  // bottom bar
+        if (box(9.0f, 10.6f, 3.5f, 8.8f)) return true;    // upper bowl
+        if (box(9.0f, 10.6f, 7.2f, 12.5f)) return true;   // lower bowl
+        return false;
+    };
+
+    std::string raw;
+    raw.reserve((size_t)size * (rowBytes + 1));
+    for (int y = 0; y < size; y++) {
+        raw += '\0';                                  // filter: none
+        for (int b = 0; b < rowBytes; b++) {
+            unsigned char byte = 0;
+            for (int bit = 0; bit < 8; bit++) {
+                int x = b * 8 + bit;
+                if (x < size && glyph(x, y)) byte |= (unsigned char)(0x80 >> bit);
+            }
+            raw += (char)byte;
+        }
+    }
+
+    // zlib stream with stored (uncompressed) deflate blocks.
+    std::string z;
+    z += (char)0x78; z += (char)0x01;
+    size_t pos = 0;
+    while (pos < raw.size()) {
+        size_t n = raw.size() - pos;
+        if (n > 65535) n = 65535;
+        bool last = (pos + n >= raw.size());
+        z += (char)(last ? 1 : 0);
+        z += (char)(n & 0xFF); z += (char)((n >> 8) & 0xFF);
+        uint16_t inv = (uint16_t)~(uint16_t)n;
+        z += (char)(inv & 0xFF); z += (char)((inv >> 8) & 0xFF);
+        z.append(raw, pos, n);
+        pos += n;
+    }
+    be32(z, adler32(raw));
+
+    std::string ihdr;
+    be32(ihdr, (uint32_t)size); be32(ihdr, (uint32_t)size);
+    ihdr += (char)1;    // bit depth: 1
+    ihdr += (char)3;    // colour type: indexed
+    ihdr += (char)0; ihdr += (char)0; ihdr += (char)0;
+
+    std::string plte;                       // 0 = background, 1 = glyph
+    plte += (char)0x25; plte += (char)0x63; plte += (char)0xEB;
+    plte += (char)0xF5; plte += (char)0xF3; plte += (char)0xFF;
+
+    std::string png = "\x89PNG\r\n\x1a\n";
+    chunk(png, "IHDR", ihdr);
+    chunk(png, "PLTE", plte);
+    chunk(png, "IDAT", z);
+    chunk(png, "IEND", "");
+    return png;
+}
+
 } // namespace bantu_templates

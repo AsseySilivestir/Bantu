@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  bantu.wxs — WiX v4/v5 source for a standard Windows MSI installer that installs
+  the Bantu toolchain to "Program Files\Bantu" and adds it to the system PATH.
+
+  Build (on Windows, with the WiX .NET tool installed):
+      dotnet tool install --global wix
+      wix build scripts\installers\bantu.wxs -d Version=1.2.2 ^
+          -bindpath <folder-containing-bantu.exe> -o dist\Bantu-1.2.2-x64.msi
+
+  The scripts\installers\build-windows-msi.ps1 wrapper automates this.
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package Name="Bantu Programming Language"
+           Manufacturer="Bantu"
+           Version="$(Version)"
+           UpgradeCode="7C6E2B44-9D3A-4F1E-B8C2-0A1B2C3D4E5F"
+           Scope="perMachine"
+           Compressed="yes">
+
+    <MajorUpgrade DowngradeErrorMessage="A newer version of Bantu is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <!-- Install into Program Files\Bantu -->
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="Bantu" />
+    </StandardDirectory>
+
+    <ComponentGroup Id="BantuFiles" Directory="INSTALLFOLDER">
+      <Component Id="BantuExe" Guid="A1B2C3D4-E5F6-4718-9A0B-1C2D3E4F5061">
+        <File Id="bantu.exe" Source="bantu.exe" KeyPath="yes" />
+        <!-- Add the install folder to the system PATH. -->
+        <Environment Id="UpdatePath"
+                     Name="PATH"
+                     Value="[INSTALLFOLDER]"
+                     Permanent="no"
+                     Part="last"
+                     Action="set"
+                     System="yes" />
+      </Component>
+    </ComponentGroup>
+
+    <Feature Id="Main" Title="Bantu" Level="1">
+      <ComponentGroupRef Id="BantuFiles" />
+    </Feature>
+  </Package>
+</Wix>

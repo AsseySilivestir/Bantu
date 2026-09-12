@@ -1,0 +1,233 @@
+name: ci
+
+# Build and test on every push and pull request.
+#
+# release.yml only fires on version tags, which meant Linux and Windows were
+# never compiled between releases. That mattered once the sua server grew
+# platform-conditional code with no macOS equivalent:
+#
+#   * the epoll backend (event_loop.hpp) — macOS takes the kqueue path, so
+#     epoll had never been compiled anywhere, let alone run.
+#   * the SO_REUSEPORT worker path (worker_pool.hpp) — Linux is the ONLY
+#     platform where the kernel load-balances accepts, so macOS never takes
+#     that branch. It is the production path and it was untested.
+#   * the Windows single-worker fallback — no fork(), so a whole different
+#     branch of worker_pool.hpp compiles there and nowhere else.
+#
+# Linux runs the full suite; Windows is a compile gate (the runners have no
+# straightforward way to drive the socket tests).
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  # ── Linux: build + the whole test suite ────────────────────────────────
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install deps
+        run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev libcurl4-openssl-dev
+
+      - name: Build
+        run: bash bantu-src/compiler/build.sh
+
+      - name: Which event-loop backend did we get?
+        run: |
+          # Fails loudly if Linux silently fell back to poll: epoll is the
+          # whole point of building here.
+          cat > /tmp/probe.b <<'EOF'
+          sua.server.get("/x", def($req, $res) { $res.send("ok"); });
+          sua.server.listen(39871);
+          EOF
+          ./bantu-src/compiler/build/bantu run /tmp/probe.b > /tmp/probe.log 2>&1 &
+          sleep 3
+          cat /tmp/probe.log
+          grep -q 'event loop: epoll' /tmp/probe.log || {
+            echo "::error::expected the epoll backend on Linux"; exit 1; }
+          pkill -f /tmp/probe.b || true
+
+      - name: Language and library suites
+        run: |
+          BANTU=./bantu-src/compiler/build/bantu
+          fail=0
+          for t in tests/*.b; do
+            [ "$t" = "tests/const_bad.b" ] && continue
+            if $BANTU "$t" 2>&1 | grep -q 'ALL GREEN'; then
+              echo "  ok    $t"
+            else
+              # The specific assertion, as an annotation -- logs need auth.
+              $BANTU "$t" 2>&1 | grep -E '^[[:space:]]*FAIL' | head -5 | while read -r line; do
+                echo "::error::$t -- $line"
+              done
+              echo "::error::$t did not report ALL GREEN"; $BANTU "$t" 2>&1 | tail -20; fail=1
+            fi
+          done
+          # A negative test: this one MUST fail to compile.
+          if $BANTU tests/const_bad.b >/dev/null 2>&1; then
+            echo "::error::const_bad.b was expected to fail"; fail=1
+          else
+            echo "  ok    tests/const_bad.b fails as designed"
+          fi
+          exit $fail
+
+      - name: Server suites
+        run: |
+          export BANTU=./bantu-src/compiler/build/bantu
+          fail=0
+          for s in tests/event_loop_test.sh \
+                   tests/sua_ws_security_test.sh \
+                   tests/sua_pwa_http_test.sh \
+                   tests/sua_http_all_test.sh \
+                   tests/sua_concurrency_test.sh \
+                   tests/sua_suspend_test.sh \
+                   tests/sua_memory_test.sh \
+                   tests/sua_timeout_test.sh \
+                   tests/sua_workers_test.sh; do
+            echo "── $s ──"
+            if out=$(bash "$s" 2>&1); then
+              echo "$out"; echo "  ok    $s"
+            else
+              echo "$out"
+              # Echo each failing assertion as an annotation. Job logs need
+              # authentication to download; annotations do not, so this is what
+              # makes a red build diagnosable from the API.
+              echo "$out" | grep -E '^[[:space:]]*FAIL' | while read -r line; do
+                echo "::error::$s -- $line"
+              done
+              echo "::error::$s failed"
+              fail=1
+            fi
+          done
+          exit $fail
+
+  # ── Linux: the opt-in build, which is C++20 ───────────────────────────
+  linux-sodium:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libsqlite3-dev libcurl4-openssl-dev libsodium-dev
+      - name: Build with libsodium
+        # BANTU_ARROW would also upgrade the build to C++20 but pulls a heavy
+        # dependency; libsodium is enough to keep the opt-in path compiling.
+        run: BANTU_SODIUM=1 bash bantu-src/compiler/build.sh
+      - name: libsodium is actually linked, not silently stubbed
+        run: |
+          # Without this the job is fake-green: build.sh ignored BANTU_SODIUM
+          # until now, so it would have built the DEFAULT binary and the crypto
+          # suites, which skip when the accelerator is absent, would all pass.
+          cat > /tmp/sod.b <<'EOF'
+          print("sodium_available: " + str(sodium_available()));
+          EOF
+          ./bantu-src/compiler/build/bantu run /tmp/sod.b | tee /tmp/sod.out
+          grep -q 'sodium_available: true' /tmp/sod.out || {
+            echo "::error::BANTU_SODIUM=1 but libsodium is not active"; exit 1; }
+
+      - name: Crypto suites
+        run: |
+          BANTU=./bantu-src/compiler/build/bantu
+          for t in crypto_primitives crypto_differential webpush; do
+            if $BANTU "tests/${t}_test.b" 2>&1 | grep -q 'ALL GREEN'; then
+              echo "  ok    $t"
+            else
+              echo "::error::$t did not report ALL GREEN"
+              $BANTU "tests/${t}_test.b" 2>&1 | tail -20
+              exit 1
+            fi
+          done
+
+  # ── macOS: the platform this was developed on ─────────────────────────
+  macos:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: bash bantu-src/compiler/build-mac.sh
+      - name: Suites
+        run: |
+          export BANTU=./bantu-src/compiler/build/bantu
+          fail=0
+          for t in tests/*.b; do
+            case "$t" in */const_bad.b) continue;; esac
+            if out=$($BANTU "$t" 2>&1) && echo "$out" | grep -q 'ALL GREEN'; then :; else
+              echo "$out" | grep -E '^[[:space:]]*FAIL' | head -5 | while read -r line; do
+                echo "::error::$t -- $line"
+              done
+              echo "::error::$t did not report ALL GREEN"; fail=1
+            fi
+          done
+          for s in tests/event_loop_test.sh tests/sua_ws_security_test.sh \
+                   tests/sua_pwa_http_test.sh tests/sua_suspend_test.sh \
+                   tests/sua_memory_test.sh tests/sua_timeout_test.sh \
+                   tests/sua_workers_test.sh; do
+            if out=$(bash "$s" 2>&1); then
+              echo "$out"
+            else
+              echo "$out"
+              echo "$out" | grep -E '^[[:space:]]*FAIL' | while read -r line; do
+                echo "::error::$s -- $line"
+              done
+              fail=1
+            fi
+          done
+          exit $fail
+
+  # ── Windows: compile gate for the single-worker fallback ──────────────
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install sqlite3 + curl (vcpkg)
+        shell: bash
+        run: vcpkg install sqlite3:x64-windows-static curl:x64-windows-static
+      - name: Configure + build
+        shell: bash
+        run: |
+          # MSVC compile errors do not produce annotations on their own, and job
+          # logs need authentication to download -- so surface them by hand,
+          # exactly as the test suites do. Without this a red Windows build is
+          # undiagnosable from the API.
+          set +e
+          out=$(cmake -S bantu-src/compiler -B build \
+            -DCMAKE_TOOLCHAIN_FILE="$VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" \
+            -DVCPKG_TARGET_TRIPLET=x64-windows-static \
+            -DCMAKE_BUILD_TYPE=Release 2>&1)
+          rc=$?
+          echo "$out"
+          if [ $rc -ne 0 ]; then
+            echo "$out" | grep -iE 'cmake error|could not find|error' | head -20 | while read -r l; do
+              echo "::error::configure: $l"
+            done
+            exit 1
+          fi
+          out=$(cmake --build build --config Release 2>&1)
+          rc=$?
+          echo "$out"
+          if [ $rc -ne 0 ]; then
+            echo "$out" | grep -iE 'error [A-Z]+[0-9]+|error:|unresolved external' | head -25 | while read -r l; do
+              echo "::error::build: $l"
+            done
+            exit 1
+          fi
+      - name: Smoke test
+        shell: bash
+        run: |
+          bin="$(find build -name bantu.exe | head -n1)"
+          echo "Found: $bin"
+          "$bin" --version
+          # workers(n) must degrade to single-worker rather than failing: there
+          # is no fork() here, so this is the branch macOS and Linux never take.
+          cat > probe.b <<'EOF'
+          print("workers=" + str(sua.server.workers(4)));
+          EOF
+          "$bin" run probe.b | tee probe.out
+          # Must DEGRADE to 1, not fail and not pretend it forked.
+          grep -q 'workers=1' probe.out || {
+            echo "::error::workers(4) should degrade to 1 on Windows"; exit 1; }

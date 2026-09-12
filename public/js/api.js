@@ -170,3 +170,141 @@ setInterval(() => {
 if (api.token()) {
   api.post('/api/presence', {}).catch(() => {});
 }
+
+// ─── Incoming-call watcher ──────────────────────────────────
+// Rings an Accept/Decline banner on ANY authed page when someone calls us.
+// It PEEKS GET /api/call/incoming (non-consuming); Accept opens the callee
+// call window (dir=in), which then performs the real, consuming offer fetch.
+// This is the fix for "call gets stuck after pickup": previously nothing ever
+// launched the callee/answerer path, so no answer was ever created.
+(function () {
+  // Don't ring on the call page itself — we're already in a call there.
+  if (location.pathname.endsWith('/call.html')) return;
+
+  let ringingFor = null;      // fromId currently shown in the banner
+  const handled = new Set();  // peers we've accepted/declined this ring cycle
+
+  function dismissBanner() {
+    const el = document.getElementById('incoming-call-banner');
+    if (el) el.remove();
+    ringingFor = null;
+  }
+
+  function showBanner(fromId, fromName, hasVideo) {
+    if (ringingFor === fromId || document.getElementById('incoming-call-banner')) return;
+    ringingFor = fromId;
+    const kind = hasVideo ? 'video' : 'voice';
+    const el = document.createElement('div');
+    el.id = 'incoming-call-banner';
+    el.className = 'incoming-call-banner';
+    el.innerHTML =
+      '<div class="ic-avatar">' + avatarLetter(fromName) + '</div>' +
+      '<div class="ic-body">' +
+        '<div class="ic-name">' + escapeHtml(fromName) + '</div>' +
+        '<div class="ic-sub">Incoming ' + kind + ' call…</div>' +
+      '</div>' +
+      '<button class="ic-btn accept" id="ic-accept">Accept</button>' +
+      '<button class="ic-btn decline" id="ic-decline">Decline</button>';
+    document.body.appendChild(el);
+
+    document.getElementById('ic-accept').onclick = function () {
+      handled.add(fromId);
+      const params = new URLSearchParams({
+        peer: fromId, name: fromName, video: hasVideo ? '1' : '0', dir: 'in'
+      });
+      window.open('/call.html?' + params.toString(), '_blank', 'width=1100,height=800');
+      dismissBanner();
+    };
+    document.getElementById('ic-decline').onclick = function () {
+      handled.add(fromId);
+      api.post('/api/call/hangup/' + fromId, {}).catch(() => {});
+      dismissBanner();
+    };
+  }
+
+  async function pollIncoming() {
+    if (!api.token()) return;
+    try {
+      const r = await api.get('/api/call/incoming');
+      if (r && r.incoming) {
+        if (!handled.has(r.fromId)) showBanner(r.fromId, r.fromName, r.hasVideo);
+      } else {
+        // No pending offer (caller hung up, or callee consumed it) — reset.
+        if (ringingFor !== null) dismissBanner();
+        handled.clear();
+      }
+    } catch (e) { /* ignore transient errors */ }
+  }
+
+  setInterval(pollIncoming, 2000);
+  if (api.token()) pollIncoming();
+})();
+
+// ════════════════════════════════════════════════════════════════════
+//  PUSH NOTIFICATIONS
+//  window.BantuPWA comes from /pwa.js, which sua injects into <head>.
+//  Subscriptions are tagged "user-<id>" so the server can push to exactly
+//  one person's browsers — see notify() in server.b.
+// ════════════════════════════════════════════════════════════════════
+(function () {
+  const CB = {
+    supported() {
+      return typeof BantuPWA !== 'undefined' && BantuPWA.pushSupported();
+    },
+
+    async status() {
+      if (!this.supported()) return 'unsupported';
+      if (Notification.permission === 'denied') return 'blocked';
+      return (await BantuPWA.isSubscribed()) ? 'on' : 'off';
+    },
+
+    // Ask permission and register this browser for the signed-in user.
+    async enable() {
+      const user = api.user();
+      if (!user) throw new Error('Sign in first');
+      if (!this.supported()) throw new Error('This browser does not support notifications');
+      await BantuPWA.subscribePush({ tag: 'user-' + user.id });
+      return true;
+    },
+
+    async disable() {
+      if (!this.supported()) return false;
+      return await BantuPWA.unsubscribePush();
+    },
+
+    // Wire up a button: reflects state and toggles on click.
+    bindToggle(el) {
+      if (!el) return;
+      const paint = async () => {
+        const s = await this.status();
+        el.dataset.state = s;
+        el.disabled = (s === 'unsupported' || s === 'blocked');
+        el.textContent = { on: 'Notifications on', off: 'Enable notifications',
+                           blocked: 'Notifications blocked', unsupported: 'Notifications unavailable' }[s];
+      };
+      el.addEventListener('click', async () => {
+        try {
+          const s = await this.status();
+          if (s === 'on') { await this.disable(); } else { await this.enable(); }
+        } catch (e) {
+          console.warn('[chatbantu] push:', e.message);
+        }
+        paint();
+      });
+      paint();
+    }
+  };
+
+  window.chatPush = CB;
+
+  // Offer to turn notifications on once, shortly after sign-in.
+  addEventListener('load', () => {
+    setTimeout(async () => {
+      if (!api.token()) return;
+      if (localStorage.getItem('cb_push_asked')) return;
+      if (!CB.supported() || Notification.permission !== 'default') return;
+      localStorage.setItem('cb_push_asked', '1');
+      try { await CB.enable(); } catch (e) { /* the user declined */ }
+    }, 4000);
+  });
+})();

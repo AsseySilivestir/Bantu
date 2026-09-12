@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Offline — Bantu PWA Demo</title>
+  <link rel="stylesheet" href="/css/app.css">
+</head>
+<body>
+  <main>
+    <header>
+      <img src="/icons/icon-192.png" alt="" width="72" height="72">
+      <h1>You're offline</h1>
+      <p class="sub">This page came from the service worker's cache — the network is unreachable.</p>
+    </header>
+    <section class="card" style="text-align:center">
+      <button onclick="location.reload()">Try again</button>
+    </section>
+  </main>
+  <script>addEventListener('online', () => location.reload());</script>
+</body>
+</html>

@@ -1,0 +1,6 @@
+ {
+      "name": "orm",
+      "version": "1.0.0",
+      "main": "orm.b",
+      "description": "This is an Object Relational Mapper designed to support multiple databases using bantu. It has Postgres,Mysql and Sqlite support"
+    }

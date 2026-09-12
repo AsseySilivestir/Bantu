@@ -1,5 +1,5 @@
 /**
- * Bantu VSCode Extension v1.2.2
+ * Bantu VSCode Extension v1.3.1
  * Entry point — registers commands, completion provider, hover provider,
  * and the file icon (declared in package.json).
  */
@@ -9,6 +9,7 @@ import { BantuCompletionProvider } from './completionProvider';
 import { BantuHoverProvider } from './hoverProvider';
 import { BantuSymbolProvider } from './symbolProvider';
 import { BantuTaskProvider } from './taskProvider';
+import { BantuDiagnostics } from './diagnosticsProvider';
 
 export function activate(context: vscode.ExtensionContext) {
     const bantuSel: vscode.DocumentSelector = [
@@ -42,6 +43,11 @@ export function activate(context: vscode.ExtensionContext) {
     context.subscriptions.push(
         vscode.tasks.registerTaskProvider('bantu', taskProvider)
     );
+
+    // ─── Live diagnostics (linter) ───
+    // Runs `bantu lint --json` as you type; errors → red, warnings → yellow.
+    const diagnostics = new BantuDiagnostics(context);
+    diagnostics.activate();
 
     // ─── Commands ───
     context.subscriptions.push(
@@ -117,7 +123,7 @@ export function activate(context: vscode.ExtensionContext) {
         })
     );
 
-    console.log('[Bantu] Extension activated (v1.2.2).');
+    console.log('[Bantu] Extension activated (v1.3.1).');
 }
 
 export function deactivate() {

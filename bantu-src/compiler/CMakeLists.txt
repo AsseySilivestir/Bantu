@@ -116,6 +116,19 @@ target_link_libraries(bantu PRIVATE Threads::Threads)
 if(WIN32)
     target_compile_definitions(bantu PRIVATE _WIN32_WINNT=0x0601)
     target_link_libraries(bantu PRIVATE ws2_32)
+
+    # sqlite3 and curl, from vcpkg.
+    #
+    # Nothing linked these before, so the CMake Windows build could not have
+    # produced a binary at all -- every curl_* and sqlite3_* symbol was
+    # unresolved. It went unnoticed because the only workflow that built
+    # Windows ran on version tags. The static triplet is what pairs with the
+    # static CRT selected below, so bantu.exe stays self-contained.
+    find_package(CURL CONFIG REQUIRED)
+    target_link_libraries(bantu PRIVATE CURL::libcurl)
+    find_package(unofficial-sqlite3 CONFIG REQUIRED)
+    target_link_libraries(bantu PRIVATE unofficial::sqlite3::sqlite3)
+
     # MSVC: also link the C runtime statically so bantu.exe runs without
     # vcruntime140.dll redistributable on the target machine.
     if(MSVC)

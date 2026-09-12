@@ -26,6 +26,10 @@ string $envPort = env("PORT");
 if (!$envPort) { $envPort = "8080"; }
 string $dbPath = "/data/chatbantu.db";
 
+// Set to true once Web Push is configured (see the PWA section near the end).
+// Declared up here so notify() can read it regardless of definition order.
+$PUSH_READY = false;
+
 // Probe persistent volume; fall back to local file
 dict $probe = sua.sqlite.open($dbPath);
 if (!$probe.connected) {
@@ -198,6 +202,19 @@ def notify($toUserId, $type, $body, $link) {
         "INSERT INTO notifications (user_id, type, body, link) VALUES (" +
         str($toUserId) + ", '" + esc($type) + "', '" + esc($body) + "', '" + esc($link) + "');"
     );
+    // Also deliver as a Web Push notification, so it arrives when the app is
+    // closed. Subscriptions are tagged "user-<id>" by the client, so this
+    // reaches only that recipient's browsers. It is a no-op when push is not
+    // configured or the user has never subscribed.
+    if ($PUSH_READY) {
+        sua.push.send_all({
+            "head": "ChatBantu",
+            "body": $body,
+            "icon": "/icons/icon-192.png",
+            "tag":  $type,
+            "url":  $link
+        }, {"ttl": 86400, "urgency": "high"}, "user-" + str($toUserId));
+    }
 }
 
 // ════════════════════════════════════════════════════════════════════
@@ -857,6 +874,37 @@ def handleCallHangup($req, $res) {
     $res.json({"ok": true, "message": "Call ended"});
 }
 
+// Peek for an incoming call addressed to me WITHOUT consuming the offer.
+// The global poller in api.js calls this to ring the Accept banner; the
+// callee's call.html later performs the real (consuming) GET /api/call/offer.
+// Returns the newest unconsumed offer's caller id, name and video flag.
+def handleCallIncoming($req, $res) {
+    dict $me = authUser($req);
+    if (!$me) {
+        $res.status(401).json({"error": "Not authenticated"});
+        return null;
+    }
+    list $rows = sua.sqlite.query(
+        "SELECT s.from_id AS from_id, u.display_name AS from_name, s.payload AS payload, s.created_at AS created_at " +
+        "FROM signaling s JOIN users u ON u.id = s.from_id " +
+        "WHERE s.to_id = " + str($me.id) + " AND s.type = 'offer' AND s.consumed = 0 " +
+        "ORDER BY s.id DESC LIMIT 1;"
+    );
+    if (len($rows) == 0) {
+        $res.json({"incoming": false});
+        return null;
+    }
+    string $payload = $rows[0].payload;
+    bool $hasVideo = contains($payload, "m=video");
+    $res.json({
+        "incoming": true,
+        "fromId": num($rows[0].from_id),
+        "fromName": $rows[0].from_name,
+        "hasVideo": $hasVideo,
+        "createdAt": $rows[0].created_at
+    });
+}
+
 // ════════════════════════════════════════════════════════════════════
 //  HEALTH & OPTIONS
 // ════════════════════════════════════════════════════════════════════
@@ -924,9 +972,68 @@ sua.server.get("/api/call/answer/:id",                handleCallAnswerGet);
 sua.server.post("/api/call/ice/:id",                  handleCallIcePost);
 sua.server.get("/api/call/ice/:id",                   handleCallIceGet);
 sua.server.post("/api/call/hangup/:id",               handleCallHangup);
+sua.server.get("/api/call/incoming",                  handleCallIncoming);
 
 // CORS preflight
 sua.server.options("/*",                              handleOptions);
+
+// ════════════════════════════════════════════════════════════════════
+//  PROGRESSIVE WEB APP
+//  Makes ChatBantu installable, usable offline, and able to receive push
+//  notifications while closed. Purely additive — every existing route is
+//  untouched, and the app runs exactly as before if push is unavailable.
+// ════════════════════════════════════════════════════════════════════
+sua.pwa.configure({
+    "name": "ChatBantu",
+    "short_name": "ChatBantu",
+    "description": "A social network and chat app written in pure Bantu",
+    "theme_color": "#1d4ed8",
+    "background_color": "#0b1020",
+    "display": "standalone",
+    "start_url": "/",
+    "scope": "/",
+    "orientation": "portrait",
+    "icons": [
+        {"src": "/icons/icon-192.png", "sizes": "192x192", "type": "image/png"},
+        {"src": "/icons/icon-512.png", "sizes": "512x512", "type": "image/png"},
+        {"src": "/icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable"}
+    ],
+    "shortcuts": [
+        {"name": "Feed", "url": "/feed.html", "description": "Your timeline"},
+        {"name": "Messages", "url": "/chat.html", "description": "Your conversations"},
+        {"name": "People", "url": "/people.html", "description": "Find people to follow"}
+    ],
+    "categories": ["social", "communication"],
+    "precache": ["/", "/feed.html", "/chat.html", "/people.html",
+                 "/notifications.html", "/css/styles.css", "/js/api.js"]
+});
+
+// VAPID keys live beside the database so they survive a redeploy on a
+// persistent volume. They must stay stable: the public key is embedded in
+// every subscription a browser has already created.
+$vapidPath = "./vapid.json";
+if ($dbPath == "/data/chatbantu.db") { $vapidPath = "/data/vapid.json"; }
+
+$pushKeys = sua.push.keys($vapidPath);
+if ($pushKeys != null) {
+    $pushDb = "./push_subscriptions.db";
+    if ($dbPath == "/data/chatbantu.db") { $pushDb = "/data/push_subscriptions.db"; }
+    dict $pushCfg = sua.push.configure({
+        "public_key": $pushKeys.public_key,
+        "private_key": $pushKeys.private_key,
+        "subject": "mailto:admin@chatbantu.app",
+        "db": $pushDb,
+        "subscribe_url": "/api/push/subscribe"
+    });
+    if ($pushCfg.ok) {
+        $PUSH_READY = true;
+        print "[OK] Web Push enabled (" + str(sua.push.count()) + " subscription(s)).";
+    } else {
+        print "[WARN] Web Push disabled: " + str($pushCfg.error);
+    }
+} else {
+    print "[WARN] Web Push unavailable in this build — notifications stay in-app only.";
+}
 
 // Static frontend
 sua.server.static("./public");

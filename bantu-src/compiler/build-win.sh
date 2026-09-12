@@ -109,6 +109,22 @@ CPP_FLAGS=(
     -D_CRT_SECURE_NO_WARNINGS
 )
 
+# ── Optional: Apache Arrow (Parquet + Feather/IPC), OFF by default ────────
+# Enable with:  BANTU_ARROW=1 ARROW_HOME=/path/to/arrow bash build-win.sh
+# Kept opt-in so the default binary gains NO new dependency. Arrow 14+ headers
+# need C++20 (std::span/popcount); the last -std wins. Untested on Windows here —
+# provide a mingw-built Arrow via ARROW_HOME. The default build is unaffected.
+ARROW_LINK=()
+if [ "${BANTU_ARROW:-0}" = "1" ]; then
+    if [ -z "${ARROW_HOME:-}" ] || [ ! -f "$ARROW_HOME/include/arrow/api.h" ]; then
+        echo "[FAIL] BANTU_ARROW=1 but ARROW_HOME not set to an Arrow install (need include/arrow/api.h)"
+        exit 1
+    fi
+    echo "  Apache Arrow: $ARROW_HOME (Parquet + Feather)"
+    CPP_FLAGS+=( -std=c++20 -DBANTU_ARROW -I "$ARROW_HOME/include" )
+    ARROW_LINK=( -L "$ARROW_HOME/lib" -larrow -lparquet )
+fi
+
 SOURCES=(
     src/lexer.cpp
     src/parser.cpp
@@ -139,16 +155,19 @@ echo
 echo "── Linking build/bantu.exe ──"
 # -L "$LIB_DIR" finds the .dll.a import libs for sqlite3.dll and libcurl-x64.dll
 # -lws2_32  → Windows Sockets (Winsock2), always static (system lib)
+# -lbcrypt  → CNG (BCryptGenRandom), the Windows CSPRNG used by bantuCsprng
 # -lc++ -lwinpthread → llvm-mingw C++ runtime + threading
 if $CXX "${CPP_FLAGS[@]}" \
         "${OBJECTS[@]}" \
         build/ios_stub.o \
         -o build/bantu.exe \
         "${EXTRA_LIB[@]}" \
+        "${ARROW_LINK[@]}" \
         -L "$LIB_DIR" \
         -l:libsqlite3.dll.a \
         -l:libcurl-x64.dll.a \
-        -lws2_32 2>&1; then
+        -lws2_32 \
+        -lbcrypt 2>&1; then
     echo "[PASS] Linked build/bantu.exe ($(wc -c <build/bantu.exe) bytes)"
 else
     echo "[FAIL] Link failed"

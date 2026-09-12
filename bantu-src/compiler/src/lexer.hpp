@@ -69,6 +69,22 @@ public:
             if (c == '$') {
                 tokens.emplace_back(BantuTokenType::DECLARATOR, "$", line_, col_);
                 advance();
+                // The word after `$` is ALWAYS a variable name — even when it
+                // spells a reserved word (e.g. $db, $create, $list, $switch).
+                // The sigil disambiguates variables from keywords, so read the
+                // following word as a raw IDENTIFIER (skipping keyword lookup).
+                // This lets any word be used as a variable name.
+                if (pos_ < source_.size() &&
+                    (std::isalpha(static_cast<unsigned char>(source_[pos_])) || source_[pos_] == '_')) {
+                    int idLine = line_, idCol = col_;
+                    std::string name;
+                    while (pos_ < source_.size() &&
+                           (std::isalnum(static_cast<unsigned char>(source_[pos_])) || source_[pos_] == '_')) {
+                        name += source_[pos_];
+                        advance();
+                    }
+                    tokens.emplace_back(BantuTokenType::IDENTIFIER, name, idLine, idCol);
+                }
                 continue;
             }
 
@@ -252,6 +268,7 @@ private:
             {"default",  BantuTokenType::DEFAULT},
             {"break",    BantuTokenType::BREAK},
             {"continue", BantuTokenType::CONTINUE},
+            {"throw",    BantuTokenType::THROW},
 
             // Functions
             {"def",      BantuTokenType::DEF},

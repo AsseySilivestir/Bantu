@@ -4,15 +4,19 @@
  * High-performance C++ interpreter with native types
  */
 
+#include "platform_compat.hpp"
 #include <string>
 #include <variant>
 #include <memory>
 #include <vector>
 #include <unordered_map>
+#include <stdexcept>
+#include "ordered_map.hpp"
 #include <functional>
 #include <iostream>
 #include <sstream>
 #include <cmath>
+#include <exception>
 #include <algorithm>
 
 // ============================================================
@@ -43,12 +47,21 @@ class Value;
 //   is specifically designed to allow incomplete T (used in pimpl patterns),
 //   so the member declaration compiles even while Value is incomplete.
 //   The map is only instantiated lazily, by which time Value is complete.
-using ObjectMap = std::unordered_map<std::string, Value>;
+// Insertion-ordered, and therefore the SAME order on every platform. It used
+// to be std::unordered_map, which iterated in hash order -- different between
+// libc++ and libstdc++, so json.stringify() key order, CSV column order and
+// arctic DataFrame columns all silently depended on the OS. See ordered_map.hpp.
+using ObjectMap = BantuOrderedMap<Value>;
 using NativeFn = std::function<Value(std::vector<Value>)>;
 
 class Value {
 public:
-    enum Type { NUMBER, STRING, BOOL, NULL_VAL, FUNCTION, CLASS_INSTANCE, CLASS_DEF, OBJECT, NATIVE_FN, LIST };
+    enum Type { NUMBER, STRING, BOOL, NULL_VAL, FUNCTION, CLASS_INSTANCE, CLASS_DEF, OBJECT, NATIVE_FN, LIST,
+                // An opaque native object (e.g. an arctic Column) owned by a
+                // shared_ptr so C++ RAII frees it when the last Bantu reference
+                // drops — no manual free, no leak. `stringVal` doubles as the
+                // type tag (e.g. "column"); `handle` holds the object.
+                NATIVE_HANDLE };
 
     Type type;
 
@@ -65,6 +78,9 @@ public:
     std::shared_ptr<ObjectMap> objectVal;
     std::vector<Value> listVal;
     std::function<Value(std::vector<Value>)> nativeFn;
+    // Opaque native object for NATIVE_HANDLE values (the type tag lives in
+    // stringVal). shared_ptr<void> gives automatic, refcounted lifetime.
+    std::shared_ptr<void> handle;
 
     Value() : type(NULL_VAL) {}
     explicit Value(double n) : type(NUMBER), numberVal(n) {}
@@ -83,8 +99,26 @@ public:
     // member above. A const reference only requires ObjectMap to be
     // declared, not complete.
     explicit Value(const ObjectMap& obj) : type(OBJECT), objectVal(std::make_shared<ObjectMap>(obj)) {}
+    // Adopt an existing map instead of copying it, so several Values can refer
+    // to the SAME object. The constructor above always copies, which is right
+    // for ordinary dict literals but wrong wherever an object has to hand out
+    // references to itself -- sua's $res, whose methods return $res so calls
+    // chain, is the case that needs it. A named factory rather than another
+    // constructor because a shared_ptr overload would be ambiguous against the
+    // NATIVE_HANDLE pair below.
+    static Value objectRef(std::shared_ptr<ObjectMap> m) {
+        Value v;
+        v.type = OBJECT;
+        v.objectVal = std::move(m);
+        return v;
+    }
+
     explicit Value(std::vector<Value> lst) : type(LIST), listVal(std::move(lst)) {}
     explicit Value(NativeFn fn) : type(NATIVE_FN), nativeFn(std::move(fn)) {}
+    // NATIVE_HANDLE: wrap an opaque native object with a type tag. The two-arg
+    // signature keeps it unambiguous from the constructors above.
+    Value(std::shared_ptr<void> h, const std::string& tag)
+        : type(NATIVE_HANDLE), stringVal(tag), handle(std::move(h)) {}
 
     bool isNumber() const { return type == NUMBER; }
     bool isString() const { return type == STRING; }
@@ -96,6 +130,9 @@ public:
     bool isObject() const { return type == OBJECT; }
     bool isList() const { return type == LIST; }
     bool isNativeFn() const { return type == NATIVE_FN; }
+    bool isNativeHandle() const { return type == NATIVE_HANDLE; }
+    // The type tag of a NATIVE_HANDLE (e.g. "column"); empty otherwise.
+    const std::string& handleTag() const { return stringVal; }
 
     bool isTruthy() const {
         switch (type) {
@@ -107,6 +144,7 @@ public:
             case CLASS_INSTANCE: case CLASS_DEF: return true;
             case OBJECT: return objectVal && !objectVal->empty();
             case LIST: return !listVal.empty();
+            case NATIVE_HANDLE: return (bool)handle;   // a live handle is truthy
         }
         return false;
     }
@@ -152,6 +190,7 @@ public:
                 oss << "]";
                 return oss.str();
             }
+            case NATIVE_HANDLE: return "<" + stringVal + ">";   // e.g. "<column>"
         }
         return "null";
     }
@@ -167,6 +206,7 @@ public:
             case STRING: return stringVal == other.stringVal;
             case BOOL: return boolVal == other.boolVal;
             case NULL_VAL: return true;
+            case NATIVE_HANDLE: return handle == other.handle;   // identity
             default: return false;
         }
     }
@@ -217,7 +257,7 @@ enum class BantuTokenType {
     DEF, RETURN,
     PRINT, READ, DB, FETCH, AWAIT,
     CONST, PRIVATE, PUBLIC, FROM,
-    TRY, CATCH,
+    TRY, CATCH, THROW,
     BREAK, CONTINUE, SWITCH, CASE, DEFAULT,
     NEW, CREATE, DELETE, UPDATE, CALC,
     CLASS, EXTENDS, IMPLEMENTS, SUPER,
@@ -244,6 +284,43 @@ struct Token {
 };
 
 // ============================================================
+// EXCEPTIONS (real, catchable error propagation)
+// ============================================================
+//
+// Bantu control flow uses two families of C++ exceptions:
+//   * BantuError  — a runtime/syntax/type error. Derives from std::exception
+//                   so `try { } catch ($e) { }` (evalTryCatch) can catch it and
+//                   the top-level/parser can recover instead of looping.
+//   * BantuThrow  — a value thrown by a Bantu `throw <expr>;` statement. Carries
+//                   the thrown Value so the catch block receives it verbatim.
+// (BreakSignal/ContinueSignal/ReturnSignal are deliberately NOT std::exception,
+//  so they pass through try/catch untouched — see evaluator.hpp.)
+
+// A structured, position-carrying error. `what()` returns a formatted message.
+struct BantuError : std::exception {
+    std::string message;   // human-readable text
+    std::string typeName;  // e.g. "RUNTIME ERROR", "SYNTAX ERROR"
+    int line = 0;
+    int col = 0;
+    std::string full;      // cached "[TYPE] message (line L, col C)"
+
+    BantuError(std::string msg, std::string type, int l = 0, int c = 0)
+        : message(std::move(msg)), typeName(std::move(type)), line(l), col(c) {
+        full = "[" + typeName + "] " + message;
+        if (line && col) full += " (line " + std::to_string(line) + ", col " + std::to_string(col) + ")";
+    }
+    const char* what() const noexcept override { return full.c_str(); }
+};
+
+// A value thrown by a Bantu `throw` statement.
+struct BantuThrow : std::exception {
+    Value value;
+    std::string rendered;
+    explicit BantuThrow(Value v) : value(std::move(v)) { rendered = value.toString(); }
+    const char* what() const noexcept override { return rendered.c_str(); }
+};
+
+// ============================================================
 // ERROR HANDLER
 // ============================================================
 
@@ -266,10 +343,12 @@ public:
         return "ERROR";
     }
 
-    static void throwError(const std::string& msg, int line = 0, int col = 0, ErrorType etype = RUNTIME_ERROR) {
-        std::cerr << "\n[" << errorTypeName(etype) << "] " << msg;
-        if (line && col) std::cerr << "\n  at line " << line << ", col " << col;
-        std::cerr << "\n";
+    // Raise a Bantu error. As of v1.3.0 this THROWS a catchable BantuError
+    // instead of merely printing — the linchpin that makes try/catch work and
+    // stops the parser from looping on a stuck token. Uncaught errors are
+    // reported by the top-level handler in evaluator.hpp / main.cpp.
+    [[noreturn]] static void throwError(const std::string& msg, int line = 0, int col = 0, ErrorType etype = RUNTIME_ERROR) {
+        throw BantuError(msg, errorTypeName(etype), line, col);
     }
 
     static void throwSyntaxError(const std::string& msg, int line = 0, int col = 0) {

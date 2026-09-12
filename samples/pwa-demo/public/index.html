@@ -1,0 +1,134 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Bantu PWA Demo</title>
+  <link rel="stylesheet" href="/css/app.css">
+  <!--
+    No PWA tags here on purpose. `auto_inject` is on, so sua injects the
+    manifest link, the theme-color and Apple meta tags, and /pwa.js into
+    <head> as this file is served. To do it explicitly instead, set
+    "auto_inject": false and render sua.pwa.meta() into your template.
+  -->
+</head>
+<body>
+  <main>
+    <header>
+      <img src="/icons/icon-192.png" alt="" width="72" height="72">
+      <h1>Bantu PWA Demo</h1>
+      <p class="sub">Installable, offline-capable, and pushing notifications signed by the interpreter itself.</p>
+    </header>
+
+    <section class="card">
+      <h2>Status</h2>
+      <dl id="status">
+        <dt>Service worker</dt><dd id="s-sw">checking…</dd>
+        <dt>Installed</dt><dd id="s-installed">checking…</dd>
+        <dt>Notifications</dt><dd id="s-perm">checking…</dd>
+        <dt>Subscribed</dt><dd id="s-sub">checking…</dd>
+        <dt>Subscribers on server</dt><dd id="s-count">—</dd>
+        <dt>Connection</dt><dd id="s-net">—</dd>
+      </dl>
+    </section>
+
+    <section class="card">
+      <h2>Try it</h2>
+      <div class="actions">
+        <button id="btn-install" disabled>Install app</button>
+        <button id="btn-subscribe">Enable notifications</button>
+        <button id="btn-notify">Send a push</button>
+        <button id="btn-unsubscribe" class="ghost">Unsubscribe</button>
+      </div>
+      <p id="msg" class="msg"></p>
+    </section>
+
+    <section class="card">
+      <h2>See it work offline</h2>
+      <ol>
+        <li>Load this page once so the service worker caches it.</li>
+        <li>Stop the server (<code>Ctrl-C</code>) — or switch off your network.</li>
+        <li>Reload. Cached pages still load; anything uncached falls back to
+            <a href="/offline">/offline</a>.</li>
+      </ol>
+      <button id="btn-time" class="ghost">Fetch /api/time</button>
+      <pre id="time-out"></pre>
+    </section>
+
+    <footer>
+      <p>Served by <code>sua</code> — Bantu's web framework.
+         Push uses RFC 8291 (aes128gcm) and RFC 8292 (VAPID).</p>
+    </footer>
+  </main>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+    const say = (t, bad) => { const m = $('msg'); m.textContent = t; m.className = 'msg' + (bad ? ' bad' : ' good'); };
+
+    async function refresh() {
+      $('s-sw').textContent = BantuPWA.supported()
+        ? (await navigator.serviceWorker.getRegistration() ? 'registered' : 'not registered yet')
+        : 'unsupported';
+      $('s-installed').textContent = BantuPWA.isInstalled() ? 'yes (running standalone)' : 'no (in a browser tab)';
+      $('s-perm').textContent = BantuPWA.permission();
+      $('s-sub').textContent = (await BantuPWA.isSubscribed()) ? 'yes' : 'no';
+      $('s-net').textContent = navigator.onLine ? 'online' : 'offline';
+      $('btn-install').disabled = !BantuPWA.canInstall();
+      try {
+        const r = await fetch('/api/status');
+        const j = await r.json();
+        $('s-count').textContent = j.subscribers;
+      } catch (e) { $('s-count').textContent = 'unavailable (offline)'; }
+    }
+
+    BantuPWA.onInstallPrompt(() => { $('btn-install').disabled = false; });
+
+    $('btn-install').onclick = async () => {
+      const outcome = await BantuPWA.promptInstall();
+      say(outcome === 'accepted' ? 'Installed.' : 'Install dismissed.', outcome !== 'accepted');
+      refresh();
+    };
+
+    $('btn-subscribe').onclick = async () => {
+      try {
+        await BantuPWA.subscribePush({ tag: 'demo' });
+        say('Subscribed. The server can now push to this browser.');
+      } catch (e) { say(e.message, true); }
+      refresh();
+    };
+
+    $('btn-unsubscribe').onclick = async () => {
+      const done = await BantuPWA.unsubscribePush();
+      say(done ? 'Unsubscribed.' : 'There was no subscription to remove.', !done);
+      refresh();
+    };
+
+    $('btn-notify').onclick = async () => {
+      try {
+        const r = await fetch('/api/notify', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ title: 'Hello from Bantu', body: 'Encrypted and signed by the interpreter.' })
+        });
+        const j = await r.json();
+        say(`Sent to ${j.sent} subscriber(s). ${j.failed} failed, ${j.pruned} pruned.`, j.sent === 0);
+      } catch (e) { say('Could not reach the server: ' + e.message, true); }
+      refresh();
+    };
+
+    $('btn-time').onclick = async () => {
+      try {
+        const r = await fetch('/api/time');
+        $('time-out').textContent = JSON.stringify(await r.json());
+      } catch (e) { $('time-out').textContent = 'fetch failed — you are offline'; }
+    };
+
+    addEventListener('online', refresh);
+    addEventListener('offline', refresh);
+    addEventListener('load', () => setTimeout(refresh, 300));
+    if (new URLSearchParams(location.search).get('action') === 'notify') {
+      addEventListener('load', () => setTimeout(() => $('btn-notify').click(), 600));
+    }
+  </script>
+</body>
+</html>

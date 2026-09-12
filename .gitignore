@@ -35,4 +35,17 @@ vscode-extension/package-lock.json
 
 # PG-enabled local build (kept separate so default build is unaffected)
 bantu-src/compiler/build_pg/
+samples
+samples/webrtc-chat/server.b
 
+# Web Push secrets — a VAPID private key must never be committed. Replacing it
+# silently invalidates every push subscription a browser has already created.
+vapid.json
+**/vapid.json
+push_subscriptions.db
+subscriptions.db
+# Code signing secrets — DO NOT COMMIT
+*.key
+*.pfx
+*.crt
+bantu-codesign.*

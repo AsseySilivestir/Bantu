@@ -73,13 +73,61 @@ CPP_FLAGS=(
     -O2
     -I src
     -I"$BREW_PREFIX/include"
+    -DBANTU_FFI          # enable the FFI builtins (loadlib/func)
 )
 
 LINK_LIBS=(
     -L"$BREW_PREFIX/lib"
     -lsqlite3
     -lcurl
+    -lffi                # libffi — foreign function interface
+    -ldl                 # dlopen/dlsym
 )
+
+# ── Optional: libsodium AEAD + argon2id (C3), OFF by default ──────────────
+# Enable with:  BANTU_SODIUM=1 bash build-mac.sh
+# Kept opt-in so the default binary gains NO new runtime dependency (important
+# for existing production deployments). When enabled we STATICALLY link
+# libsodium (libsodium.a) so the resulting binary stays self-contained.
+if [ "${BANTU_SODIUM:-0}" = "1" ]; then
+    SODIUM_PREFIX="$(brew --prefix libsodium 2>/dev/null || true)"
+    if [ -z "$SODIUM_PREFIX" ] || [ ! -f "$SODIUM_PREFIX/include/sodium.h" ]; then
+        die "BANTU_SODIUM=1 but libsodium not found" \
+            "Install it first:  brew install libsodium"
+    fi
+    echo "  libsodium: $SODIUM_PREFIX (static link)"
+    CPP_FLAGS+=( -DBANTU_SODIUM -I"$SODIUM_PREFIX/include" )
+    # Prefer the static archive so the binary carries no libsodium .dylib dep.
+    if [ -f "$SODIUM_PREFIX/lib/libsodium.a" ]; then
+        LINK_LIBS+=( "$SODIUM_PREFIX/lib/libsodium.a" )
+    else
+        LINK_LIBS+=( -L"$SODIUM_PREFIX/lib" -lsodium )
+    fi
+fi
+
+# ── Optional: Apache Arrow (Parquet + Feather/IPC), OFF by default ────────
+# Enable with:  BANTU_ARROW=1 bash build-mac.sh
+# Kept opt-in so the default binary gains NO new runtime dependency (Arrow is a
+# heavy library). When enabled we link the shared libarrow/libparquet from brew.
+if [ "${BANTU_ARROW:-0}" = "1" ]; then
+    # Arrow 14+ headers need C++20 (std::span/popcount). The last -std wins, so
+    # appending here upgrades the whole (opt-in) build; the default stays C++17.
+    CPP_FLAGS+=( -std=c++20 )
+    if command -v pkg-config >/dev/null 2>&1 && pkg-config --exists arrow parquet; then
+        echo "  Apache Arrow: $(pkg-config --modversion arrow) (Parquet + Feather)"
+        CPP_FLAGS+=( -DBANTU_ARROW $(pkg-config --cflags arrow parquet) )
+        LINK_LIBS+=( $(pkg-config --libs arrow parquet) )
+    else
+        ARROW_PREFIX="$(brew --prefix apache-arrow 2>/dev/null || true)"
+        if [ -z "$ARROW_PREFIX" ] || [ ! -f "$ARROW_PREFIX/include/arrow/api.h" ]; then
+            die "BANTU_ARROW=1 but Apache Arrow not found" \
+                "Install it first:  brew install apache-arrow"
+        fi
+        echo "  Apache Arrow: $ARROW_PREFIX (Parquet + Feather)"
+        CPP_FLAGS+=( -DBANTU_ARROW -I"$ARROW_PREFIX/include" )
+        LINK_LIBS+=( -L"$ARROW_PREFIX/lib" -larrow -lparquet )
+    fi
+fi
 
 # ═══════════════════════════════════════════════════════════════════════
 #  Build

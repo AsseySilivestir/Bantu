@@ -21,6 +21,7 @@
 #include "types.hpp"
 #include "lexer.hpp"
 #include "parser.hpp"
+#include "linter.hpp"
 #include "evaluator.hpp"
 #include "environment.hpp"
 #include "server.hpp"
@@ -55,7 +56,7 @@
     #include <unistd.h>
 #endif
 
-const std::string BANTU_VERSION = "1.2.2";
+const std::string BANTU_VERSION = "1.3.2";
 const std::string BANTU_LANG = "Bantu";
 
 // ─── Helpers ──────────────────────────────────────────────────────────
@@ -289,6 +290,9 @@ void printHelp() {
 // v1.2.2: global quiet flag — flips evaluator into quiet mode and suppresses
 // the "Running:" / "[Executed in ...]" chit-chat. Set by --quiet on the CLI.
 static bool g_quietMode = false;
+// Compile gate: when true, `run`/`build` lint the source and refuse to execute
+// on error-severity diagnostics. Disabled with `--no-lint`.
+static bool g_lintGate = true;
 
 void runCode(const std::string& source, const std::string& filename = "<repl>") {
     auto start = std::chrono::high_resolution_clock::now();
@@ -298,6 +302,25 @@ void runCode(const std::string& source, const std::string& filename = "<repl>") 
 
     Parser parser(std::move(tokens));
     auto ast = parser.parse();
+
+    // Compile gate: lint the parsed program (syntax errors from recovery + the
+    // static checks) and refuse to execute if ANY error-severity diagnostic is
+    // present. Warnings are printed but do not block. Fix-then-run, like a real
+    // toolchain. (`--no-lint` is honored by the caller for an escape hatch.)
+    if (g_lintGate) {
+        std::vector<LintDiag> diags;
+        for (const auto& e : parser.errors()) diags.push_back({e.line, e.col, "error", e.message});
+        { std::set<std::string> consts; for (auto& node : ast) bantuLintWalk(node, consts, diags); }
+        int errCount = 0;
+        for (const auto& d : diags) {
+            std::cerr << "  [" << d.severity << "] line " << d.line << ", col " << d.col << ": " << d.message << "\n";
+            if (d.severity == "error") errCount++;
+        }
+        if (errCount > 0) {
+            throw BantuError("compilation blocked by " + std::to_string(errCount)
+                             + " error(s) — fix them and re-run", "LINT");
+        }
+    }
 
     Evaluator evaluator;
     evaluator.setQuiet(g_quietMode);
@@ -366,6 +389,60 @@ void runRepl() {
             buffer.clear();
         }
     }
+}
+
+// ─── bantu lint ───────────────────────────────────────────────────────
+// Static analysis without executing. `--json` emits machine-readable
+// diagnostics for the VS Code extension; otherwise a human summary.
+// Exit code is non-zero when any error-severity diagnostic is present.
+int cmdLint(int argc, char* argv[]) {
+    std::string path;
+    bool json = false;
+    for (int i = 2; i < argc; ++i) {
+        std::string a = argv[i];
+        if (a == "--json") json = true;
+        else if (a == "--help" || a == "-h") {
+            std::cout << "  Usage: bantu lint <file.b> [--json]\n";
+            return 0;
+        } else if (!a.empty() && a[0] != '-') {
+            path = a;
+        }
+    }
+    if (path.empty()) {
+        std::cerr << "  Usage: bantu lint <file.b> [--json]\n";
+        return 1;
+    }
+    if (!fileExists(path)) {
+        std::cerr << "  [ERROR] File not found: " << path << "\n";
+        return 1;
+    }
+
+    std::string source = readFile(path);
+    auto diags = bantuLintSource(source);
+
+    if (json) {
+        std::cout << "[";
+        for (size_t i = 0; i < diags.size(); ++i) {
+            if (i) std::cout << ",";
+            std::cout << "{\"line\":" << diags[i].line
+                      << ",\"col\":" << diags[i].col
+                      << ",\"severity\":\"" << diags[i].severity << "\""
+                      << ",\"message\":\"" << bantuJsonEscape(diags[i].message) << "\"}";
+        }
+        std::cout << "]\n";
+    } else {
+        int errs = 0, warns = 0;
+        for (auto& d : diags) {
+            (d.severity == "error" ? errs : warns)++;
+            std::cerr << "  " << d.severity << " (line " << d.line << ", col " << d.col << "): "
+                      << d.message << "\n";
+        }
+        if (diags.empty()) std::cout << "  ✓ " << path << " — no issues found\n";
+        else std::cout << "  " << errs << " error(s), " << warns << " warning(s)\n";
+    }
+
+    for (auto& d : diags) if (d.severity == "error") return 1;
+    return 0;
 }
 
 // ─── bantu run ────────────────────────────────────────────────────────
@@ -688,6 +765,83 @@ int cmdInitWeb(const std::string& projectName) {
     std::cout << "    bantu run main.b    # anywhere with bantu on PATH\n";
     std::cout << "\n";
     std::cout << "  Then open http://localhost:8080\n";
+
+    return 0;
+}
+
+// ─── bantu init --pwa / bantu new --pwa ──────────────────────────────
+// Scaffolds a Sua web app that is ALSO a Progressive Web App: an installable
+// manifest, a service worker with offline support, and Web Push notifications.
+
+int cmdInitPwa(const std::string& projectName) {
+    if (projectName.empty()) {
+        std::cerr << "  [ERROR] Project name required.\n";
+        std::cerr << "  Usage: bantu init --pwa <project-name>\n";
+        return 1;
+    }
+    if (projectName.find_first_of("/\\:*?\"<>|") != std::string::npos
+        || projectName.find(' ') != std::string::npos) {
+        std::cerr << "  [ERROR] Invalid project name: '" << projectName << "'\n";
+        std::cerr << "  Names cannot contain spaces or any of: / \\ : * ? \" < > |\n";
+        return 1;
+    }
+    if (fileExists(projectName)) {
+        std::cerr << "  [ERROR] Directory already exists: " << projectName << "\n";
+        return 1;
+    }
+
+    std::cout << "  Creating Bantu PWA: " << projectName << "\n";
+
+#ifdef _WIN32
+    #define BANTU_MKDIR_PWA(p) mkdir(p)
+#else
+    #define BANTU_MKDIR_PWA(p) mkdir(p, 0755)
+#endif
+    BANTU_MKDIR_PWA(projectName.c_str());
+    BANTU_MKDIR_PWA((projectName + "/public").c_str());
+    BANTU_MKDIR_PWA((projectName + "/public/css").c_str());
+    BANTU_MKDIR_PWA((projectName + "/public/js").c_str());
+    BANTU_MKDIR_PWA((projectName + "/public/icons").c_str());
+#undef BANTU_MKDIR_PWA
+
+    writeFile(projectName + "/main.b",                 bantu_templates::pwa_main_b(projectName));
+    writeFile(projectName + "/public/index.html",      bantu_templates::pwa_index_html(projectName));
+    writeFile(projectName + "/public/offline.html",    bantu_templates::pwa_offline_html(projectName));
+    writeFile(projectName + "/public/css/style.css",   bantu_templates::pwa_style_css());
+    writeFile(projectName + "/public/js/app.js",       bantu_templates::pwa_app_js());
+    writeFile(projectName + "/public/icons/icon-192.png", bantu_templates::pwa_icon_png(192));
+    writeFile(projectName + "/public/icons/icon-512.png", bantu_templates::pwa_icon_png(512));
+    writeFile(projectName + "/start.sh",               bantu_templates::start_sh());
+    writeFile(projectName + "/start.bat",              bantu_templates::start_bat());
+    writeFile(projectName + "/Dockerfile",             bantu_templates::dockerfile());
+    writeFile(projectName + "/render.yaml",            bantu_templates::render_yaml(projectName));
+    writeFile(projectName + "/.gitignore",             bantu_templates::pwa_gitignore());
+    writeFile(projectName + "/README.md",              bantu_templates::pwa_readme_md(projectName));
+    writeFile(projectName + "/bantu.json",             bantu_templates::pwa_bantu_json(projectName, BANTU_VERSION));
+
+#ifndef _WIN32
+    chmod((projectName + "/start.sh").c_str(), 0755);
+#endif
+
+    std::cout << "  ────────────────────────────\n";
+    std::cout << "  Project created: " << projectName << "/\n";
+    std::cout << "    " << projectName << "/main.b                 ← server + PWA + push config\n";
+    std::cout << "    " << projectName << "/public/                ← frontend\n";
+    std::cout << "    " << projectName << "/public/offline.html    ← shown when the network is gone\n";
+    std::cout << "    " << projectName << "/public/icons/          ← placeholder icons (replace these)\n";
+    std::cout << "    " << projectName << "/README.md              ← docs\n";
+    std::cout << "\n";
+    std::cout << "  Served for you automatically:\n";
+    std::cout << "    /manifest.json      /serviceworker.js      /offline\n";
+    std::cout << "    /pwa.js             /pwa/subscribe\n";
+    std::cout << "\n";
+    std::cout << "  Next steps:\n";
+    std::cout << "    cd " << projectName << "\n";
+    std::cout << "    bantu run main.b\n";
+    std::cout << "\n";
+    std::cout << "  Then open http://localhost:8080 and install it from the address bar.\n";
+    std::cout << "  A VAPID keypair is written to vapid.json on first run — keep it\n";
+    std::cout << "  secret and stable (it is gitignored for you).\n";
 
     return 0;
 }
@@ -2668,10 +2822,14 @@ int main(int argc, char* argv[]) {
         for (int i = 2; i < argc; ++i) {
             std::string a = argv[i];
             if (a == "--quiet" || a == "-q") { g_quietMode = true; }
+            else if (a == "--no-lint") { g_lintGate = false; }
             else if (!a.empty() && a[0] != '-') { file = a; }
         }
         return cmdRun(file);
     }
+
+    // ─── bantu lint ───
+    if (command == "lint") return cmdLint(argc, argv);
 
     // ─── bantu build ───
     if (command == "build") {
@@ -2686,27 +2844,31 @@ int main(int argc, char* argv[]) {
     //   bantu new <name>             ← alias of init
     //   bantu new --web <name>       ← alias of init --web
     if (command == "init" || command == "new") {
-        // Parse args. The --web flag can come before or after the name.
-        bool web = false;
+        // Parse args. The flag can come before or after the name.
+        enum { KIND_CLI, KIND_WEB, KIND_PWA } kind = KIND_CLI;
         std::string name = "";
         for (int i = 2; i < argc; ++i) {
             std::string a = argv[i];
             if (a == "--web" || a == "-w" || a == "web") {
-                web = true;
+                kind = KIND_WEB;
+            } else if (a == "--pwa" || a == "-p" || a == "pwa") {
+                kind = KIND_PWA;
             } else if (a == "--cli" || a == "-c") {
-                web = false;
+                kind = KIND_CLI;
             } else if (a == "--help" || a == "-h") {
                 std::cout << "  Usage:\n";
                 std::cout << "    bantu init <name>           CLI project (default)\n";
                 std::cout << "    bantu init --web <name>     Sua web app starter\n";
+                std::cout << "    bantu init --pwa <name>     Installable PWA: manifest,\n";
+                std::cout << "                                service worker, offline page,\n";
+                std::cout << "                                and Web Push notifications\n";
                 return 0;
             } else if (!a.empty() && a[0] != '-') {
                 name = a;
             }
         }
-        if (web) {
-            return cmdInitWeb(name);
-        }
+        if (kind == KIND_PWA) return cmdInitPwa(name);
+        if (kind == KIND_WEB) return cmdInitWeb(name);
         return cmdInit(name);
     }
 

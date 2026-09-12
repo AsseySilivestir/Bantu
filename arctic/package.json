@@ -1,0 +1,6 @@
+{
+  "name": "arctic",
+  "version": "1.2.0",
+  "main": "arctic.b",
+  "description": "A data-science DataFrame library for Bantu — the power of pandas + polars, made simple. DataFrame/Series with method chaining and a plain-English query() DSL; groupby/agg, joins, multi-column sort, unique/drop_nulls/fill_null, pivot/melt, concat/hstack, value_counts/quantile/corr; window and cumulative ops (cumsum, shift, diff, rank); text operations; datetime/date/categorical dtypes; lazy frames with predicate + projection pushdown; CSV (sub-second on 1M rows), JSON, SQLite, and Parquet/Feather I/O (opt-in Arrow build). Written in pure Bantu on the native columnar primitives (col_*); fast on millions of rows."
+}

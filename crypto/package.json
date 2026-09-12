@@ -1,0 +1,9 @@
+{
+  "name": "crypto",
+  "version": "1.0.0",
+  "main": "crypto.b",
+  "description": "Cryptography for Bantu — OS-CSPRNG secure random (random_bytes, token_hex, token_urlsafe, random_int), HMAC-SHA256 with constant-time verification, HKDF-SHA256 (RFC 5869), and base64/base64url/hex encoding. Pure Bantu on native primitives. Symmetric encryption and password KDFs are intentionally out of scope (use a vetted native layer).",
+  "dependencies": {
+    "hash": "1.0.0"
+  }
+}
