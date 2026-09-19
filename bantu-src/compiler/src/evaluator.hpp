@@ -6,6 +6,7 @@
  *           SQLite, PostgreSQL, MySQL
  */
 
+#include <csignal>      // SIGPIPE: see bantuStartHttpServer
 #include "types.hpp"
 #include "ast.hpp"
 #include "environment.hpp"
@@ -2045,6 +2046,20 @@ private:
 #ifdef _WIN32
         WSADATA wsa;
         WSAStartup(MAKEWORD(2, 2), &wsa);
+#else
+        // A client that sends a request and then disconnects without reading
+        // the reply makes the next send() on that socket raise SIGPIPE, whose
+        // default action terminates the process (exit 141 = 128 + 13). No
+        // handshake and no credentials are needed, so this is an unauthenticated
+        // remote kill: one request is enough.
+        //
+        // Ignoring the signal turns the same condition into send() returning
+        // -1/EPIPE, which the existing error paths already handle by giving up
+        // on that connection.
+        //
+        // Set here rather than at process start so that `bantu run script.b | head`
+        // still terminates on a closed pipe like any other CLI program.
+        signal(SIGPIPE, SIG_IGN);
 #endif
         int sock = (int)socket(AF_INET, SOCK_STREAM, 0);
         if (sock < 0) {
