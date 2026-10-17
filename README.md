@@ -1,14 +1,37 @@
 # Bantu
 
-**Bantu Programming Language v1.3.0 — Stable Release**
+**Bantu Programming Language v1.4.0 — Stable Release**
 
-A high-level, dynamically-typed programming language implemented as a tree-walking interpreter in C++17. The entire toolchain — interpreter, linter, package manager, HTTP server, WebRTC engine, SQLite/PostgreSQL drivers, FFI, project scaffolding, VSCode extension, and cross-platform desktop installer generator — ships as a single static binary with zero runtime dependencies.
+A high-level, dynamically-typed programming language implemented as a tree-walking interpreter in C++17. The entire toolchain — interpreter, linter, package manager, cycle-collecting runtime, HTTP server, WebSocket engine, WebRTC engine, SQLite/PostgreSQL drivers, FFI, native n-d arrays, matplotlib-style charts with a byte-identical SVG+PNG raster backend, project scaffolding, VSCode extension, and cross-platform desktop installer generator — ships as a single static binary with zero runtime dependencies.
 
 ```bash
-bantu --version     # → Bantu v1.3.0
+bantu --version     # → Bantu v1.4.0
 bantu init myapp
 cd myapp && bantu run
 ```
+
+## What's New in v1.4.0
+
+The **"Systems & Data" release**. v1.4.0 ships two new headline features and formally
+publishes the long "Phase 6" body of work — a cycle collector, refcounted class instances,
+`numba` (native n-d arrays), `arctic` (DataFrames), `bplot` (matplotlib-style charts
+with a from-scratch raster backend that produces byte-identical PNGs on Linux, macOS and
+Windows), and a control-flow rewrite that cut the interpreter benchmark from **35.7 s to
+6.7 s**. Full details in [`CHANGELOG.md`](CHANGELOG.md).
+
+| Change | Highlights |
+|---|---|
+| **`sua.fs` filesystem namespace [NEW]** | Twenty-six native builtins: `exists`, `stat`, `mkdir`/`mkdirp`, `rmdir`/`rmdir_rec`, `remove`, `rename`, `copy`/`copy_rec`, `readdir`/`listdir`, `cwd`/`chdir`, `tempdir`, `abspath`/`basename`/`dirname`/`join`/`split`, `readfile`/`writefile`/`appendfile` (incl. `_bytes` binary variants), `chmod`. Cross-platform POSIX + Windows. Covered by `tests/fs_test.b` (61 assertions). |
+| **`format()` string formatting [NEW]** | Python-style: `format("Hello, {}!", "World")`, `format("{0}+{0}={1}", ...)` positional, `format("{name} is {age}", {"name":"Ada","age":36})` keyed, plus `{{`/`}}` escapes. Covered by `tests/format_test.b` (21 assertions). |
+| **Cycle collector** | A CPython/PHP-style cycle collector runs alongside refcounting. Programs that leak (mutual refs, self-stored methods, nested `def`s) are now flat at 17–20 MB instead of growing to OOM. `gc_stats()` / `gc_collect()` / `gc_enable(bool)` builtins; `BANTU_GC=0` disables automatic collection. Zero cost when there are no cycles. |
+| **Refcounted class instances** | `new ClassName()` no longer leaks. 20,000 instances are flat at 4.9 MB instead of climbing to 372 MB. |
+| **Pending-signal control flow** | `return`/`break`/`continue` are a pending signal, not a C++ exception. `benchmarks/bench.b` went **35.7 s → 6.7 s**. No syntax/semantics change. |
+| **`numba` — native n-d arrays** | A native ndarray backend: elementwise math, reductions over axes, broadcasting, matmul, slicing, all without leaving native memory. Drawing a 1,000,000-row column went from ~20 s / 3.1 GB to **under a second**. |
+| **`arctic` — DataFrames** | pandas-style Series + DataFrame: read/write CSV+JSON, groupby, joins, rolling windows, and lazy `include` of bplot so `$df.plot({...})` just works. |
+| **`bplot` — matplotlib-style charts** | A full charting library written from scratch in Bantu + a native raster backend: SVG **and** byte-identical PNG output, `hist`/`boxplot`/`violin`/`errorbar`/`fill_between`/`step`/`stem`/`pie`, log/symlog scales, calendar-aware date axes, subplots, twin/shared axes, `tight_layout`, `imshow`/`heatmap`/`pcolormesh`/`contour` with colormaps & colorbars, style sheets. A 4000×3000 dashboard at 300 dpi renders in 2.2 s. |
+| **`sort` / `reverse` / `sort`-by-key** | The language finally has list ordering. `sort`/`reverse` return new lists; `sort(list, {"key": fn})` is **17× faster** than a comparator on 100k rows. NaN sorts last in both directions. |
+| **List `+` concatenation** | `[1,2] + [3]` is `[1,2,3]` (was silently `0`). |
+| **Binary file modes** | `open(path, "wb"/"rb"/"ab")` works; unknown modes raise; `num("12abc")` is `0` (was `12`); `num(true)` is `1`. |
 
 ## What's New in v1.3.0
 

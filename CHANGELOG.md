@@ -7,7 +7,60 @@ All notable changes to the Bantu programming language are documented in this fil
 
 ## [Unreleased]
 
-### Added
+_Nothing yet._
+
+---
+
+## [1.4.0] — 2026-10-17
+
+The **"Systems & Data" release**: a complete filesystem namespace, Python-style string
+formatting, and the formal publication of the "Phase 6" body of work — a cycle collector,
+refcounted class instances, a from-scratch raster backend that produces byte-identical PNGs
+on Linux/macOS/Windows, `numba` (native n-d arrays), `arctic` (DataFrames), and `bplot`
+(matplotlib-style charts). v1.4.0 promotes the long `## [Unreleased]` section below to a
+numbered release and ships two new headline features on top of it.
+
+### Added — NEW in v1.4.0
+
+- **[feature] `sua.fs` — a complete filesystem namespace.** Twenty-six native builtins for
+  path and directory work, complementing the v1.3.0 file I/O (`open`/`read`/`write`):
+
+  ```bantu
+  sua.fs.mkdir("/tmp/app/data")            // or mkdirp for recursive
+  sua.fs.writefile("/tmp/app/data/cfg.json", "{...}")
+  $files = sua.fs.readdir("/tmp/app/data") // list of names
+  $info = sua.fs.stat("/tmp/app/data/cfg.json")
+  print($info.type)                        // "file"
+  print(str($info.size))                   // byte count
+  sua.fs.copy_rec("./site", "./backup")    // recursive copy
+  sua.fs.rmdir_rec("/tmp/app/data")        // rm -rf
+  print(sua.fs.join("var", "log", "app.log"))
+  print(sua.fs.abspath("../x.b"))
+  ```
+
+  Full method list: `exists`, `stat`, `mkdir`, `mkdirp`, `rmdir`, `remove`, `rmdir_rec`,
+  `rename`, `copy`, `copy_rec`, `readdir`, `listdir`, `cwd`, `chdir`, `tempdir`,
+  `abspath`, `basename`, `dirname`, `join`, `split`, `readfile`, `writefile`,
+  `appendfile`, `readfile_bytes`, `writefile_bytes`, `chmod`. Cross-platform (POSIX +
+  Windows). Covered by `tests/fs_test.b` (61 assertions, ALL GREEN).
+
+- **[feature] `format()` — Python-style string formatting.** A new builtin with positional,
+  auto-positional, and keyed placeholders, plus `{{`/`}}` escapes:
+
+  ```bantu
+  format("Hello, {}!", "World")                          // "Hello, World!"
+  format("{0} + {0} = {1}", "1", "2")                    // "1 + 1 = 2"
+  format("{name} is {age}", {"name": "Ada", "age": 36})  // "Ada is 36"
+  format("literal {{braces}} here")                      // "literal {braces} here"
+  ```
+
+  Bad formats (unbalanced braces, missing keys, out-of-range indices) raise a clear
+  `RUNTIME_ERROR`. Covered by `tests/format_test.b` (21 assertions, ALL GREEN).
+
+### Added — Phase 6 body of work (formally released in v1.4.0)
+
+The features below were developed on the `main` branch since v1.3.2 and are now formally
+published as part of v1.4.0. They were previously documented under `## [Unreleased]`.
 
 - **[feature] bplot's generators are Bantu, not Python.** `scripts/gen_circle_tables.b` and
   `scripts/gen_font_tables.b`, a TrueType reader, replace the Python scripts that wrote

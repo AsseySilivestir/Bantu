@@ -56,6 +56,34 @@
   #include <sys/syscall.h>      // SYS_getrandom
 #endif
 
+// ─── Filesystem headers (sua.fs namespace, v1.4.0) ───
+// POSIX uses <dirent.h>/<unistd.h>/<sys/stat.h>; Windows uses <direct.h>/<io.h>
+// and underscores for the libc-style calls. Macros alias the two so the sua.fs
+// implementation below is one portable body.
+#include <sys/stat.h>
+#ifdef _WIN32
+  #include <direct.h>           // _mkdir, _rmdir, _getcwd, _chdir
+  #include <io.h>              // _chmod, _unlink
+  #include <windows.h>         // GetFileAttributesA, MAX_PATH (already above too)
+  #define BANTU_FS_MKDIR(p)        _mkdir(p)
+  #define BANTU_FS_RMDIR(p)        _rmdir(p)
+  #define BANTU_FS_UNLINK(p)       _unlink(p)
+  #define BANTU_FS_CHMOD(p, m)     _chmod((p), (m))
+  #define BANTU_FS_GETCWD(b, sz)   _getcwd((b), (sz))
+  #define BANTU_FS_CHDIR(p)        _chdir(p)
+#else
+  #include <dirent.h>           // opendir, readdir
+  #include <unistd.h>          // mkdir, rmdir, chdir, getcwd, unlink, access
+  #include <fcntl.h>
+  #include <sys/types.h>
+  #define BANTU_FS_MKDIR(p, m)     mkdir((p), (m))
+  #define BANTU_FS_RMDIR(p)        rmdir(p)
+  #define BANTU_FS_UNLINK(p)       unlink(p)
+  #define BANTU_FS_CHMOD(p, m)     chmod((p), (m))
+  #define BANTU_FS_GETCWD(b, sz)   getcwd((b), (sz))
+  #define BANTU_FS_CHDIR(p)        chdir(p)
+#endif
+
 // ─── External Library Headers ───
 #include <curl/curl.h>
 #include <sqlite3.h>
@@ -7735,6 +7763,109 @@ private:
             return Value(r);
         }));
 
+        // format(fmt, args...) — Python-style "{}"/"{0}"/"{name}" formatter.
+        //
+        // Three placeholder forms, all delimited by single braces:
+        //   {}    auto-positional, advances a counter starting at the first arg
+        //   {0}   explicit positional; the index counts into args[1], args[2], ...
+        //         (or args[2], args[3], ... when a dict is passed in args[1])
+        //   {key} keyed lookup; requires the SECOND argument to be a dict.
+        //
+        // {{ and }} are the literal { and } escapes; a stray } without a
+        // matching { is an unbalanced-brace error, as is a { with no closing }.
+        // Out-of-range indices and missing keys raise, so a bad template cannot
+        // silently render "0" or "null" where a value should be.
+        env_->define("format", makeNative([](std::vector<Value> args) -> Value {
+            if (args.empty()) {
+                ErrorHandler::throwRuntimeError("format() needs at least a format string", 0, 0);
+            }
+            if (!args[0].isString()) {
+                ErrorHandler::throwRuntimeError(std::string("format(): first argument must be a string, got ")
+                    + typeNameOf(args[0]), 0, 0);
+            }
+            const std::string& fmt = args[0].stringVal;
+            bool hasDict = (args.size() >= 2 && args[1].isObject());
+            const ObjectMap* dict = hasDict ? args[1].objectVal.get() : nullptr;
+            // Positional placeholders consume args AFTER the format string. When
+            // a dict is passed, it occupies args[1], so positional indices count
+            // from args[2]; otherwise they count from args[1].
+            size_t positionalBase = hasDict ? 2 : 1;
+
+            std::string out;
+            out.reserve(fmt.size() * 2);
+            size_t i = 0;
+            size_t autoIdx = 0;
+            while (i < fmt.size()) {
+                char c = fmt[i];
+                if (c == '{') {
+                    if (i + 1 < fmt.size() && fmt[i + 1] == '{') {
+                        out.push_back('{');
+                        i += 2;
+                        continue;
+                    }
+                    size_t end = fmt.find('}', i + 1);
+                    if (end == std::string::npos) {
+                        ErrorHandler::throwRuntimeError(
+                            "format(): unbalanced '{' in format string", 0, 0);
+                    }
+                    std::string field = fmt.substr(i + 1, end - i - 1);
+                    if (field.empty()) {
+                        size_t idx = positionalBase + autoIdx;
+                        if (idx >= args.size()) {
+                            ErrorHandler::throwRuntimeError(
+                                "format(): not enough arguments for {} placeholder", 0, 0);
+                        }
+                        out += args[idx].toString();
+                        ++autoIdx;
+                    } else {
+                        bool allDigits = !field.empty();
+                        for (char ch : field) {
+                            if (ch < '0' || ch > '9') { allDigits = false; break; }
+                        }
+                        if (allDigits) {
+                            size_t n = 0;
+                            try { n = (size_t)std::stoull(field); }
+                            catch (...) {
+                                ErrorHandler::throwRuntimeError(
+                                    "format(): index {" + field + "} is out of range", 0, 0);
+                            }
+                            size_t idx = positionalBase + n;
+                            if (idx >= args.size()) {
+                                ErrorHandler::throwRuntimeError(
+                                    "format(): index {" + field + "} is out of range", 0, 0);
+                            }
+                            out += args[idx].toString();
+                        } else {
+                            if (!dict) {
+                                ErrorHandler::throwRuntimeError(
+                                    "format(): key placeholder {" + field +
+                                    "} requires a dict as the second argument", 0, 0);
+                            }
+                            auto it = dict->find(field);
+                            if (it == dict->end()) {
+                                ErrorHandler::throwRuntimeError(
+                                    "format(): key '" + field + "' not found in dict", 0, 0);
+                            }
+                            out += it->second.toString();
+                        }
+                    }
+                    i = end + 1;
+                } else if (c == '}') {
+                    if (i + 1 < fmt.size() && fmt[i + 1] == '}') {
+                        out.push_back('}');
+                        i += 2;
+                        continue;
+                    }
+                    ErrorHandler::throwRuntimeError(
+                        "format(): unbalanced '}' in format string", 0, 0);
+                } else {
+                    out.push_back(c);
+                    ++i;
+                }
+            }
+            return Value(out);
+        }));
+
         // Register Sua Framework
         registerSuaFramework();
     }
@@ -10270,6 +10401,637 @@ private:
         });
 
         suaObj["ws"] = Value(std::move(wsObj));
+
+        // ════════════════════════════════════════════════════════════
+        // sua.fs — filesystem operations (v1.4.0)
+        // ════════════════════════════════════════════════════════════
+        //
+        //   sua.fs.exists(path)        -> bool        (never throws)
+        //   sua.fs.stat(path)          -> {path,type,size,mtime,mode}
+        //   sua.fs.mkdir(path)         -> bool
+        //   sua.fs.mkdirp(path)        -> bool        (mkdir -p)
+        //   sua.fs.rmdir(path)        -> bool        (empty dir only)
+        //   sua.fs.remove(path)       -> bool        (file or empty dir)
+        //   sua.fs.rmdir_rec(path)    -> bool        (rm -rf)
+        //   sua.fs.rename(from, to)   -> bool
+        //   sua.fs.copy(from, to)     -> bool        (binary-safe file copy)
+        //   sua.fs.copy_rec(from, to) -> bool        (recursive dir copy)
+        //   sua.fs.readdir(path)     -> [name, ...]  (excludes . and ..)
+        //   sua.fs.listdir(path)      -> [{name,type,size}, ...]
+        //   sua.fs.cwd()              -> string
+        //   sua.fs.chdir(path)       -> bool
+        //   sua.fs.tempdir()          -> string       (/tmp on POSIX, %TEMP% on Win)
+        //   sua.fs.abspath(path)      -> string
+        //   sua.fs.basename(path)     -> string
+        //   sua.fs.dirname(path)      -> string
+        //   sua.fs.join(a, b, ...)    -> string       (skip empties)
+        //   sua.fs.split(path)        -> [dirname, basename]
+        //   sua.fs.readfile(path)     -> string       (text)
+        //   sua.fs.writefile(path, s) -> bool
+        //   sua.fs.appendfile(path, s) -> bool
+        //   sua.fs.readfile_bytes(path)  -> [0..255, ...]
+        //   sua.fs.writefile_bytes(path, list) -> bool
+        //   sua.fs.chmod(path, mode)  -> bool         (no-op+true on Windows)
+        //
+        ObjectMap fsObj;
+
+        // ─── Path helpers (basename / dirname / split) ───────────────────
+        // Both '/' and '\\' count as separators, so a Windows-style path
+        // produced by join() is correctly split on either platform.
+        fsObj["basename"] = makeNative([](std::vector<Value> args) -> Value {
+            if (args.empty()) return Value(std::string(""));
+            const std::string& p = args[0].toString();
+            size_t pos = p.find_last_of("/\\");
+            if (pos == std::string::npos) return Value(p);
+            return Value(p.substr(pos + 1));
+        });
+        fsObj["dirname"] = makeNative([](std::vector<Value> args) -> Value {
+            if (args.empty()) return Value(std::string("."));
+            const std::string& p = args[0].toString();
+            size_t pos = p.find_last_of("/\\");
+            if (pos == std::string::npos) return Value(std::string("."));
+            if (pos == 0) return Value(std::string(1, p[0]));
+            return Value(p.substr(0, pos));
+        });
+        fsObj["split"] = makeNative([](std::vector<Value> args) -> Value {
+            std::string p = args.empty() ? std::string("") : args[0].toString();
+            size_t pos = p.find_last_of("/\\");
+            std::string dir, base;
+            if (pos == std::string::npos) { dir = "."; base = p; }
+            else if (pos == 0)            { dir = std::string(1, p[0]); base = p.substr(pos + 1); }
+            else                          { dir = p.substr(0, pos); base = p.substr(pos + 1); }
+            return Value(std::vector<Value>{Value(dir), Value(base)});
+        });
+        fsObj["join"] = makeNative([](std::vector<Value> args) -> Value {
+            std::string out;
+            for (const Value& a : args) {
+                std::string s = a.toString();
+                if (s.empty()) continue;
+                if (out.empty()) { out = s; continue; }
+                char lastOut = out.back();
+                char firstS  = s.front();
+                if (lastOut == '/' || lastOut == '\\') {
+                    if (firstS == '/' || firstS == '\\') out += s.substr(1);
+                    else                                 out += s;
+                } else if (firstS == '/' || firstS == '\\') {
+                    out += s;
+                } else {
+#ifdef _WIN32
+                    out += "\\";     // join("a", "b") -> "a\\b" on Windows
+#else
+                    out += "/";
+#endif
+                    out += s;
+                }
+            }
+            return Value(out);
+        });
+
+        // ─── exists / stat ───────────────────────────────────────────────
+        // exists() never throws — returns false on missing path or bad arg.
+        fsObj["exists"] = makeNative([](std::vector<Value> args) -> Value {
+            if (args.empty()) return Value(false);
+            struct stat buf;
+            return Value(::stat(args[0].toString().c_str(), &buf) == 0);
+        });
+        // stat() raises on a missing path, so callers can distinguish
+        // "absent" (exists()==false) from "found" (stat() succeeds).
+        fsObj["stat"] = makeNative([](std::vector<Value> args) -> Value {
+            if (args.empty()) {
+                ErrorHandler::throwRuntimeError("sua.fs.stat(path) needs 1 arg", 0, 0);
+            }
+            std::string p = args[0].toString();
+            struct stat buf;
+            if (::stat(p.c_str(), &buf) != 0) {
+                ErrorHandler::throwRuntimeError("sua.fs.stat: '" + p + "' does not exist", 0, 0);
+            }
+            std::string type;
+#ifdef _WIN32
+            type = (buf.st_mode & _S_IFDIR) ? "dir" :
+                   (buf.st_mode & _S_IFREG) ? "file" : "other";
+#else
+            if      (S_ISDIR(buf.st_mode))  type = "dir";
+            else if (S_ISREG(buf.st_mode))  type = "file";
+            else                            type = "other";
+#endif
+            ObjectMap m;
+            m["path"]   = Value(p);
+            m["type"]   = Value(type);
+            m["size"]   = Value((double)buf.st_size);
+            m["mtime"]  = Value((double)buf.st_mtime);
+            m["mode"]   = Value((double)(unsigned)buf.st_mode);
+            return Value(std::move(m));
+        });
+
+        // ─── mkdir / mkdirp ──────────────────────────────────────────────
+        // mkdir returns false for "already exists" (EEXIST) but raises on
+        // other failures (permission denied, etc.) so the cause isn't hidden.
+        fsObj["mkdir"] = makeNative([](std::vector<Value> args) -> Value {
+            if (args.empty()) {
+                ErrorHandler::throwRuntimeError("sua.fs.mkdir(path) needs 1 arg", 0, 0);
+            }
+            std::string p = args[0].toString();
+            int r = BANTU_FS_MKDIR(p.c_str(), 0755);
+            if (r == 0) return Value(true);
+            int e = errno;
+            if (e == EEXIST) return Value(false);
+            ErrorHandler::throwRuntimeError(
+                "sua.fs.mkdir: cannot create '" + p + "' (errno " + std::to_string(e) + ")", 0, 0);
+            return Value();   // unreachable; throwRuntimeError is [[noreturn]] via throwError
+        });
+        // mkdirp — recursive, like `mkdir -p`. Walks the path components
+        // from the root down, creating each missing segment. Returns true
+        // if the directory exists when this returns.
+        fsObj["mkdirp"] = makeNative([](std::vector<Value> args) -> Value {
+            if (args.empty()) {
+                ErrorHandler::throwRuntimeError("sua.fs.mkdirp(path) needs 1 arg", 0, 0);
+            }
+            std::string p = args[0].toString();
+            if (p.empty()) return Value(true);
+            // Split into segments by either separator, then re-accumulate
+            // and create each prefix that does not yet exist.
+            size_t i = 0;
+            // Leading slash (POSIX) or drive letter (Windows) is preserved.
+#ifdef _WIN32
+            if (p.size() >= 2 && p[1] == ':') i = 2;   // "C:" stays
+#endif
+            while (i < p.size()) {
+                size_t next = p.find_first_of("/\\", i);
+                if (next == std::string::npos) next = p.size();
+                std::string prefix = p.substr(0, next);
+                if (!prefix.empty()) {
+                    struct stat buf;
+                    if (::stat(prefix.c_str(), &buf) != 0) {
+                        int r = BANTU_FS_MKDIR(prefix.c_str(), 0755);
+                        if (r != 0 && errno != EEXIST) {
+                            ErrorHandler::throwRuntimeError(
+                                "sua.fs.mkdirp: cannot create '" + prefix +
+                                "' (errno " + std::to_string(errno) + ")", 0, 0);
+                        }
+                    }
+                }
+                i = next;
+                // Skip consecutive separators
+                while (i < p.size() && (p[i] == '/' || p[i] == '\\')) ++i;
+            }
+            // Final check: the path exists and is a directory.
+            struct stat buf;
+            if (::stat(p.c_str(), &buf) != 0) return Value(false);
+#ifdef _WIN32
+            return Value((buf.st_mode & _S_IFDIR) != 0);
+#else
+            return Value(S_ISDIR(buf.st_mode));
+#endif
+        });
+
+        // ─── rmdir / remove / rmdir_rec ─────────────────────────────────
+        fsObj["rmdir"] = makeNative([](std::vector<Value> args) -> Value {
+            if (args.empty()) {
+                ErrorHandler::throwRuntimeError("sua.fs.rmdir(path) needs 1 arg", 0, 0);
+            }
+            std::string p = args[0].toString();
+            if (BANTU_FS_RMDIR(p.c_str()) == 0) return Value(true);
+            return Value(false);
+        });
+        // remove() handles BOTH files (unlink) and empty dirs (rmdir).
+        fsObj["remove"] = makeNative([](std::vector<Value> args) -> Value {
+            if (args.empty()) {
+                ErrorHandler::throwRuntimeError("sua.fs.remove(path) needs 1 arg", 0, 0);
+            }
+            std::string p = args[0].toString();
+            struct stat buf;
+            if (::stat(p.c_str(), &buf) != 0) return Value(false);
+#ifdef _WIN32
+            bool isDir = (buf.st_mode & _S_IFDIR) != 0;
+#else
+            bool isDir = S_ISDIR(buf.st_mode);
+#endif
+            if (isDir) {
+                if (BANTU_FS_RMDIR(p.c_str()) == 0) return Value(true);
+            } else {
+                if (BANTU_FS_UNLINK(p.c_str()) == 0) return Value(true);
+            }
+            return Value(false);
+        });
+        // rmdir_rec — recursive remove. A std::function lets the lambda
+        // capture itself so it can walk subtrees. Excludes "." and ".."
+        // (which every directory has and which would otherwise loop back
+        // into itself forever).
+        fsObj["rmdir_rec"] = makeNative([](std::vector<Value> args) -> Value {
+            if (args.empty()) {
+                ErrorHandler::throwRuntimeError("sua.fs.rmdir_rec(path) needs 1 arg", 0, 0);
+            }
+            std::string p = args[0].toString();
+            std::function<bool(const std::string&)> rec = [&](const std::string& path) -> bool {
+                struct stat buf;
+                if (::stat(path.c_str(), &buf) != 0) return false;
+#ifdef _WIN32
+                bool isDir = (buf.st_mode & _S_IFDIR) != 0;
+#else
+                bool isDir = S_ISDIR(buf.st_mode);
+#endif
+                if (!isDir) return BANTU_FS_UNLINK(path.c_str()) == 0;
+#ifndef _WIN32
+                DIR* d = ::opendir(path.c_str());
+                if (!d) return false;
+                struct dirent* e;
+                while ((e = ::readdir(d)) != nullptr) {
+                    std::string n = e->d_name;
+                    if (n == "." || n == "..") continue;
+                    std::string child = path + "/" + n;
+                    rec(child);
+                }
+                ::closedir(d);
+                return BANTU_FS_RMDIR(path.c_str()) == 0;
+#else
+                // Windows: walk with FindFirstFile/FindNextFile.
+                std::string pattern = path + "\\*";
+                WIN32_FIND_DATAA fd;
+                HANDLE h = FindFirstFileA(pattern.c_str(), &fd);
+                if (h == INVALID_HANDLE_VALUE) return false;
+                bool ok = true;
+                do {
+                    std::string n = fd.cFileName;
+                    if (n == "." || n == "..") continue;
+                    std::string child = path + "\\" + n;
+                    if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) rec(child);
+                    else                                              BANTU_FS_UNLINK(child.c_str());
+                } while (FindNextFileA(h, &fd));
+                FindClose(h);
+                return BANTU_FS_RMDIR(path.c_str()) == 0;
+#endif
+            };
+            return Value(rec(p));
+        });
+
+        // ─── rename / copy / copy_rec ───────────────────────────────────
+        fsObj["rename"] = makeNative([](std::vector<Value> args) -> Value {
+            if (args.size() < 2) {
+                ErrorHandler::throwRuntimeError("sua.fs.rename(from, to) needs 2 args", 0, 0);
+            }
+            std::string from = args[0].toString();
+            std::string to   = args[1].toString();
+#ifdef _WIN32
+            // Windows rename() refuses to overwrite; fall back to copy+remove
+            // via MoveFileExA with REPLACE_EXISTING for parity with POSIX.
+            if (MoveFileExA(from.c_str(), to.c_str(), MOVEFILE_REPLACE_EXISTING))
+                return Value(true);
+            return Value(false);
+#else
+            if (::rename(from.c_str(), to.c_str()) == 0) return Value(true);
+            return Value(false);
+#endif
+        });
+        // copy() — binary-safe file copy. Uses ifstream/ofstream with
+        // ios::binary so neither CRLF translation nor 0x1A EOF can corrupt a
+        // PNG, a zip, or a key on Windows.
+        fsObj["copy"] = makeNative([](std::vector<Value> args) -> Value {
+            if (args.size() < 2) {
+                ErrorHandler::throwRuntimeError("sua.fs.copy(from, to) needs 2 args", 0, 0);
+            }
+            std::string from = args[0].toString();
+            std::string to   = args[1].toString();
+            std::ifstream in(from, std::ios::binary);
+            if (!in.is_open()) {
+                ErrorHandler::throwRuntimeError("sua.fs.copy: cannot open source '" + from + "'", 0, 0);
+            }
+            std::ofstream out(to, std::ios::binary | std::ios::trunc);
+            if (!out.is_open()) {
+                ErrorHandler::throwRuntimeError("sua.fs.copy: cannot open destination '" + to + "'", 0, 0);
+            }
+            out << in.rdbuf();
+            out.flush();
+            return Value((bool)out);
+        });
+        // copy_rec — recursive dir copy. Mirror the layout: dirs become
+        // dirs, files become files. mkdirp() the destination root so the
+        // call is idempotent (the destination need not pre-exist).
+        fsObj["copy_rec"] = makeNative([](std::vector<Value> args) -> Value {
+            if (args.size() < 2) {
+                ErrorHandler::throwRuntimeError("sua.fs.copy_rec(from, to) needs 2 args", 0, 0);
+            }
+            std::string from = args[0].toString();
+            std::string to   = args[1].toString();
+            std::function<bool(const std::string&, const std::string&)> rec =
+                [&](const std::string& src, const std::string& dst) -> bool {
+                struct stat buf;
+                if (::stat(src.c_str(), &buf) != 0) return false;
+#ifdef _WIN32
+                bool isDir = (buf.st_mode & _S_IFDIR) != 0;
+#else
+                bool isDir = S_ISDIR(buf.st_mode);
+#endif
+                if (!isDir) {
+                    std::ifstream in(src, std::ios::binary);
+                    if (!in.is_open()) return false;
+                    std::ofstream out(dst, std::ios::binary | std::ios::trunc);
+                    if (!out.is_open()) return false;
+                    out << in.rdbuf();
+                    out.flush();
+                    return (bool)out;
+                }
+                // mkdirp(dst) — duplicate the directory.
+                {
+                    size_t i = 0;
+#ifdef _WIN32
+                    if (dst.size() >= 2 && dst[1] == ':') i = 2;
+#endif
+                    while (i < dst.size()) {
+                        size_t next = dst.find_first_of("/\\", i);
+                        if (next == std::string::npos) next = dst.size();
+                        std::string prefix = dst.substr(0, next);
+                        if (!prefix.empty()) {
+                            struct stat sb;
+                            if (::stat(prefix.c_str(), &sb) != 0) {
+                                int r = BANTU_FS_MKDIR(prefix.c_str(), 0755);
+                                if (r != 0 && errno != EEXIST) return false;
+                            }
+                        }
+                        i = next;
+                        while (i < dst.size() && (dst[i] == '/' || dst[i] == '\\')) ++i;
+                    }
+                }
+#ifndef _WIN32
+                DIR* d = ::opendir(src.c_str());
+                if (!d) return false;
+                struct dirent* e;
+                bool ok = true;
+                while ((e = ::readdir(d)) != nullptr) {
+                    std::string n = e->d_name;
+                    if (n == "." || n == "..") continue;
+                    std::string childSrc = src + "/" + n;
+                    std::string childDst = dst + "/" + n;
+                    if (!rec(childSrc, childDst)) ok = false;
+                }
+                ::closedir(d);
+                return ok;
+#else
+                std::string pattern = src + "\\*";
+                WIN32_FIND_DATAA fd;
+                HANDLE h = FindFirstFileA(pattern.c_str(), &fd);
+                if (h == INVALID_HANDLE_VALUE) return false;
+                bool ok = true;
+                do {
+                    std::string n = fd.cFileName;
+                    if (n == "." || n == "..") continue;
+                    std::string childSrc = src + "\\" + n;
+                    std::string childDst = dst + "\\" + n;
+                    if (!rec(childSrc, childDst)) ok = false;
+                } while (FindNextFileA(h, &fd));
+                FindClose(h);
+                return ok;
+#endif
+            };
+            return Value(rec(from, to));
+        });
+
+        // ─── readdir / listdir ──────────────────────────────────────────
+        fsObj["readdir"] = makeNative([](std::vector<Value> args) -> Value {
+            if (args.empty()) {
+                ErrorHandler::throwRuntimeError("sua.fs.readdir(path) needs 1 arg", 0, 0);
+            }
+            std::string p = args[0].toString();
+            std::vector<Value> out;
+#ifndef _WIN32
+            DIR* d = ::opendir(p.c_str());
+            if (!d) {
+                ErrorHandler::throwRuntimeError("sua.fs.readdir: cannot open '" + p + "'", 0, 0);
+            }
+            struct dirent* e;
+            while ((e = ::readdir(d)) != nullptr) {
+                std::string n = e->d_name;
+                if (n == "." || n == "..") continue;
+                out.push_back(Value(n));
+            }
+            ::closedir(d);
+#else
+            std::string pattern = p + "\\*";
+            WIN32_FIND_DATAA fd;
+            HANDLE h = FindFirstFileA(pattern.c_str(), &fd);
+            if (h == INVALID_HANDLE_VALUE) {
+                ErrorHandler::throwRuntimeError("sua.fs.readdir: cannot open '" + p + "'", 0, 0);
+            }
+            do {
+                std::string n = fd.cFileName;
+                if (n == "." || n == "..") continue;
+                out.push_back(Value(n));
+            } while (FindNextFileA(h, &fd));
+            FindClose(h);
+#endif
+            return Value(std::move(out));
+        });
+        // listdir — like readdir, but each entry is a {name, type, size} dict.
+        // Avoids an extra stat() per entry on POSIX by using dirent->d_type
+        // when available (it is on Linux/macOS; falls back to stat() if the
+        // filesystem reports DT_UNKNOWN).
+        fsObj["listdir"] = makeNative([](std::vector<Value> args) -> Value {
+            if (args.empty()) {
+                ErrorHandler::throwRuntimeError("sua.fs.listdir(path) needs 1 arg", 0, 0);
+            }
+            std::string p = args[0].toString();
+            std::vector<Value> out;
+            auto typeStr = [](const struct stat& buf) -> std::string {
+#ifdef _WIN32
+                if (buf.st_mode & _S_IFDIR) return "dir";
+                if (buf.st_mode & _S_IFREG) return "file";
+                return "other";
+#else
+                if      (S_ISDIR(buf.st_mode))  return "dir";
+                else if (S_ISREG(buf.st_mode))  return "file";
+                else                            return "other";
+#endif
+            };
+#ifndef _WIN32
+            DIR* d = ::opendir(p.c_str());
+            if (!d) {
+                ErrorHandler::throwRuntimeError("sua.fs.listdir: cannot open '" + p + "'", 0, 0);
+            }
+            struct dirent* e;
+            while ((e = ::readdir(d)) != nullptr) {
+                std::string n = e->d_name;
+                if (n == "." || n == "..") continue;
+                std::string full = p + "/" + n;
+                struct stat buf;
+                ObjectMap m;
+                m["name"] = Value(n);
+                if (::stat(full.c_str(), &buf) == 0) {
+                    m["type"] = Value(typeStr(buf));
+                    m["size"] = Value((double)buf.st_size);
+                } else {
+                    m["type"] = Value(std::string("other"));
+                    m["size"] = Value(0.0);
+                }
+                out.push_back(Value(std::move(m)));
+            }
+            ::closedir(d);
+#else
+            std::string pattern = p + "\\*";
+            WIN32_FIND_DATAA fd;
+            HANDLE h = FindFirstFileA(pattern.c_str(), &fd);
+            if (h == INVALID_HANDLE_VALUE) {
+                ErrorHandler::throwRuntimeError("sua.fs.listdir: cannot open '" + p + "'", 0, 0);
+            }
+            do {
+                std::string n = fd.cFileName;
+                if (n == "." || n == "..") continue;
+                ObjectMap m;
+                m["name"] = Value(n);
+                m["type"] = Value((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) ? "dir" : "file");
+                // 64-bit file size: nFileSizeHigh << 32 | nFileSizeLow
+                unsigned long long sz =
+                    ((unsigned long long)fd.nFileSizeHigh << 32) |
+                    (unsigned long long)fd.nFileSizeLow;
+                m["size"] = Value((double)sz);
+                out.push_back(Value(std::move(m)));
+            } while (FindNextFileA(h, &fd));
+            FindClose(h);
+#endif
+            return Value(std::move(out));
+        });
+
+        // ─── cwd / chdir / tempdir / abspath ────────────────────────────
+        fsObj["cwd"] = makeNative([](std::vector<Value> args) -> Value {
+            char buf[4096];
+            if (BANTU_FS_GETCWD(buf, sizeof(buf)) != nullptr) return Value(std::string(buf));
+            return Value(std::string(""));
+        });
+        fsObj["chdir"] = makeNative([](std::vector<Value> args) -> Value {
+            if (args.empty()) {
+                ErrorHandler::throwRuntimeError("sua.fs.chdir(path) needs 1 arg", 0, 0);
+            }
+            if (BANTU_FS_CHDIR(args[0].toString().c_str()) == 0) return Value(true);
+            return Value(false);
+        });
+        fsObj["tempdir"] = makeNative([](std::vector<Value> args) -> Value {
+#ifdef _WIN32
+            const char* t = std::getenv("TEMP");
+            if (!t || !t[0]) t = std::getenv("TMP");
+            if (!t || !t[0]) {
+                char buf[MAX_PATH];
+                if (GetTempPathA(MAX_PATH, buf) > 0) return Value(std::string(buf));
+                return Value(std::string("."));
+            }
+            return Value(std::string(t));
+#else
+            const char* t = std::getenv("TMPDIR");
+            if (t && t[0]) return Value(std::string(t));
+            return Value(std::string("/tmp"));
+#endif
+        });
+        fsObj["abspath"] = makeNative([](std::vector<Value> args) -> Value {
+            if (args.empty()) return Value(std::string(""));
+            // bantu::canonicalize() is realpath() on POSIX and GetFullPathNameA
+            // on Windows; both fall back to the input path if the call fails
+            // (e.g. the file does not yet exist), so this is safe to call on a
+            // path that does not exist yet.
+            return Value(bantu::canonicalize(args[0].toString()));
+        });
+
+        // ─── readfile / writefile / appendfile ──────────────────────────
+        // These mirror the top-level readfile()/writefile()/appendfile()
+        // builtins, but under the sua.fs namespace so filesystem code reads
+        // as one cohesive group instead of mixing modules.
+        fsObj["readfile"] = makeNative([](std::vector<Value> args) -> Value {
+            if (args.empty()) return Value(std::string(""));
+            std::ifstream fs(args[0].toString(), std::ios::binary);
+            if (!fs.is_open()) {
+                ErrorHandler::throwRuntimeError(
+                    "sua.fs.readfile: cannot open '" + args[0].toString() + "'", 0, 0);
+            }
+            std::stringstream ss; ss << fs.rdbuf();
+            return Value(ss.str());
+        });
+        fsObj["writefile"] = makeNative([](std::vector<Value> args) -> Value {
+            if (args.size() < 2) return Value(false);
+            std::string path = args[0].toString();
+            std::string data = args[1].toString();
+            std::ofstream fs(path, std::ios::binary | std::ios::trunc);
+            if (!fs.is_open()) {
+                ErrorHandler::throwRuntimeError(
+                    "sua.fs.writefile: cannot open '" + path + "'", 0, 0);
+            }
+            fs.write(data.data(), (std::streamsize)data.size());
+            fs.flush();
+            if (!fs) {
+                ErrorHandler::throwRuntimeError(
+                    "sua.fs.writefile: write to '" + path + "' failed", 0, 0);
+            }
+            return Value(true);
+        });
+        fsObj["appendfile"] = makeNative([](std::vector<Value> args) -> Value {
+            if (args.size() < 2) return Value(false);
+            std::string path = args[0].toString();
+            std::string data = args[1].toString();
+            std::ofstream fs(path, std::ios::binary | std::ios::app);
+            if (!fs.is_open()) {
+                ErrorHandler::throwRuntimeError(
+                    "sua.fs.appendfile: cannot open '" + path + "'", 0, 0);
+            }
+            fs.write(data.data(), (std::streamsize)data.size());
+            fs.flush();
+            if (!fs) {
+                ErrorHandler::throwRuntimeError(
+                    "sua.fs.appendfile: write to '" + path + "' failed", 0, 0);
+            }
+            return Value(true);
+        });
+
+        // ─── readfile_bytes / writefile_bytes ──────────────────────────
+        // Binary I/O: bytes travel as a list of integers 0..255 (the same
+        // convention used everywhere else in the evaluator — see the
+        // "bytes()" builtin and bantuToBytes/bantuBytesToList).
+        fsObj["readfile_bytes"] = makeNative([](std::vector<Value> args) -> Value {
+            if (args.empty()) return Value(std::vector<Value>{});
+            std::ifstream fs(args[0].toString(), std::ios::binary);
+            if (!fs.is_open()) {
+                ErrorHandler::throwRuntimeError(
+                    "sua.fs.readfile_bytes: cannot open '" + args[0].toString() + "'", 0, 0);
+            }
+            std::vector<unsigned char> data(
+                (std::istreambuf_iterator<char>(fs)),
+                 std::istreambuf_iterator<char>());
+            std::vector<Value> out;
+            out.reserve(data.size());
+            for (unsigned char b : data) out.push_back(Value((double)b));
+            return Value(std::move(out));
+        });
+        fsObj["writefile_bytes"] = makeNative([](std::vector<Value> args) -> Value {
+            if (args.size() < 2) return Value(false);
+            std::string path = args[0].toString();
+            std::vector<unsigned char> data = bantuToBytes(args[1]);
+            std::ofstream fs(path, std::ios::binary | std::ios::trunc);
+            if (!fs.is_open()) {
+                ErrorHandler::throwRuntimeError(
+                    "sua.fs.writefile_bytes: cannot open '" + path + "'", 0, 0);
+            }
+            fs.write((const char*)data.data(), (std::streamsize)data.size());
+            fs.flush();
+            if (!fs) {
+                ErrorHandler::throwRuntimeError(
+                    "sua.fs.writefile_bytes: write to '" + path + "' failed", 0, 0);
+            }
+            return Value(true);
+        });
+
+        // ─── chmod ──────────────────────────────────────────────────────
+        // POSIX: chmod(2). Windows: no-op + true, because Unix permission
+        // bits do not exist on Windows file objects — chmod() there is at
+        // best a write-protect toggle, and faking it would be misleading.
+        fsObj["chmod"] = makeNative([](std::vector<Value> args) -> Value {
+            if (args.size() < 2) {
+                ErrorHandler::throwRuntimeError("sua.fs.chmod(path, mode) needs 2 args", 0, 0);
+            }
+            std::string p = args[0].toString();
+            int mode = (int)bantuU32(args[1].numberVal);
+#ifdef _WIN32
+            (void)p; (void)mode;
+            return Value(true);
+#else
+            return Value(::chmod(p.c_str(), (mode_t)mode) == 0);
+#endif
+        });
+
+        suaObj["fs"] = Value(std::move(fsObj));
 
         // ════════════════════════════════════════════════════════
         // Register sua as a global variable

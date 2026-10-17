@@ -57,3 +57,6 @@ subscriptions.db
 *.pfx
 *.crt
 bantu-codesign.*
+
+# v1.4.0 release staging (built artifacts, uploaded to GitHub Release)
+release/
