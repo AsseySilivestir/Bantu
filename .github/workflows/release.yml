@@ -98,14 +98,20 @@ jobs:
       - name: Resolve version
         id: v
         shell: bash
-        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
-      - name: Package zip + MSI
+        run: |
+          if [ -n "${{ inputs.version }}" ]; then echo "version=${{ inputs.version }}" >> "$GITHUB_OUTPUT";
+          else echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"; fi
+      - name: Package zip (always)
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force out | Out-Null
           Compress-Archive -Force -Path bantu.exe -DestinationPath out/bantu-windows-x64.zip
+      - name: Build MSI (best-effort — WiX v7 OSMF EULA may fail)
+        shell: pwsh
+        continue-on-error: true
+        run: |
           ./scripts/installers/build-windows-msi.ps1 -Binary ./bantu.exe -Version "${{ steps.v.outputs.version }}" -Arch x64
-          Copy-Item dist/*.msi out/
+          if (Test-Path dist/*.msi) { Copy-Item dist/*.msi out/ }
       - uses: actions/upload-artifact@v7
         with:
           name: windows
@@ -129,3 +135,6 @@ jobs:
         with:
           files: release/*
           generate_release_notes: true
+          allowUpdates: true
+          # v1.4.0 release already exists (created via API) — update it
+          # with the CI-built assets instead of failing.
